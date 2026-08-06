@@ -1,0 +1,31 @@
+name: Build userscript
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/ghost-byte-wage-calculator.part*.b64'
+      - '.github/workflows/build-userscript.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild userscript
+        run: |
+          cat src/ghost-byte-wage-calculator.part*.b64 | base64 --decode | gzip --decompress > ghost-byte-wage-calculator.user.js
+          node --check ghost-byte-wage-calculator.user.js
+      - name: Commit generated userscript
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator.user.js
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Build userscript"
+          git push
