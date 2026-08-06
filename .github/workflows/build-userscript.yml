@@ -1,6 +1,7 @@
 name: Build userscript
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -17,7 +18,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rebuild userscript
         run: |
-          cat src/ghost-byte-wage-calculator.part*.b64 | base64 --decode | gzip --decompress > ghost-byte-wage-calculator.user.js
+          cat src/ghost-byte-wage-calculator.part*.b64 | tr -d '\r\n\t ' | base64 --decode | gzip --decompress > ghost-byte-wage-calculator.user.js
+          sed -i '0,/\/\/ @version      1.2.0/s//\/\/ @version      1.2.2/' ghost-byte-wage-calculator.user.js
           node --check ghost-byte-wage-calculator.user.js
       - name: Commit generated userscript
         run: |
@@ -27,5 +29,5 @@ jobs:
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "Build userscript"
+          git commit -m "Build self-contained userscript"
           git push
