@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ghost Byte Wage Calculator Loader
 // @namespace    wyn.torn.company.tools
-// @version      1.2.1
-// @description  Loads the Ghost Byte Torn PDA employee wage calculator.
+// @version      1.2.2
+// @description  Loads the Ghost Byte Torn PDA employee wage calculator using Torn PDA's native HTTP bridge.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
 // @match        https://www.torn.com/joblist.php*
@@ -19,40 +19,76 @@
     'ghost-byte-wage-calculator.part02.b64',
   ];
 
-  // jsDelivr normally works better inside Android WebView/Torn PDA than
-  // raw.githubusercontent.com. Statically is included as a fallback.
   const SOURCES = [
     'https://cdn.jsdelivr.net/gh/chadgian/torn-pda-wage-calculator@main/src/',
-    'https://cdn.statically.io/gh/chadgian/torn-pda-wage-calculator/main/src/',
+    'https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/src/',
   ];
+
+  function getPdaHttpGet() {
+    if (typeof window.PDA_httpGet === 'function') {
+      return window.PDA_httpGet.bind(window);
+    }
+
+    if (typeof PDA_httpGet === 'function') {
+      return PDA_httpGet;
+    }
+
+    return null;
+  }
+
+  async function requestText(url) {
+    const pdaHttpGet = getPdaHttpGet();
+
+    if (pdaHttpGet) {
+      const response = await pdaHttpGet(url, {
+        Accept: 'text/plain,*/*',
+        'Cache-Control': 'no-cache',
+      });
+
+      const status = Number(response?.status || 200);
+      const text = response?.responseText ?? response?.body ?? response?.text;
+
+      if (status < 200 || status >= 300) {
+        throw new Error(`PDA HTTP ${status}`);
+      }
+
+      if (typeof text !== 'string' || !text.trim()) {
+        throw new Error('PDA HTTP returned an empty response');
+      }
+
+      return text;
+    }
+
+    const response = await fetch(url, {
+      cache: 'no-store',
+      credentials: 'omit',
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return response.text();
+  }
 
   async function fetchPart(name) {
     let lastError;
 
     for (const base of SOURCES) {
       try {
-        const response = await fetch(`${base}${name}?v=1.2.1`, {
-          cache: 'no-store',
-          credentials: 'omit',
-        });
-
-        if (!response.ok) {
-          throw new Error(`${response.status} ${response.statusText}`.trim());
-        }
-
-        return await response.text();
+        return await requestText(`${base}${name}?v=1.2.2`);
       } catch (error) {
         lastError = error;
         console.warn(`[Ghost Byte Wage Calculator] Could not load ${name} from ${base}`, error);
       }
     }
 
-    throw new Error(`Could not download ${name}: ${lastError?.message || 'all download sources failed'}`);
+    throw new Error(`Could not download ${name}: ${lastError?.message || 'all sources failed'}`);
   }
 
   async function decompressGzipBase64(base64) {
     if (typeof DecompressionStream !== 'function') {
-      throw new Error('This Torn PDA WebView does not support DecompressionStream. Update Torn PDA or Android System WebView.');
+      throw new Error('Update Android System WebView and Torn PDA, then try again.');
     }
 
     const compressed = Uint8Array.from(
@@ -75,7 +111,6 @@
       source = source.replaceAll('###PDA-APIKEY###', PDA_API_KEY);
     }
 
-    // Indirect eval executes the downloaded userscript in the page context.
     (0, eval)(`${source}\n//# sourceURL=ghost-byte-wage-calculator.full.user.js`);
   }
 
