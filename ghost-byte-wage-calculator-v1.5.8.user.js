@@ -6,8 +6,6 @@
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
 // @match        https://torn.com/companies.php*
-// @updateURL    https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js
-// @downloadURL  https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js
 // @run-at       document-end
 // @grant        none
 // ==/UserScript==
