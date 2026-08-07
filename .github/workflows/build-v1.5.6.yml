@@ -1,0 +1,49 @@
+name: Build wage calculator v1.5.6
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.5.6.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build robust pay-field autofill
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('ghost-byte-wage-calculator-v1.5.5.user.js').read_text(encoding='utf-8')
+          src = src.replace('// @version      1.5.5', '// @version      1.5.6')
+          src = src.replace("var ID='gb-wage-v155'", "var ID='gb-wage-v156'")
+          old = '''function wageInputs(){var sel=['input[name*="wage" i]','input[id*="wage" i]','input[placeholder*="wage" i]','input[aria-label*="wage" i]','input[name*="salary" i]','input[id*="salary" i]','input[placeholder*="salary" i]','input[name*="pay" i]','input[id*="pay" i]'];var out=[];for(var j=0;j<sel.length;j++)Array.from(document.querySelectorAll(sel[j])).forEach(function(i){if(visible(i)&&out.indexOf(i)<0)out.push(i);});return out;}'''
+          new = '''function looksLikePayInput(i){if(!i||i.tagName!=='INPUT'||!visible(i)||i.disabled||i.readOnly)return false;var meta=[i.name,i.id,i.placeholder,i.getAttribute('aria-label'),i.className].join(' ').toLowerCase();if(/wage|salary|pay/.test(meta))return true;if(!/^(number|text|tel)$/.test((i.type||'text').toLowerCase()))return false;var box=i.closest('tr,li,[role="row"],[data-user-id],[data-userid],[class*="employee" i],[class*="staff" i],[class*="worker" i],[class*="row" i],form');if(!box)return false;var text=(box.textContent||'').toLowerCase();return /wage|salary|pay|daily pay/.test(text)||!!box.querySelector('a[href*="XID="],a[href*="userID="],a[href*="profiles.php"]');}\nfunction wageInputs(){return Array.from(document.querySelectorAll('input')).filter(looksLikePayInput);}'''
+          if old not in src:
+              raise SystemExit('wageInputs block not found')
+          src = src.replace(old, new, 1)
+          old2 = '''function fillInput(i,x){if(!cfg.fill||!i||!x||x.omit)return false;if(i.dataset.gb===x.id&&n(i.value)===Math.round(x.suggested))return true;var d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set)d.set.call(i,String(Math.round(x.suggested)));else i.value=String(Math.round(x.suggested));i.dataset.gb=x.id;i.dispatchEvent(new Event('input',{bubbles:true}));i.dispatchEvent(new Event('change',{bubbles:true}));i.focus();return true;}'''
+          new2 = '''function setNativeValue(i,value){var p=i,descriptor=null;while(p&&!descriptor){descriptor=Object.getOwnPropertyDescriptor(p,'value');p=Object.getPrototypeOf(p);}if(descriptor&&descriptor.set)descriptor.set.call(i,value);else i.value=value;}\nfunction fillInput(i,x){if(!cfg.fill||!i||!x||x.omit)return false;var value=String(Math.round(x.suggested));function apply(){setNativeValue(i,value);i.dataset.gb=x.id;try{i.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));}catch(e){i.dispatchEvent(new Event('input',{bubbles:true}));}i.dispatchEvent(new Event('change',{bubbles:true}));}i.focus();apply();setTimeout(apply,60);setTimeout(apply,180);setTimeout(apply,400);return true;}'''
+          if old2 not in src:
+              raise SystemExit('fillInput block not found')
+          src = src.replace(old2, new2, 1)
+          old3 = '''document.addEventListener('pointerdown',function(e){var i=e.target&&e.target.closest?e.target.closest('input'):null;if(i&&wageInputs().indexOf(i)>=0&&cfg.fill)setTimeout(function(){fillClickedInput(i);},0);},true);document.addEventListener('focusin',function(e){var i=e.target;if(i&&i.tagName==='INPUT'&&wageInputs().indexOf(i)>=0&&cfg.fill)setTimeout(function(){fillClickedInput(i);},0);},true);'''
+          new3 = '''function handlePayTarget(target){var i=target&&target.closest?target.closest('input'):null;if(!cfg.fill||!looksLikePayInput(i))return;setTimeout(function(){fillClickedInput(i);},20);setTimeout(function(){fillClickedInput(i);},180);}\ndocument.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){handlePayTarget(e.target);},true);'''
+          if old3 not in src:
+              raise SystemExit('event listener block not found')
+          src = src.replace(old3, new3, 1)
+          Path('ghost-byte-wage-calculator-v1.5.6.user.js').write_text(src, encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.5.6.user.js
+      - name: Commit generated file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.5.6.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Fix direct employee pay-field autofill"
+          git push
