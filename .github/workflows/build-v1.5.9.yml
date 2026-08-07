@@ -21,11 +21,18 @@ jobs:
           src=Path('ghost-byte-wage-calculator-v1.5.8.user.js').read_text(encoding='utf-8')
           src=src.replace('// @version      1.5.8','// @version      1.5.9',1)
           src=src.replace("var ID='gb-wage-v158'","var ID='gb-wage-v159'",1)
-          old="var link=node.querySelector&&node.querySelector('a[href*=\"XID=\"],a[href*=\"userID=\"],a[href*=\"profiles.php\"]');var href=link&&link.getAttribute('href')||'';"
-          new="var link=null,links=node.querySelectorAll?node.querySelectorAll('a'):[];for(var q=0;q<links.length;q++){var candidate=links[q].getAttribute('href')||'';if(/(?:XID|userID)=\\d+|profiles\\.php/i.test(candidate)){link=links[q];break;}}var href=link&&link.getAttribute('href')||'';"
-          if old not in src:
-              raise SystemExit('Expected fragile selector was not found')
-          src=src.replace(old,new,1)
+
+          helper="""function findEmployeeLink(box){var links=box&&box.querySelectorAll?box.querySelectorAll('a'):[];for(var i=0;i<links.length;i++){var href=links[i].getAttribute('href')||'';if(/(?:XID|userID)=\\d+|profiles\\.php/i.test(href))return links[i];}return null;}\nfunction hasEmployeeLink(box){return !!findEmployeeLink(box);}\n"""
+          marker="function looksLikePayInput(i){"
+          if marker not in src:
+              raise SystemExit('looksLikePayInput marker missing')
+          src=src.replace(marker,helper+marker,1)
+
+          src=src.replace("!!box.querySelector('a[href*=\"XID=\"],a[href*=\"userID=\"],a[href*=\"profiles.php\"]')","hasEmployeeLink(box)")
+          src=src.replace("var link=box.querySelector('a[href*=\"XID=\"],a[href*=\"userID=\"],a[href*=\"profiles.php\"]');","var link=findEmployeeLink(box);")
+          src=src.replace("var id='',link=box.querySelector('a[href*=XID],a[href*=userID],a[href*=profiles\\.php]');","var id='',link=findEmployeeLink(box);")
+          src=src.replace("var a=Array.from(document.querySelectorAll('a[href*=\"XID='+x.id+'\"],a[href*=\"userID='+x.id+'\"]')).filter(visible);","var a=Array.from(document.querySelectorAll('a')).filter(function(link){var href=link.getAttribute('href')||'';return visible(link)&&(href.indexOf('XID='+x.id)>=0||href.indexOf('userID='+x.id)>=0);});")
+
           if 'a[href*=' in src:
               raise SystemExit('Fragile href substring selector remains')
           Path('ghost-byte-wage-calculator-v1.5.9.user.js').write_text(src,encoding='utf-8')
