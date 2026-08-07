@@ -1,0 +1,76 @@
+name: Build wage calculator v1.6.2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.6.2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build strict row-local autofill release
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          src=Path('ghost-byte-wage-calculator-v1.6.1.user.js').read_text(encoding='utf-8')
+          src=src.replace('// @version      1.6.1','// @version      1.6.2',1)
+          src=src.replace("var ID='gb-wage-v161'","var ID='gb-wage-v162'",1)
+
+          start=src.index('function looksLikePayInput(i)')
+          end=src.index('function setNativeValue(i,value)')
+          replacement=r'''function employeeCandidatesIn(node){var found={},out=[];if(!node||node.nodeType!==1)return out;var links=node.querySelectorAll?node.querySelectorAll('a'):[];for(var i=0;i<links.length;i++){var href=links[i].getAttribute('href')||'',id='';try{var u=new URL(href,location.href);id=u.searchParams.get('XID')||u.searchParams.get('userID')||'';}catch(e){}if(!id){var m=href.match(/(?:XID|userID)=(\d+)/i);if(m)id=m[1];}if(id){var byId=rows.find(function(x){return x.id===String(id);});if(byId)found[byId.id]=byId;}}if(!Object.keys(found).length){var text=(node.textContent||'').toLowerCase();rows.forEach(function(x){var name=String(x.name||'').trim().toLowerCase();if(name&&text.indexOf(name)>=0)found[x.id]=x;});}Object.keys(found).forEach(function(k){out.push(found[k]);});return out;}
+function employeeFromNode(t){if(!t||!rows.length)return null;var node=t.nodeType===1?t:t.parentElement;for(var depth=0;node&&node!==document.body&&depth<10;depth++,node=node.parentElement){var c=employeeCandidatesIn(node);if(c.length===1)return c[0];if(c.length>1)return null;}return null;}
+function looksLikePayInput(i){if(!i||i.tagName!=='INPUT'||!visible(i)||i.disabled||i.readOnly)return false;if(!/^(number|text|tel)$/.test((i.type||'text').toLowerCase()))return false;var meta=[i.name,i.id,i.placeholder,i.getAttribute('aria-label'),i.className].join(' ').toLowerCase();if(/wage|salary|pay/.test(meta))return true;if(employeeFromNode(i))return true;var node=i.parentElement;for(var d=0;node&&node!==document.body&&d<5;d++,node=node.parentElement){var text=(node.textContent||'').toLowerCase();if(/wage|salary|daily pay|\bpay\b/.test(text))return true;}return false;}
+function wageInputs(){return Array.from(document.querySelectorAll('input')).filter(looksLikePayInput);}
+function wageInput(){var a=wageInputs();return a.length===1?a[0]:null;}
+function employeeForInput(i){return employeeFromNode(i);}
+'''
+          src=src[:start]+replacement+src[end:]
+
+          # Remove the older duplicate employeeFromNode function if it remains later in the file.
+          src=re.sub(r"function employeeFromNode\(t\)\{.*?\}\nfunction fillClickedInput", "function fillClickedInput", src, count=1, flags=re.S)
+
+          old="var pendingEmployeeId='',pendingUntil=0;function rememberEmployee(target){var x=employeeFromNode(target);if(x){pendingEmployeeId=x.id;pendingUntil=Date.now()+1800;return x;}return null;}function pendingEmployee(){if(!pendingEmployeeId||Date.now()>pendingUntil){pendingEmployeeId='';return null;}return rows.find(function(z){return z.id===pendingEmployeeId;})||null;}function handlePayTarget(target){if(!cfg.fill)return;var x=rememberEmployee(target),i=target&&target.closest?target.closest('input'):null;if(i&&looksLikePayInput(i)){var direct=employeeForInput(i)||x;if(direct){pendingEmployeeId='';fillInput(i,direct);}}}document.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){var i=e.target;if(!cfg.fill||!i||i.tagName!=='INPUT'||!looksLikePayInput(i))return;var x=employeeForInput(i)||pendingEmployee();if(x){pendingEmployeeId='';fillInput(i,x);}},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(muts){if(!cfg.fill||!pendingEmployeeId)return;var x=pendingEmployee();if(!x)return;for(var m=0;m<muts.length;m++){var nodes=muts[m].addedNodes||[];for(var j=0;j<nodes.length;j++){var node=nodes[j],inputs=[];if(node.nodeType===1){if(node.tagName==='INPUT')inputs=[node];else if(node.querySelectorAll)inputs=Array.from(node.querySelectorAll('input'));}for(var k=0;k<inputs.length;k++){if(looksLikePayInput(inputs[k])){pendingEmployeeId='';fillInput(inputs[k],x);return;}}}}}).observe(document.documentElement,{childList:true,subtree:true});"
+          new="var pendingEmployeeId='',pendingUntil=0;function clearPending(){pendingEmployeeId='';pendingUntil=0;}function rememberEmployee(target){var x=employeeFromNode(target);if(x){pendingEmployeeId=x.id;pendingUntil=Date.now()+1800;return x;}return null;}function pendingEmployee(){if(!pendingEmployeeId||Date.now()>pendingUntil){clearPending();return null;}return rows.find(function(z){return z.id===pendingEmployeeId;})||null;}function handlePayTarget(target){if(!cfg.fill)return;var i=target&&target.closest?target.closest('input'):null;var direct=i?employeeForInput(i):null;var x=direct||rememberEmployee(target);if(i&&looksLikePayInput(i)&&x){clearPending();fillInput(i,x);}}document.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){var i=e.target;if(!cfg.fill||!i||i.tagName!=='INPUT'||!looksLikePayInput(i))return;var direct=employeeForInput(i);if(direct){clearPending();fillInput(i,direct);return;}var x=pendingEmployee();if(x){clearPending();fillInput(i,x);}},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(muts){if(!cfg.fill||!pendingEmployeeId)return;var x=pendingEmployee();if(!x)return;for(var m=0;m<muts.length;m++){var nodes=muts[m].addedNodes||[];for(var j=0;j<nodes.length;j++){var node=nodes[j],inputs=[];if(node.nodeType===1){if(node.tagName==='INPUT')inputs=[node];else if(node.querySelectorAll)inputs=Array.from(node.querySelectorAll('input'));}for(var k=0;k<inputs.length;k++){if(looksLikePayInput(inputs[k])){clearPending();fillInput(inputs[k],x);return;}}}}}).observe(document.documentElement,{childList:true,subtree:true});"
+          if old not in src:
+              raise SystemExit('Expected v1.6.1 event block not found')
+          src=src.replace(old,new,1)
+
+          # Safety checks: no form-level employee fallback and no index-based employee mapping.
+          if "[role=\"dialog\"],form" in src or "[role=row],[role=dialog],form" in src:
+              raise SystemExit('Broad form fallback remains')
+          if "inputs.indexOf(i)" in src:
+              raise SystemExit('Index fallback remains')
+          Path('ghost-byte-wage-calculator-v1.6.2.user.js').write_text(src,encoding='utf-8')
+          Path('ghost-byte-wage-calculator.user.js').write_text(src,encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.6.2.user.js
+      - name: Unit-test employee mapping behavior
+        run: |
+          node - <<'JS'
+          const rows=[{id:'300',name:'Highest',suggested:6000},{id:'100',name:'Low',suggested:2950},{id:'200',name:'Mid',suggested:5700}];
+          function resolve(ancestors){for(const node of ancestors){const found=new Map();for(const id of node.ids||[]){const r=rows.find(x=>x.id===id);if(r)found.set(r.id,r);}if(!found.size){const text=(node.text||'').toLowerCase();for(const r of rows){if(text.includes(r.name.toLowerCase()))found.set(r.id,r);}}if(found.size===1)return [...found.values()][0];if(found.size>1)return null;}return null;}
+          const form={text:'Highest Low Mid',ids:['300','100','200']};
+          const cases=[
+            [2950,[{text:'',ids:[]},{text:'Low Pay',ids:['100']},form]],
+            [5700,[{text:'',ids:[]},{text:'Mid Pay',ids:['200']},form]],
+            [6000,[{text:'',ids:[]},{text:'Highest Pay',ids:['300']},form]],
+          ];
+          for(const [want,ancestors] of cases){const got=resolve(ancestors);if(!got||got.suggested!==want)throw new Error('mapping failed: expected '+want+' got '+(got&&got.suggested));}
+          console.log('mapping tests passed');
+          JS
+      - name: Commit generated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.6.2.user.js ghost-byte-wage-calculator.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Fix employee-specific wage autofill mapping"
+          git push
