@@ -14,30 +14,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build robust autofill release
+      - name: Build employee-first autofill release
         run: |
           python - <<'PY'
           from pathlib import Path
-          src=Path('ghost-byte-wage-calculator.user.js').read_text(encoding='utf-8')
-          src=src.replace('// @version      1.5.6','// @version      1.5.7',1)
-          src=src.replace("var ID='gb-wage-v156'","var ID='gb-wage-v157'",1)
-          patch=r'''
-function gbNotice(msg,ok){var old=document.getElementById('gb-autofill-notice');if(old)old.remove();var d=document.createElement('div');d.id='gb-autofill-notice';d.textContent=msg;d.style.cssText='position:fixed;left:50%;bottom:85px;transform:translateX(-50%);z-index:2147483647;max-width:88vw;padding:10px 14px;border-radius:8px;background:'+(ok?'#075c3a':'#6b2020')+';color:#fff;-webkit-text-fill-color:#fff;font:700 13px Arial;box-shadow:0 3px 14px #000b';document.body.appendChild(d);setTimeout(function(){d.remove();},2200);}
-function gbRowForInput(input){var node=input;for(var i=0;i<10&&node&&node!==document.body;i++,node=node.parentElement){var text=(node.innerText||node.textContent||'').toLowerCase();var link=node.querySelector&&node.querySelector('a[href*="XID="],a[href*="userID="],a[href*="profiles.php"]');var href=link&&link.getAttribute('href')||'';var m=href.match(/(?:XID|userID)=(\d+)/i);if(m){var byId=rows.find(function(r){return String(r.id)===m[1];});if(byId)return byId;}for(var j=0;j<rows.length;j++){var name=String(rows[j].name||'').trim().toLowerCase();if(name&&text.indexOf(name)!==-1)return rows[j];}}return null;}
-function gbSetInput(input,row){if(!input||!row||row.omit)return false;var value=String(Math.round(row.suggested));try{input.focus();var proto=input instanceof HTMLInputElement?HTMLInputElement.prototype:input instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:null;var desc=proto&&Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(input,value);else input.value=value;if(input._valueTracker)input._valueTracker.setValue('');input.setAttribute('value',value);try{input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));}catch(_){input.dispatchEvent(new Event('input',{bubbles:true}));}input.dispatchEvent(new Event('change',{bubbles:true}));setTimeout(function(){if(String(input.value).replace(/,/g,'')!==value){if(desc&&desc.set)desc.set.call(input,value);else input.value=value;if(input._valueTracker)input._valueTracker.setValue('');input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));}},120);gbNotice('Filled '+row.name+': $'+fmt(row.suggested),true);return true;}catch(e){gbNotice('Could not fill this pay field.',false);return false;}}
-function gbDirectAutofill(event){if(!cfg.fill||!rows.length)return;var input=event.target;if(!input||host.contains(input))return;var tag=(input.tagName||'').toLowerCase();if(tag!=='input'&&tag!=='textarea'&&!input.isContentEditable)return;var row=gbRowForInput(input);if(!row){gbNotice('Employee could not be identified for this field.',false);return;}gbSetInput(input,row);}
-document.addEventListener('pointerdown',gbDirectAutofill,true);document.addEventListener('focusin',gbDirectAutofill,true);
-'''
-          src=src.replace('\n}());',patch+'\n}());')
-          Path('ghost-byte-wage-calculator-v1.5.7.user.js').write_text(src,encoding='utf-8')
-          Path('ghost-byte-wage-calculator.user.js').write_text(src,encoding='utf-8')
+          p=Path('ghost-byte-wage-calculator-v1.5.6.user.js')
+          s=p.read_text(encoding='utf-8')
+          s=s.replace('// @version      1.5.6','// @version      1.5.7',1)
+          s=s.replace("var ID='gb-wage-v156'","var ID='gb-wage-v157'",1)
+          old="function fillClickedInput(i){if(!cfg.fill)return false;var x=employeeForInput(i);if(!x)return false;selected=x.id;return fillInput(i,x);}"
+          new="function employeeFromNode(t){if(!t||!rows.length)return null;var box=t.closest&&t.closest('tr,li,[data-user-id],[data-userid],[class*=employee i],[class*=staff i],[class*=worker i],[class*=row i],[role=row],[role=dialog],form');if(!box)return null;var id='',link=box.querySelector('a[href*=XID],a[href*=userID],a[href*=profiles\\.php]');if(link){try{var u=new URL(link.href,location.href);id=u.searchParams.get('XID')||u.searchParams.get('userID')||'';}catch(e){}}id=id||box.getAttribute('data-user-id')||box.getAttribute('data-userid')||box.getAttribute('data-id')||'';if(id){var byId=rows.find(function(x){return x.id===String(id);});if(byId)return byId;}var text=(box.textContent||'').toLowerCase();return rows.find(function(x){return x.name&&text.indexOf(x.name.toLowerCase())>=0;})||null;}\nfunction fillClickedInput(i){if(!cfg.fill)return false;var x=employeeForInput(i)||rows.find(function(z){return z.id===selected;});if(!x)return false;selected=x.id;return fillInput(i,x);}"
+          if old not in s: raise SystemExit('fillClickedInput anchor missing')
+          s=s.replace(old,new,1)
+          old2="function handlePayTarget(target){var i=target&&target.closest?target.closest('input'):null;if(!cfg.fill||!looksLikePayInput(i))return;setTimeout(function(){fillClickedInput(i);},20);setTimeout(function(){fillClickedInput(i);},180);}"
+          new2="function handlePayTarget(target){if(!cfg.fill)return;var x=employeeFromNode(target);if(x)selected=x.id;var i=target&&target.closest?target.closest('input'):null;if(i&&looksLikePayInput(i)){setTimeout(function(){fillClickedInput(i);},20);setTimeout(function(){fillClickedInput(i);},180);setTimeout(function(){fillClickedInput(i);},500);}else if(x){var tries=0,timer=setInterval(function(){if(fill()||++tries>25)clearInterval(timer);},120);}}"
+          if old2 not in s: raise SystemExit('handlePayTarget anchor missing')
+          s=s.replace(old2,new2,1)
+          Path('ghost-byte-wage-calculator-v1.5.7.user.js').write_text(s,encoding='utf-8')
+          main=s.replace('// @match        https://torn.com/companies.php*\n','// @match        https://torn.com/companies.php*\n// @updateURL    https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js\n// @downloadURL  https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js\n',1)
+          Path('ghost-byte-wage-calculator.user.js').write_text(main,encoding='utf-8')
           PY
           node --check ghost-byte-wage-calculator-v1.5.7.user.js
+          node --check ghost-byte-wage-calculator.user.js
       - name: Commit generated files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ghost-byte-wage-calculator-v1.5.7.user.js ghost-byte-wage-calculator.user.js
           if git diff --cached --quiet; then exit 0; fi
-          git commit -m "Fix direct employee pay autofill"
+          git commit -m "Remember employee before Torn opens pay editor"
           git push
