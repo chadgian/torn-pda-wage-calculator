@@ -1,0 +1,43 @@
+name: Build wage calculator v1.6.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.6.0.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build employee-specific autofill release
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src=Path('ghost-byte-wage-calculator-v1.5.9.user.js').read_text(encoding='utf-8')
+          src=src.replace('// @version      1.5.9','// @version      1.6.0',1)
+          src=src.replace("var ID='gb-wage-v159'","var ID='gb-wage-v160'",1)
+          src=src.replace("function fillClickedInput(i){if(!cfg.fill)return false;var x=employeeForInput(i)||rows.find(function(z){return z.id===selected;});if(!x)return false;selected=x.id;return fillInput(i,x);}","function fillClickedInput(i){if(!cfg.fill)return false;var x=employeeForInput(i);if(!x)return false;selected=x.id;return fillInput(i,x);}",1)
+          old="S.querySelector('#overlay').onclick=function(e){if(e.target.id==='overlay')close();};S.addEventListener('click',function(e){if(!e.target.closest('[data-help]')&&!e.target.closest('#tip'))tip(false);});function handlePayTarget(target){if(!cfg.fill)return;var x=employeeFromNode(target);if(x)selected=x.id;var i=target&&target.closest?target.closest('input'):null;if(i&&looksLikePayInput(i)){setTimeout(function(){fillClickedInput(i);},20);setTimeout(function(){fillClickedInput(i);},180);setTimeout(function(){fillClickedInput(i);},500);}else if(x){var tries=0,timer=setInterval(function(){if(fill()||++tries>25)clearInterval(timer);},120);}}\ndocument.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){handlePayTarget(e.target);},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(){fill();}).observe(document.documentElement,{childList:true,subtree:true});"
+          new="S.querySelector('#overlay').onclick=function(e){if(e.target.id==='overlay')close();};S.addEventListener('click',function(e){if(!e.target.closest('[data-help]')&&!e.target.closest('#tip'))tip(false);});var pendingEmployeeId='',pendingUntil=0;function rememberEmployee(target){var x=employeeFromNode(target);if(x){pendingEmployeeId=x.id;pendingUntil=Date.now()+1800;return x;}return null;}function pendingEmployee(){if(!pendingEmployeeId||Date.now()>pendingUntil){pendingEmployeeId='';return null;}return rows.find(function(z){return z.id===pendingEmployeeId;})||null;}function handlePayTarget(target){if(!cfg.fill)return;var x=rememberEmployee(target),i=target&&target.closest?target.closest('input'):null;if(i&&looksLikePayInput(i)){var direct=employeeForInput(i)||x;if(direct){pendingEmployeeId='';fillInput(i,direct);}}}document.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){var i=e.target;if(!cfg.fill||!i||i.tagName!=='INPUT'||!looksLikePayInput(i))return;var x=employeeForInput(i)||pendingEmployee();if(x){pendingEmployeeId='';fillInput(i,x);}},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(muts){if(!cfg.fill||!pendingEmployeeId)return;var x=pendingEmployee();if(!x)return;for(var m=0;m<muts.length;m++){var nodes=muts[m].addedNodes||[];for(var j=0;j<nodes.length;j++){var node=nodes[j],inputs=[];if(node.nodeType===1){if(node.tagName==='INPUT')inputs=[node];else if(node.querySelectorAll)inputs=Array.from(node.querySelectorAll('input'));}for(var k=0;k<inputs.length;k++){if(looksLikePayInput(inputs[k])){pendingEmployeeId='';fillInput(inputs[k],x);return;}}}}}).observe(document.documentElement,{childList:true,subtree:true});"
+          if old not in src:
+              raise SystemExit('Expected old event wiring was not found')
+          src=src.replace(old,new,1)
+          if "new MutationObserver(function(){fill();})" in src:
+              raise SystemExit('Global fill observer remains')
+          Path('ghost-byte-wage-calculator-v1.6.0.user.js').write_text(src,encoding='utf-8')
+          Path('ghost-byte-wage-calculator.user.js').write_text(src,encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.6.0.user.js
+      - name: Commit generated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.6.0.user.js ghost-byte-wage-calculator.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Fix employee-specific wage autofill"
+          git push
