@@ -18,7 +18,6 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re
           src=Path('ghost-byte-wage-calculator-v1.6.1.user.js').read_text(encoding='utf-8')
           src=src.replace('// @version      1.6.1','// @version      1.6.2',1)
           src=src.replace("var ID='gb-wage-v161'","var ID='gb-wage-v162'",1)
@@ -34,8 +33,14 @@ function employeeForInput(i){return employeeFromNode(i);}
 '''
           src=src[:start]+replacement+src[end:]
 
-          # Remove the older duplicate employeeFromNode function if it remains later in the file.
-          src=re.sub(r"function employeeFromNode\(t\)\{.*?\}\nfunction fillClickedInput", "function fillClickedInput", src, count=1, flags=re.S)
+          # Remove only the old duplicate resolver later in the source.
+          first=src.find('function employeeFromNode(t)')
+          second=src.find('function employeeFromNode(t)',first+1)
+          if second!=-1:
+              second_end=src.find('function fillClickedInput',second)
+              if second_end==-1:
+                  raise SystemExit('Could not locate end of old employee resolver')
+              src=src[:second]+src[second_end:]
 
           old="var pendingEmployeeId='',pendingUntil=0;function rememberEmployee(target){var x=employeeFromNode(target);if(x){pendingEmployeeId=x.id;pendingUntil=Date.now()+1800;return x;}return null;}function pendingEmployee(){if(!pendingEmployeeId||Date.now()>pendingUntil){pendingEmployeeId='';return null;}return rows.find(function(z){return z.id===pendingEmployeeId;})||null;}function handlePayTarget(target){if(!cfg.fill)return;var x=rememberEmployee(target),i=target&&target.closest?target.closest('input'):null;if(i&&looksLikePayInput(i)){var direct=employeeForInput(i)||x;if(direct){pendingEmployeeId='';fillInput(i,direct);}}}document.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){var i=e.target;if(!cfg.fill||!i||i.tagName!=='INPUT'||!looksLikePayInput(i))return;var x=employeeForInput(i)||pendingEmployee();if(x){pendingEmployeeId='';fillInput(i,x);}},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(muts){if(!cfg.fill||!pendingEmployeeId)return;var x=pendingEmployee();if(!x)return;for(var m=0;m<muts.length;m++){var nodes=muts[m].addedNodes||[];for(var j=0;j<nodes.length;j++){var node=nodes[j],inputs=[];if(node.nodeType===1){if(node.tagName==='INPUT')inputs=[node];else if(node.querySelectorAll)inputs=Array.from(node.querySelectorAll('input'));}for(var k=0;k<inputs.length;k++){if(looksLikePayInput(inputs[k])){pendingEmployeeId='';fillInput(inputs[k],x);return;}}}}}).observe(document.documentElement,{childList:true,subtree:true});"
           new="var pendingEmployeeId='',pendingUntil=0;function clearPending(){pendingEmployeeId='';pendingUntil=0;}function rememberEmployee(target){var x=employeeFromNode(target);if(x){pendingEmployeeId=x.id;pendingUntil=Date.now()+1800;return x;}return null;}function pendingEmployee(){if(!pendingEmployeeId||Date.now()>pendingUntil){clearPending();return null;}return rows.find(function(z){return z.id===pendingEmployeeId;})||null;}function handlePayTarget(target){if(!cfg.fill)return;var i=target&&target.closest?target.closest('input'):null;var direct=i?employeeForInput(i):null;var x=direct||rememberEmployee(target);if(i&&looksLikePayInput(i)&&x){clearPending();fillInput(i,x);}}document.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){var i=e.target;if(!cfg.fill||!i||i.tagName!=='INPUT'||!looksLikePayInput(i))return;var direct=employeeForInput(i);if(direct){clearPending();fillInput(i,direct);return;}var x=pendingEmployee();if(x){clearPending();fillInput(i,x);}},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(muts){if(!cfg.fill||!pendingEmployeeId)return;var x=pendingEmployee();if(!x)return;for(var m=0;m<muts.length;m++){var nodes=muts[m].addedNodes||[];for(var j=0;j<nodes.length;j++){var node=nodes[j],inputs=[];if(node.nodeType===1){if(node.tagName==='INPUT')inputs=[node];else if(node.querySelectorAll)inputs=Array.from(node.querySelectorAll('input'));}for(var k=0;k<inputs.length;k++){if(looksLikePayInput(inputs[k])){clearPending();fillInput(inputs[k],x);return;}}}}}).observe(document.documentElement,{childList:true,subtree:true});"
@@ -43,11 +48,15 @@ function employeeForInput(i){return employeeFromNode(i);}
               raise SystemExit('Expected v1.6.1 event block not found')
           src=src.replace(old,new,1)
 
-          # Safety checks: no form-level employee fallback and no index-based employee mapping.
-          if "[role=\"dialog\"],form" in src or "[role=row],[role=dialog],form" in src:
-              raise SystemExit('Broad form fallback remains')
+          if src.count('function employeeFromNode(t)')!=1:
+              raise SystemExit('Expected exactly one employee resolver')
           if "inputs.indexOf(i)" in src:
               raise SystemExit('Index fallback remains')
+          if "[role=row],[role=dialog],form" in src or "[role=\"dialog\"],form" in src:
+              raise SystemExit('Broad form fallback remains')
+          if "function setNativeValue" not in src or "function fillInput" not in src:
+              raise SystemExit('Autofill functions were accidentally removed')
+
           Path('ghost-byte-wage-calculator-v1.6.2.user.js').write_text(src,encoding='utf-8')
           Path('ghost-byte-wage-calculator.user.js').write_text(src,encoding='utf-8')
           PY
@@ -64,6 +73,7 @@ function employeeForInput(i){return employeeFromNode(i);}
             [6000,[{text:'',ids:[]},{text:'Highest Pay',ids:['300']},form]],
           ];
           for(const [want,ancestors] of cases){const got=resolve(ancestors);if(!got||got.suggested!==want)throw new Error('mapping failed: expected '+want+' got '+(got&&got.suggested));}
+          const broadOnly=resolve([form]);if(broadOnly!==null)throw new Error('broad form must not resolve to one employee');
           console.log('mapping tests passed');
           JS
       - name: Commit generated files
