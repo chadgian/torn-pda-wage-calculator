@@ -1,0 +1,43 @@
+name: Build wage calculator v1.5.7
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.5.7.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build robust autofill release
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src=Path('ghost-byte-wage-calculator.user.js').read_text(encoding='utf-8')
+          src=src.replace('// @version      1.5.6','// @version      1.5.7',1)
+          src=src.replace("var ID='gb-wage-v156'","var ID='gb-wage-v157'",1)
+          patch=r'''
+function gbNotice(msg,ok){var old=document.getElementById('gb-autofill-notice');if(old)old.remove();var d=document.createElement('div');d.id='gb-autofill-notice';d.textContent=msg;d.style.cssText='position:fixed;left:50%;bottom:85px;transform:translateX(-50%);z-index:2147483647;max-width:88vw;padding:10px 14px;border-radius:8px;background:'+(ok?'#075c3a':'#6b2020')+';color:#fff;-webkit-text-fill-color:#fff;font:700 13px Arial;box-shadow:0 3px 14px #000b';document.body.appendChild(d);setTimeout(function(){d.remove();},2200);}
+function gbRowForInput(input){var node=input;for(var i=0;i<9&&node&&node!==document.body;i++,node=node.parentElement){var text=(node.innerText||node.textContent||'').toLowerCase();var link=node.querySelector&&node.querySelector('a[href*="XID="],a[href*="userID="],a[href*="profiles.php"]');var href=link&&link.getAttribute('href')||'';var m=href.match(/(?:XID|userID)=(\d+)/i);if(m){var byId=rows.find(function(r){return String(r.id)===m[1];});if(byId)return byId;}for(var j=0;j<rows.length;j++){var name=String(rows[j].name||'').trim().toLowerCase();if(name&&text.indexOf(name)!==-1)return rows[j];}}return null;}
+function gbSetInput(input,row){if(!input||!row||row.omit)return false;var value=String(Math.round(row.suggested));try{input.focus();var proto=input instanceof HTMLInputElement?HTMLInputElement.prototype:input instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:null;var desc=proto&&Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(input,value);else input.value=value;if(input._valueTracker)input._valueTracker.setValue('');input.setAttribute('value',value);input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('blur',{bubbles:true}));setTimeout(function(){if(String(input.value).replace(/,/g,'')!==value){if(desc&&desc.set)desc.set.call(input,value);else input.value=value;input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));}},120);gbNotice('Filled '+row.name+': $'+fmt(row.suggested),true);return true;}catch(e){gbNotice('Could not fill this pay field.',false);return false;}}
+function gbDirectAutofill(event){if(!cfg.fill||!rows.length)return;var input=event.target;if(!input||input.closest&&input.closest('#'+ID))return;var tag=(input.tagName||'').toLowerCase();if(tag!=='input'&&tag!=='textarea'&&!(input.isContentEditable))return;var row=gbRowForInput(input);if(!row){gbNotice('Employee could not be identified for this field.',false);return;}gbSetInput(input,row);}
+document.addEventListener('pointerdown',gbDirectAutofill,true);document.addEventListener('focusin',gbDirectAutofill,true);
+'''
+          src=src.replace('\n}());',patch+'\n}());')
+          Path('ghost-byte-wage-calculator-v1.5.7.user.js').write_text(src,encoding='utf-8')
+          Path('ghost-byte-wage-calculator.user.js').write_text(src,encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.5.7.user.js
+      - name: Commit generated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.5.7.user.js ghost-byte-wage-calculator.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Fix direct employee pay autofill"
+          git push
