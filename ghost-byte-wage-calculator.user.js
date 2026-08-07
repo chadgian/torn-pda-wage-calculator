@@ -1,287 +1,65 @@
 // ==UserScript==
 // @name         Ghost Byte Wage Calculator
 // @namespace    wyn.torn.company.tools
-// @version      1.4.0
-// @description  Self-contained Torn PDA wage calculator with a draggable launcher, exclusions, role suggestions, help, and optional wage autofill.
+// @version      1.5.6
+// @description  Self-contained Torn PDA employee wage calculator.
 // @author       Wyn / OpenAI
-// @match        https://www.torn.com/*
-// @match        https://torn.com/*
-// @include      https://www.torn.com/*
-// @include      https://torn.com/*
+// @match        https://www.torn.com/companies.php*
+// @match        https://torn.com/companies.php*
+// @updateURL    https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js
+// @downloadURL  https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js
 // @run-at       document-end
 // @grant        none
 // ==/UserScript==
 
-(() => {
-  'use strict';
-
-  const ID = 'ghost-byte-wage-calculator';
-  const API_KEY = '###PDA-APIKEY###';
-  const STORE = `${ID}:v140`;
-  const $ = (s, root = document) => root.querySelector(s);
-  const $$ = (s, root = document) => [...root.querySelectorAll(s)];
-  const num = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
-  const cash = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
-
-  const defaults = {
-    mode: 'current', fixedBudget: 10000000, benchmark: 1000000,
-    targetEff: 100, statWeight: 35, effWeight: 65,
-    minWage: 0, maxWage: 25000000, roundTo: 10000,
-    includeDirector: true, autoFill: false,
-  };
-
-  const help = {
-    mode: ['Payment model', 'Current payroll redistributes the included employees’ present wage pool. Fixed budget distributes the amount you enter. Benchmark multiplies each employee score by the benchmark wage.'],
-    fixedBudget: ['Fixed daily payroll', 'Used only with Fixed budget. This entire amount is divided among included employees. Excluded employees keep their existing wage outside this pool.'],
-    benchmark: ['Benchmark daily wage', 'Used only with Benchmark. An employee whose score is 1.00 receives approximately this amount before limits and rounding.'],
-    targetEff: ['Target effectiveness', 'The effectiveness value treated as 1.00. At the default of 100, an employee with 100 effectiveness has a performance index of 1.00.'],
-    statWeight: ['Work-stat weight', 'Controls how strongly MAN + INT + END influence the score. Work stats are compared with the median of included employees using logarithmic scaling.'],
-    effWeight: ['Effectiveness weight', 'Controls how strongly current total effectiveness influences the score. The two weights are automatically converted into proportions.'],
-    minWage: ['Minimum wage', 'The lowest recommended daily wage for an included employee, unless the chosen total budget cannot mathematically support it.'],
-    maxWage: ['Maximum wage', 'The highest recommended daily wage. The default is $25,000,000.'],
-    roundTo: ['Round wages to', 'Rounds recommendations to a clean increment, such as the nearest $10,000.'],
-    includeDirector: ['Include director', 'When off, the director remains visible but is excluded from the median, employee scores, and wage distribution.'],
-    autoFill: ['Autofill wage field', 'When enabled, clicking an employee causes the script to fill the visible wage textbox with the suggestion. It never presses Update, Save, or Submit.'],
-  };
-
-  const cyberRoles = [
-    ['Developer', 'intelligence', 24000, 'endurance', 12000],
-    ['Tester', 'intelligence', 12000, 'endurance', 6000],
-    ['Graphic Designer', 'intelligence', 18000, 'endurance', 9000],
-    ['Apprentice', 'intelligence', 6000, 'endurance', 3000],
-    ['Cleaner', 'manual', 12000, 'endurance', 6000],
-    ['Lead Developer', 'endurance', 48000, 'intelligence', 24000],
-    ['Analyst', 'endurance', 36000, 'intelligence', 18000],
-  ];
-
-  let settings = load('settings', defaults);
-  let excluded = new Set(load('excluded', []));
-  let employees = [];
-  let loading = false;
-  let error = '';
-  let selectedId = '';
-  let latestRows = [];
-  let settingsOpen = false;
-
-  function load(key, fallback) {
-    try {
-      const value = JSON.parse(localStorage.getItem(`${STORE}:${key}`));
-      if (Array.isArray(fallback)) return Array.isArray(value) ? value : [...fallback];
-      return value && typeof value === 'object' ? { ...fallback, ...value } : { ...fallback };
-    } catch (_) { return Array.isArray(fallback) ? [...fallback] : { ...fallback }; }
-  }
-  function save(key, value) { localStorage.setItem(`${STORE}:${key}`, JSON.stringify(value)); }
-  function n(v) { const x = Number(v); return Number.isFinite(x) ? x : 0; }
-  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-  function sum(a, fn) { return a.reduce((t, x) => t + n(fn(x)), 0); }
-  function median(a) { const x = a.filter(Number.isFinite).sort((p, q) => p - q); const m = Math.floor(x.length / 2); return !x.length ? 1 : x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2; }
-  function roundWage(v) { const step = Math.max(1, n(settings.roundTo)); return Math.round(v / step) * step; }
-  function esc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c])); }
-
-  function normalize(collection) {
-    const pairs = Array.isArray(collection) ? collection.map((x, i) => [x?.id ?? x?.user_id ?? i, x]) : Object.entries(collection || {});
-    return pairs.map(([fallback, raw]) => {
-      const ws = raw?.working_stats || raw?.work_stats || raw?.stats || {};
-      const user = raw?.user && typeof raw.user === 'object' ? raw.user : {};
-      const pos = typeof raw?.position === 'object' ? raw.position.name || raw.position.title : raw?.position || raw?.role || 'Unassigned';
-      const manual = n(ws.manual_labor ?? ws.manual ?? raw?.manual_labor ?? raw?.manual ?? raw?.man);
-      const intelligence = n(ws.intelligence ?? ws.intel ?? raw?.intelligence ?? raw?.intel ?? raw?.int);
-      const endurance = n(ws.endurance ?? ws.end ?? raw?.endurance ?? raw?.end);
-      const source = raw?.effectiveness ?? raw?.efficiency ?? 0;
-      let effectiveness = n(source);
-      if (source && typeof source === 'object') {
-        effectiveness = n(source.total ?? source.overall ?? source.effectiveness ?? source.value);
-        if (!effectiveness) effectiveness = sum(Object.values(source), v => v);
-      }
-      return {
-        id: String(raw?.id ?? raw?.user_id ?? raw?.player_id ?? user.id ?? fallback),
-        name: String(raw?.name ?? raw?.username ?? user.name ?? `Employee ${fallback}`),
-        position: String(pos), manual, intelligence, endurance,
-        total: manual + intelligence + endurance, effectiveness,
-        wage: n(raw?.wage ?? raw?.salary ?? raw?.daily_wage ?? raw?.pay),
-        director: Boolean(raw?.is_director) || /director/i.test(String(pos)),
-      };
-    });
-  }
-
-  async function fetchEmployees() {
-    if (!API_KEY || API_KEY.includes('###PDA-APIKEY###')) throw new Error('Torn PDA did not supply an API key. Configure a Limited or Custom key with company employee access.');
-    const response = await fetch(`https://api.torn.com/v2/company/employees?key=${encodeURIComponent(API_KEY)}`, { credentials: 'omit', headers: { Accept: 'application/json' } });
-    if (!response.ok) throw new Error(`Torn API request failed (${response.status}).`);
-    const data = await response.json();
-    if (data?.error) throw new Error(data.error.error || data.error.message || 'Torn API error.');
-    const rows = normalize(data?.employees ?? data?.company_employees ?? data?.companyEmployees ?? []);
-    if (!rows.length) throw new Error('No employees were returned. Confirm that the key belongs to the company director.');
-    return rows;
-  }
-
-  function roleSuggestion(e) {
-    let best = null;
-    for (const [name, p, pr, s, sr] of cyberRoles) {
-      const fit = Math.min(e[p] / pr, e[s] / sr);
-      const balance = Math.min(e[p] / pr, 2) * .7 + Math.min(e[s] / sr, 2) * .3;
-      const score = fit >= 1 ? 10 + balance : balance;
-      if (!best || score > best.score) best = { name, score, fit };
-    }
-    return best ? `${best.name}${best.fit < 1 ? ' (developing)' : ''}` : 'General staff';
-  }
-
-  function calculate() {
-    const eligible = employees.filter(e => !excluded.has(e.id) && (settings.includeDirector || !e.director));
-    const med = Math.max(1, median(eligible.map(e => e.total)));
-    const sw = Math.max(0, n(settings.statWeight));
-    const ew = Math.max(0, n(settings.effWeight));
-    const wt = sw + ew || 1;
-    const scored = eligible.map(e => {
-      const statIndex = clamp(Math.log1p(e.total) / Math.log1p(med), .35, 2.25);
-      const effIndex = clamp(e.effectiveness / Math.max(1, n(settings.targetEff)), 0, 2.5);
-      return { ...e, score: Math.max(.01, (statIndex * sw + effIndex * ew) / wt) };
-    });
-
-    if (settings.mode === 'benchmark') {
-      scored.forEach(e => e.suggested = roundWage(clamp(n(settings.benchmark) * e.score, n(settings.minWage), n(settings.maxWage))));
-    } else {
-      const budget = settings.mode === 'fixed' ? Math.max(0, n(settings.fixedBudget)) : sum(scored, e => e.wage);
-      const min = Math.max(0, n(settings.minWage));
-      const max = Math.max(min, n(settings.maxWage));
-      const scoreTotal = sum(scored, e => e.score) || 1;
-      const guaranteed = Math.min(budget, min * scored.length);
-      const remaining = Math.max(0, budget - guaranteed);
-      scored.forEach(e => e.suggested = roundWage(clamp((scored.length ? guaranteed / scored.length : 0) + remaining * e.score / scoreTotal, min, max)));
-      const step = Math.max(1, n(settings.roundTo));
-      let diff = roundWage(budget - sum(scored, e => e.suggested));
-      const ordered = [...scored].sort((a, b) => diff >= 0 ? b.score - a.score : a.score - b.score);
-      let guard = 0;
-      while (Math.abs(diff) >= step && ordered.length && guard++ < 500) {
-        const e = ordered[guard % ordered.length];
-        const next = e.suggested + (diff > 0 ? step : -step);
-        if (next >= min && next <= max) { e.suggested = next; diff += diff > 0 ? -step : step; }
-      }
-    }
-
-    const map = new Map(scored.map(e => [e.id, e]));
-    latestRows = employees.map(e => {
-      const found = map.get(e.id);
-      const omitted = excluded.has(e.id) || (!settings.includeDirector && e.director);
-      const suggested = found?.suggested ?? e.wage;
-      return { ...(found || e), omitted, suggested, change: suggested - e.wage, role: roleSuggestion(e) };
-    });
-    return { rows: latestRows, current: sum(latestRows, e => e.wage), suggested: sum(latestRows, e => e.suggested), med };
-  }
-
-  function installStyles() {
-    if ($(`#${ID}-style`)) return;
-    const style = document.createElement('style');
-    style.id = `${ID}-style`;
-    style.textContent = `
-#${ID}-button{position:fixed;right:14px;bottom:96px;z-index:2147483646;border:2px solid #85efb7;border-radius:999px;padding:12px 16px;background:#075c3a;color:#fff;font:800 14px Arial,sans-serif;box-shadow:0 4px 18px #000b;touch-action:none;user-select:none;-webkit-user-select:none;display:block!important;visibility:visible!important;opacity:1!important}
-#${ID}-overlay{display:none;position:fixed;inset:0;z-index:2147483647;background:#000c;overflow:auto;padding:10px;box-sizing:border-box;font-family:Arial,sans-serif;color:#fff}#${ID}-overlay.open{display:block}
-#${ID}-panel{max-width:1150px;margin:0 auto 40px;background:#15191d;border:1px solid #68727c;border-radius:12px;overflow:hidden}.gb-head{display:flex;justify-content:space-between;align-items:center;padding:14px;background:#080a0c;border-bottom:1px solid #555}.gb-title{font-size:18px;font-weight:800}.gb-sub,.gb-note{color:#e0e4e7;font-size:12px}.gb-tools{display:flex;flex-wrap:wrap;gap:7px;padding:11px;background:#22272c}.gb-btn{border:1px solid #7d8791;border-radius:7px;padding:9px 11px;background:#343b42;color:#fff;font-weight:800}.gb-primary{background:#086642}.gb-settings{display:none;padding:12px;background:#1d2227}.gb-settings.open{display:block}.gb-grid{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}.gb-field label{display:flex;align-items:center;gap:5px;color:#fff;font-size:12px;font-weight:800;margin-bottom:5px}.gb-field input,.gb-field select{width:100%;box-sizing:border-box;padding:9px;border:1px solid #8a949e;border-radius:7px;background:#050607;color:#fff;font-size:14px}.gb-q{width:20px;height:20px;padding:0;border:1px solid #aeb7c0;border-radius:50%;background:#48515a;color:#fff;font-weight:900}.gb-help{display:none;margin-top:6px;padding:8px;border:1px solid #6d7882;border-radius:7px;background:#07090b;color:#fff;font-size:12px;line-height:1.45}.gb-help.open{display:block}.gb-check{display:flex;align-items:center;gap:7px;padding-top:23px}.gb-error{margin:12px;padding:10px;background:#5c1e1e;border:1px solid #e17d7d;border-radius:7px}.gb-status{padding:14px}.gb-summary{display:grid;grid-template-columns:repeat(4,minmax(135px,1fr));gap:8px;padding:12px}.gb-card{padding:10px;background:#272d33;border:1px solid #606b75;border-radius:8px}.gb-card small{display:block;color:#e1e5e8}.gb-card b{display:block;margin-top:4px;color:#fff;font-size:16px}.gb-wrap{overflow:auto;padding:0 12px 15px}.gb-table{width:100%;min-width:1120px;border-collapse:collapse;font-size:12px}.gb-table th{position:sticky;top:0;background:#07090b;color:#fff;padding:9px 7px;border-bottom:1px solid #777;white-space:nowrap}.gb-table td{padding:9px 7px;background:#171c21;color:#fff;border-bottom:1px solid #444;text-align:right;white-space:nowrap}.gb-table tr:nth-child(even) td{background:#101418}.gb-table th:nth-child(-n+4),.gb-table td:nth-child(-n+4){text-align:left}.gb-table a{color:#8bd1ff!important;font-weight:800}.gb-omitted td{opacity:.65}.gb-up{color:#8af0b1!important}.gb-down{color:#ff9b9b!important}.gb-editor{background:#15191d!important;color:#fff!important}.gb-editor :where(label,p,span,strong,small,h1,h2,h3,h4){color:#fff!important;text-shadow:none!important}.gb-editor :where(input,select,textarea){background:#fff!important;color:#080808!important;-webkit-text-fill-color:#080808!important;opacity:1!important}.gb-fill-note{padding:8px;margin:8px 0;background:#123b28;color:#fff;border:1px solid #48b77d;border-radius:7px;font:700 12px Arial}
-@media(max-width:760px){#${ID}-overlay{padding:0}#${ID}-panel{border-radius:0;min-height:100vh}.gb-grid,.gb-summary{grid-template-columns:repeat(2,minmax(130px,1fr))}}@media(max-width:420px){.gb-grid{grid-template-columns:1fr}}
-`;
-    (document.head || document.documentElement).appendChild(style);
-  }
-
-  function field(key, title, type = 'number') {
-    const value = settings[key];
-    const input = type === 'select'
-      ? `<select data-setting="${key}"><option value="current" ${value === 'current' ? 'selected' : ''}>Keep current payroll</option><option value="fixed" ${value === 'fixed' ? 'selected' : ''}>Fixed total budget</option><option value="benchmark" ${value === 'benchmark' ? 'selected' : ''}>Benchmark wage × score</option></select>`
-      : `<input type="number" min="0" inputmode="numeric" data-setting="${key}" value="${esc(value)}">`;
-    return `<div class="gb-field"><label>${esc(title)} <button type="button" class="gb-q" data-help="${key}">?</button></label>${input}<div class="gb-help" id="${ID}-help-${key}"></div></div>`;
-  }
-
-  function render() {
-    const panel = $(`#${ID}-panel`); if (!panel) return;
-    let result = null; try { if (employees.length) result = calculate(); } catch (e) { error = String(e?.message || e); }
-    panel.innerHTML = `
-<div class="gb-head"><div><div class="gb-title">Ghost Byte Wage Calculator</div><div class="gb-sub">Advisory only — no wage or position is submitted automatically.</div></div><button class="gb-btn" data-action="close">Close</button></div>
-<div class="gb-tools"><button class="gb-btn gb-primary" data-action="refresh" ${loading ? 'disabled' : ''}>${loading ? 'Loading…' : 'Refresh API'}</button><button class="gb-btn" data-action="settings">Settings</button><button class="gb-btn" data-action="copy" ${result ? '' : 'disabled'}>Copy wages</button></div>
-<div class="gb-settings ${settingsOpen ? 'open' : ''}"><div class="gb-grid">${field('mode','Payment model','select')}${field('fixedBudget','Fixed daily payroll')}${field('benchmark','Benchmark daily wage')}${field('targetEff','Target effectiveness')}${field('statWeight','Work-stat weight')}${field('effWeight','Effectiveness weight')}${field('minWage','Minimum wage')}${field('maxWage','Maximum wage')}${field('roundTo','Round wages to')}<label class="gb-check"><input type="checkbox" data-setting="includeDirector" ${settings.includeDirector ? 'checked' : ''}> Include director <button type="button" class="gb-q" data-help="includeDirector">?</button></label><label class="gb-check"><input type="checkbox" data-setting="autoFill" ${settings.autoFill ? 'checked' : ''}> Autofill wage field <button type="button" class="gb-q" data-help="autoFill">?</button></label></div><div class="gb-note" style="margin-top:12px">Click each question mark for a brief and detailed explanation. Position suggestions are informational stat-fit estimates only.</div></div>
-${error ? `<div class="gb-error">${esc(error)}</div>` : ''}${loading ? '<div class="gb-status">Loading company employees from the Torn API…</div>' : ''}
-${result ? `<div class="gb-summary"><div class="gb-card"><small>Employees</small><b>${num.format(result.rows.length)}</b></div><div class="gb-card"><small>Current payroll</small><b>${cash.format(result.current)}</b></div><div class="gb-card"><small>Suggested payroll</small><b>${cash.format(result.suggested)}</b></div><div class="gb-card"><small>Median included stats</small><b>${num.format(result.med)}</b></div></div><div class="gb-wrap"><table class="gb-table"><thead><tr><th>Include</th><th>Employee</th><th>Current position</th><th>Suggested position</th><th>MAN</th><th>INT</th><th>END</th><th>Eff.</th><th>Score</th><th>Current</th><th>Suggested</th><th>Change</th></tr></thead><tbody>${result.rows.map(e => `<tr class="${e.omitted ? 'gb-omitted' : ''}"><td><input type="checkbox" data-include="${esc(e.id)}" ${excluded.has(e.id) ? '' : 'checked'}></td><td><a href="#" data-employee="${esc(e.id)}">${esc(e.name)}</a></td><td>${esc(e.position)}</td><td title="Information only">${esc(e.role)}</td><td>${num.format(e.manual)}</td><td>${num.format(e.intelligence)}</td><td>${num.format(e.endurance)}</td><td>${num.format(e.effectiveness)}</td><td>${e.omitted ? '—' : e.score.toFixed(3)}</td><td>${cash.format(e.wage)}</td><td><b>${cash.format(e.suggested)}</b></td><td class="${e.change > 0 ? 'gb-up' : e.change < 0 ? 'gb-down' : ''}">${e.change > 0 ? '+' : e.change < 0 ? '−' : ''}${cash.format(Math.abs(e.change))}</td></tr>`).join('')}</tbody></table></div>` : (!loading ? '<div class="gb-status">Tap Refresh API to load employees.</div>' : '')}`;
-    bind(result);
-  }
-
-  function bind(result) {
-    const panel = $(`#${ID}-panel`);
-    $('[data-action="close"]', panel)?.addEventListener('click', close);
-    $('[data-action="refresh"]', panel)?.addEventListener('click', refresh);
-    $('[data-action="settings"]', panel)?.addEventListener('click', () => { settingsOpen = !settingsOpen; render(); });
-    $('[data-action="copy"]', panel)?.addEventListener('click', () => copy(result.rows.filter(e => !e.omitted).map(e => `${e.name} [${e.id}] — ${cash.format(e.suggested)} / day`).join('\n')));
-    $$('[data-setting]', panel).forEach(input => input.addEventListener('change', () => {
-      settings[input.dataset.setting] = input.type === 'checkbox' ? input.checked : input.type === 'number' ? n(input.value) : input.value;
-      save('settings', settings); render();
-    }));
-    $$('[data-help]', panel).forEach(button => button.addEventListener('click', ev => {
-      ev.preventDefault(); const [brief, detail] = help[button.dataset.help]; const box = $(`#${ID}-help-${button.dataset.help}`, panel) || button.closest('.gb-check')?.nextElementSibling;
-      let target = box; if (!target) { target = document.createElement('div'); target.className = 'gb-help'; button.closest('.gb-check')?.appendChild(target); }
-      target.innerHTML = `<b>${esc(brief)}</b><br>${esc(detail)}`; target.classList.toggle('open');
-    }));
-    $$('[data-include]', panel).forEach(input => input.addEventListener('change', () => { input.checked ? excluded.delete(input.dataset.include) : excluded.add(input.dataset.include); save('excluded', [...excluded]); render(); }));
-    $$('[data-employee]', panel).forEach(link => link.addEventListener('click', ev => { ev.preventDefault(); const row = result.rows.find(e => e.id === link.dataset.employee); if (row) chooseEmployee(row); }));
-  }
-
-  async function refresh() { loading = true; error = ''; render(); try { employees = await fetchEmployees(); } catch (e) { error = String(e?.message || e); } finally { loading = false; render(); } }
-  function open() { $(`#${ID}-overlay`)?.classList.add('open'); render(); if (!employees.length && !loading) refresh(); }
-  function close() { $(`#${ID}-overlay`)?.classList.remove('open'); }
-
-  function visible(el) { if (!(el instanceof Element)) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; }
-  function wageInput() {
-    const selectors = ['input[name*="wage" i]','input[id*="wage" i]','input[placeholder*="wage" i]','input[aria-label*="wage" i]','input[name*="salary" i]','input[id*="salary" i]'];
-    for (const s of selectors) { const list = $$(s).filter(visible); if (list.length) return list.at(-1); }
-    const dialogs = $$('[role="dialog"],[class*="modal" i],[class*="popup" i],[class*="employee" i]').filter(visible).reverse();
-    for (const d of dialogs) { if (!/wage|salary|pay/i.test(d.textContent || '')) continue; const list = $$('input[type="number"],input[inputmode="numeric"],input[type="text"]', d).filter(visible); if (list.length) return list[0]; }
-    return null;
-  }
-  function enhanceEditor() { const input = wageInput(); if (!input) return; (input.closest('[role="dialog"],form,[class*="modal" i],[class*="popup" i],[class*="dialog" i]') || input.parentElement)?.classList.add('gb-editor'); }
-  function fillSelected() {
-    enhanceEditor(); if (!settings.autoFill || !selectedId) return;
-    const row = latestRows.find(e => e.id === selectedId); if (!row || row.omitted) return;
-    const input = wageInput(); if (!input || input.dataset.gbFilledFor === row.id) return;
-    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value'); descriptor?.set?.call(input, String(Math.round(row.suggested)));
-    input.dataset.gbFilledFor = row.id; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
-    const note = document.createElement('div'); note.className = 'gb-fill-note'; note.textContent = `Filled ${row.name}: ${cash.format(row.suggested)}. Review it, then press Update manually.`; input.insertAdjacentElement('afterend', note); input.focus();
-  }
-  async function chooseEmployee(row) {
-    selectedId = row.id; close();
-    const native = $$(`a[href*="XID=${CSS.escape(row.id)}"],a[href*="userID=${CSS.escape(row.id)}"]`).find(visible); native?.click();
-    if (!settings.autoFill) return;
-    for (let i = 0; i < 25; i++) { await new Promise(r => setTimeout(r, 160)); fillSelected(); if (wageInput()?.dataset.gbFilledFor === row.id) break; }
-  }
-  function identifyNativeEmployee(target) {
-    if (!(target instanceof Element) || !employees.length) return null;
-    const link = target.closest('a[href*="profiles.php"],a[href*="XID="]');
-    if (link) { try { const id = new URL(link.href, location.href).searchParams.get('XID'); const found = employees.find(e => e.id === String(id)); if (found) return found; } catch (_) {} }
-    const box = target.closest('tr,li,[class*="employee" i],[data-user-id],[data-userid]') || target;
-    const text = (box.textContent || '').toLowerCase(); return employees.find(e => text.includes(e.name.toLowerCase())) || null;
-  }
-
-  function drag(button) {
-    const saved = load('position', {}); const place = (x, y) => { const maxX = Math.max(6, innerWidth - button.offsetWidth - 6); const maxY = Math.max(6, innerHeight - button.offsetHeight - 6); x = clamp(n(x), 6, maxX); y = clamp(n(y), 6, maxY); button.style.left = `${x}px`; button.style.top = `${y}px`; button.style.right = 'auto'; button.style.bottom = 'auto'; return { x, y }; };
-    requestAnimationFrame(() => { if (Number.isFinite(saved.x) && Number.isFinite(saved.y)) place(saved.x, saved.y); });
-    let d = null, moved = false;
-    button.addEventListener('pointerdown', e => { const r = button.getBoundingClientRect(); d = { id: e.pointerId, dx: e.clientX - r.left, dy: e.clientY - r.top }; moved = false; button.setPointerCapture?.(e.pointerId); });
-    button.addEventListener('pointermove', e => { if (!d || d.id !== e.pointerId) return; moved = true; e.preventDefault(); place(e.clientX - d.dx, e.clientY - d.dy); });
-    button.addEventListener('pointerup', e => { if (!d || d.id !== e.pointerId) return; const r = button.getBoundingClientRect(); save('position', place(r.left, r.top)); d = null; if (!moved) open(); });
-    button.addEventListener('pointercancel', () => { d = null; });
-    addEventListener('resize', () => { const r = button.getBoundingClientRect(); save('position', place(r.left, r.top)); });
-  }
-
-  function ensure() {
-    if (!document.body) return;
-    installStyles();
-    if (!$(`#${ID}-button`)) { const b = document.createElement('button'); b.id = `${ID}-button`; b.type = 'button'; b.textContent = '💵 Wage Calc'; b.title = 'Tap to open · drag to move'; document.body.appendChild(b); drag(b); }
-    if (!$(`#${ID}-overlay`)) { const o = document.createElement('div'); o.id = `${ID}-overlay`; o.innerHTML = `<div id="${ID}-panel"></div>`; o.addEventListener('click', e => { if (e.target === o) close(); }); document.body.appendChild(o); }
-  }
-
-  function copy(text) { if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text); else { const a = document.createElement('textarea'); a.value = text; document.body.appendChild(a); a.select(); document.execCommand('copy'); a.remove(); } }
-
-  function start() {
-    ensure();
-    document.addEventListener('click', e => { const found = identifyNativeEmployee(e.target); if (found) { selectedId = found.id; if (settings.autoFill) { setTimeout(fillSelected, 100); setTimeout(fillSelected, 450); setTimeout(fillSelected, 900); } } }, true);
-    new MutationObserver(() => { ensure(); enhanceEditor(); if (settings.autoFill && selectedId) setTimeout(fillSelected, 80); }).observe(document.documentElement, { childList: true, subtree: true });
-    setInterval(ensure, 1500);
-  }
-
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true }); else start();
-})();
+(function () {
+'use strict';
+var companyParams=new URLSearchParams(window.location.search);
+if(!/\/companies\.php$/i.test(window.location.pathname)||companyParams.get('step')!=='your')return;
+var ID='gb-wage-v156',PDA_KEY='###PDA-APIKEY###',PFX=ID+':',staff=[],rows=[],selected='',busy=false,settingsOpen=false;
+var def={mode:'current',budget:10000000,benchmark:1000000,target:100,stats:35,eff:65,min:0,max:25000000,round:10000,director:true,fill:false};
+var cfg=get('cfg',def),excluded=get('excluded',[]);Object.keys(def).forEach(function(k){if(cfg[k]===undefined)cfg[k]=def[k];});
+var help={mode:['Payment model','Current payroll redistributes the included employees current wage pool. Fixed budget uses the total you enter. Benchmark multiplies each score by the benchmark wage.'],budget:['Fixed daily payroll','The total daily payroll distributed among included employees in Fixed budget mode.'],benchmark:['Benchmark daily wage','A score of 1.00 receives about this wage before limits and rounding.'],target:['Target effectiveness','The effectiveness value treated as 1.00. The default is 100.'],stats:['Work-stat weight','How strongly MAN, INT, and END affect the wage score.'],eff:['Effectiveness weight','How strongly current effectiveness affects the wage score.'],min:['Minimum wage','Lowest suggested wage for an included employee.'],max:['Maximum wage','Highest suggested wage for an included employee.'],round:['Round wages to','Recommendations are rounded to this increment.'],director:['Include director','Turn off to exclude the director from scoring and wage distribution.'],fill:['Autofill wage field','Fills the visible employee wage field but never presses Update or Save.']};
+var roles=[['Cashier','endurance',10000,'intelligence',5000],['Cleaner','manual',5000,'endurance',2500],['Manager','endurance',20000,'intelligence',10000],['Receptionist','endurance',15000,'intelligence',7500],['Marketer','intelligence',20000,'endurance',10000],['Teacher','intelligence',30000,'endurance',15000],['Administrator','intelligence',20000,'endurance',10000],['Technician','intelligence',17500,'manual',8750]];
+function get(k,f){try{var v=JSON.parse(localStorage.getItem(PFX+k));return v===null||v===undefined?f:v;}catch(e){return f;}}
+function put(k,v){try{localStorage.setItem(PFX+k,JSON.stringify(v));}catch(e){}}
+function n(v){return Number(String(v==null?'':v).replace(/,/g,''))||0;}
+function fmt(v){try{return new Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(n(v));}catch(e){return String(Math.round(n(v)));}}
+function money(v){return(n(v)<0?'-':'')+'$'+fmt(Math.abs(n(v)));}
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function sum(a,f){return a.reduce(function(t,x){return t+n(f(x));},0);}
+function med(a){a=a.slice().sort(function(x,y){return x-y;});if(!a.length)return 1;var m=Math.floor(a.length/2);return a.length%2?a[m]:(a[m-1]+a[m])/2;}
+function key(){var manual=get('key','');if(manual)return String(manual).trim();return PDA_KEY.indexOf('###PDA-APIKEY###')<0?PDA_KEY.trim():'';}
+function norm(c){var a=Array.isArray(c)?c:Object.keys(c||{}).map(function(k){var x=c[k]||{};if(!x.id)x.id=k;return x;});return a.map(function(x,i){x=x||{};var s=x.working_stats||x.work_stats||x.stats||{},u=x.user||{},p=typeof x.position==='object'?(x.position.name||x.position.title):x.position||x.role||'Unassigned',e=x.effectiveness!=null?x.effectiveness:x.efficiency||0;if(typeof e==='object')e=e.total||e.overall||e.value||Object.keys(e).reduce(function(t,k){return t+n(e[k]);},0);var m=n(s.manual_labor!=null?s.manual_labor:s.manual!=null?s.manual:x.manual_labor!=null?x.manual_labor:x.manual||x.man),it=n(s.intelligence!=null?s.intelligence:s.intel!=null?s.intel:x.intelligence!=null?x.intelligence:x.intel||x.int),en=n(s.endurance!=null?s.endurance:s.end!=null?s.end:x.endurance!=null?x.endurance:x.end);return{id:String(x.id||x.user_id||x.player_id||u.id||i),name:String(x.name||x.username||u.name||('Employee '+i)),position:String(p),manual:m,intelligence:it,endurance:en,total:m+it+en,effectiveness:n(e),wage:n(x.wage!=null?x.wage:x.salary!=null?x.salary:x.daily_wage!=null?x.daily_wage:x.pay),director:!!x.is_director||/director/i.test(p)};});}
+function fit(x,r){var a=n(x[r[1]])/r[2],b=n(x[r[3]])/r[4];return Math.min(a,b)*.7+(a+b)/2*.3;}
+function assignPositions(list){var plan={},used={},count=list.length;function pick(name,minFit){var r=roles.find(function(z){return z[0]===name;}),best=null;list.forEach(function(x){if(used[x.id])return;var f=fit(x,r)+(String(x.position).toLowerCase()===name.toLowerCase()?.35:0);if(f>=minFit&&(!best||f>best.f))best={x:x,f:f};});if(best){plan[best.x.id]=name;used[best.x.id]=1;}}pick('Cleaner',.45);if(count>=5)pick('Receptionist',.55);if(count>=6)pick('Manager',.6);if(count>=8)pick('Marketer',.65);if(count>=10)pick('Teacher',.75);list.forEach(function(x){if(!plan[x.id])plan[x.id]='Cashier';});return plan;}
+function calc(){var inc=staff.filter(function(x){return excluded.indexOf(x.id)<0&&(cfg.director||!x.director);}),median=Math.max(1,med(inc.map(function(x){return x.total;}))),tw=n(cfg.stats)+n(cfg.eff)||1,sc=inc.map(function(x){var y=Object.assign({},x),si=Math.max(.35,Math.min(2.25,Math.log(1+x.total)/Math.log(1+median))),ei=Math.max(0,Math.min(2.5,x.effectiveness/Math.max(1,n(cfg.target))));y.score=(si*n(cfg.stats)+ei*n(cfg.eff))/tw;return y;}),min=n(cfg.min),max=Math.max(min,n(cfg.max)),step=Math.max(1,n(cfg.round)),total=sum(sc,function(x){return x.score;})||1,budget=cfg.mode==='fixed'?n(cfg.budget):sum(sc,function(x){return x.wage;});sc.forEach(function(x){var raw=cfg.mode==='benchmark'?n(cfg.benchmark)*x.score:(budget*x.score/total);x.suggested=Math.round(Math.max(min,Math.min(max,raw))/step)*step;});var map={};sc.forEach(function(x){map[x.id]=x;});rows=staff.map(function(x){var y=map[x.id],omit=excluded.indexOf(x.id)>=0||(!cfg.director&&x.director),s=y?y.suggested:x.wage;return Object.assign({},y||x,{omit:omit,suggested:s,change:s-x.wage,role:'Cashier',score:y?y.score:0});});var positionPlan=assignPositions(rows.filter(function(x){return !x.omit;}));rows.forEach(function(x){x.role=x.omit?x.position:(positionPlan[x.id]||'Cashier');});return{rows:rows,current:sum(rows,function(x){return x.wage;}),suggested:sum(rows,function(x){return x.suggested;}),median:inc.length?median:0};}
+function fetchStaff(){var k=key();if(!k)return Promise.reject(new Error('No API key saved. Tap API Key and add one with company employee access.'));return fetch('https://api.torn.com/v2/company/employees?key='+encodeURIComponent(k),{credentials:'omit'}).then(function(r){if(!r.ok)throw new Error('Torn API request failed ('+r.status+').');return r.json();}).then(function(d){if(d.error)throw new Error(d.error.error||d.error.message||'Torn API error.');var x=norm(d.employees||d.company_employees||d.companyEmployees||[]);if(!x.length)throw new Error('No employees returned. Check the API key permissions.');return x;});}
+function htmlField(k,label,select){var input=select?'<select data-set="'+k+'"><option value="current"'+(cfg[k]==='current'?' selected':'')+'>Keep current payroll</option><option value="fixed"'+(cfg[k]==='fixed'?' selected':'')+'>Fixed total budget</option><option value="benchmark"'+(cfg[k]==='benchmark'?' selected':'')+'>Benchmark wage x score</option></select>':'<input data-num="'+k+'" inputmode="numeric" value="'+fmt(cfg[k])+'">';return'<div class="field"><label>'+label+' <button class="q" data-help="'+k+'">?</button></label>'+input+'</div>';}
+function render(){var p=S.querySelector('#panel'),r=staff.length?calc():null,h='<header><div><b>Ghost Byte Wage Calculator</b><small>Advisory only. Nothing is submitted automatically.</small></div><button data-a="close">Close</button></header><nav><button data-a="load" class="green">'+(busy?'Loading...':'Refresh API')+'</button><button data-a="key">API Key</button><button data-a="settings">Settings</button><button data-a="copy"'+(r?'':' disabled')+'>Copy wages</button></nav><section class="settings '+(settingsOpen?'show':'')+'"><div class="grid">'+htmlField('mode','Payment model',1)+htmlField('budget','Fixed daily payroll')+htmlField('benchmark','Benchmark daily wage')+htmlField('target','Target effectiveness')+htmlField('stats','Work-stat weight')+htmlField('eff','Effectiveness weight')+htmlField('min','Minimum wage')+htmlField('max','Maximum wage')+htmlField('round','Round wages to')+'<label class="check"><input type="checkbox" data-set="director"'+(cfg.director?' checked':'')+'> Include director <button class="q" data-help="director">?</button></label><label class="check"><input type="checkbox" data-set="fill"'+(cfg.fill?' checked':'')+'> Autofill wage field <button class="q" data-help="fill">?</button></label></div><small>Number fields use commas for readability. Most employees are prioritized as Cashiers; one employee is selected for each useful support role when stats and company size justify it.</small></section>';
+if(err)h+='<div class="err">'+esc(err)+'</div>';if(busy)h+='<div class="status">Loading employees...</div>';if(r){h+='<div class="summary"><div><small>Employees</small><b>'+fmt(r.rows.length)+'</b></div><div><small>Current payroll</small><b>'+money(r.current)+'</b></div><div><small>Suggested payroll</small><b>'+money(r.suggested)+'</b></div><div><small>Median stats</small><b>'+fmt(r.median)+'</b></div></div><div class="wrap"><table><thead><tr><th>Include</th><th>Employee</th><th>Position</th><th>Suggested position</th><th>MAN</th><th>INT</th><th>END</th><th>Eff.</th><th>Score</th><th>Current</th><th>Suggested</th><th>Change</th></tr></thead><tbody>';r.rows.forEach(function(x){h+='<tr class="'+(x.omit?'omit':'')+'"><td><input type="checkbox" data-inc="'+esc(x.id)+'"'+(excluded.indexOf(x.id)<0?' checked':'')+'></td><td><a href="#" data-emp="'+esc(x.id)+'">'+esc(x.name)+'</a></td><td>'+esc(x.position)+'</td><td>'+esc(x.role)+'</td><td>'+fmt(x.manual)+'</td><td>'+fmt(x.intelligence)+'</td><td>'+fmt(x.endurance)+'</td><td>'+fmt(x.effectiveness)+'</td><td>'+(x.omit?'-':x.score.toFixed(3))+'</td><td>'+money(x.wage)+'</td><td><b>'+money(x.suggested)+'</b></td><td class="'+(x.change>0?'up':x.change<0?'down':'')+'">'+(x.change>0?'+':'')+money(x.change)+'</td></tr>';});h+='</tbody></table></div>';}else if(!busy)h+='<div class="status">Tap Refresh API to load employees.</div>';p.innerHTML=h;bind(r);}
+var err='';
+function bind(r){var p=S.querySelector('#panel');p.querySelector('[data-a="close"]').onclick=close;p.querySelector('[data-a="load"]').onclick=load;p.querySelector('[data-a="key"]').onclick=showKey;p.querySelector('[data-a="settings"]').onclick=function(){settingsOpen=!settingsOpen;tip(false);render();};var c=p.querySelector('[data-a="copy"]');if(c&&r)c.onclick=function(){copy(r.rows.filter(function(x){return!x.omit;}).map(function(x){return x.name+' ['+x.id+'] - '+money(x.suggested)+' per day';}).join('\n'));};p.querySelectorAll('[data-set]').forEach(function(i){i.onchange=function(){var k=i.dataset.set;cfg[k]=i.type==='checkbox'?i.checked:i.value;put('cfg',cfg);render();};});p.querySelectorAll('[data-num]').forEach(function(i){i.oninput=function(){var digits=i.value.replace(/\D/g,'');cfg[i.dataset.num]=n(digits);i.value=digits?fmt(digits):'';put('cfg',cfg);};i.onfocus=function(){i.select();};i.onblur=render;});p.querySelectorAll('[data-help]').forEach(function(b){b.onclick=function(e){e.preventDefault();e.stopPropagation();tip(b,b.dataset.help);};});p.querySelectorAll('[data-inc]').forEach(function(i){i.onchange=function(){var id=i.dataset.inc,at=excluded.indexOf(id);if(i.checked&&at>=0)excluded.splice(at,1);if(!i.checked&&at<0)excluded.push(id);put('excluded',excluded);render();};});p.querySelectorAll('[data-emp]').forEach(function(a){a.onclick=function(e){e.preventDefault();var x=rows.find(function(z){return z.id===a.dataset.emp;});if(x)choose(x);};});bindScroll();}
+function bindScroll(){var w=S.querySelector('.wrap');if(!w||w.dataset.bound)return;w.dataset.bound='1';var d=null;function start(x){d={x:x,left:w.scrollLeft};w.classList.add('dragging');}function move(x,e){if(!d)return;if(e)e.preventDefault();w.scrollLeft=d.left-(x-d.x);}function end(){d=null;w.classList.remove('dragging');}w.addEventListener('touchstart',function(e){if(e.touches.length===1)start(e.touches[0].clientX);},{passive:true});w.addEventListener('touchmove',function(e){if(e.touches.length===1)move(e.touches[0].clientX,e);},{passive:false});w.addEventListener('touchend',end);w.addEventListener('pointerdown',function(e){if(e.pointerType==='mouse'){start(e.clientX);w.setPointerCapture&&w.setPointerCapture(e.pointerId);}});w.addEventListener('pointermove',function(e){if(d&&e.pointerType==='mouse')move(e.clientX,e);});w.addEventListener('pointerup',end);}
+function load(){busy=true;err='';render();fetchStaff().then(function(x){staff=x;}).catch(function(e){err=e.message||String(e);}).then(function(){busy=false;render();});}
+function open(){S.querySelector('#overlay').classList.add('show');render();}
+function close(){tip(false);S.querySelector('#overlay').classList.remove('show');}
+function tip(button,k){var t=S.querySelector('#tip');if(!button){t.classList.remove('show');return;}var d=help[k],r=button.getBoundingClientRect();t.innerHTML='<b>'+esc(d[0])+'</b><span>'+esc(d[1])+'</span>';t.classList.add('show');var w=t.offsetWidth,h=t.offsetHeight,x=Math.max(8,Math.min(innerWidth-w-8,r.left+r.width/2-w/2)),y=r.bottom+8;if(y+h>innerHeight-8)y=Math.max(8,r.top-h-8);t.style.left=x+'px';t.style.top=y+'px';}
+function showKey(){var d=S.querySelector('#keybox'),i=d.querySelector('input'),st=d.querySelector('p');i.value=get('key','')||'';st.textContent=get('key','')?'Manual key saved on this device.':(PDA_KEY.indexOf('###PDA-APIKEY###')<0?'Using the key supplied by Torn PDA.':'No key configured.');d.classList.add('show');i.focus();}
+function keyBind(){var d=S.querySelector('#keybox'),i=d.querySelector('input');d.querySelector('[data-k="save"]').onclick=function(){if(!i.value.trim())return;put('key',i.value.trim());d.classList.remove('show');err='';};d.querySelector('[data-k="clear"]').onclick=function(){put('key','');i.value='';d.querySelector('p').textContent=PDA_KEY.indexOf('###PDA-APIKEY###')<0?'Using the key supplied by Torn PDA.':'No key configured.';};d.querySelector('[data-k="cancel"]').onclick=function(){d.classList.remove('show');};}
+function copy(x){if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(x);else{var a=document.createElement('textarea');a.value=x;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();}}
+function visible(x){if(!x)return false;var r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width&&r.height&&s.display!=='none'&&s.visibility!=='hidden';}
+function looksLikePayInput(i){if(!i||i.tagName!=='INPUT'||!visible(i)||i.disabled||i.readOnly)return false;var meta=[i.name,i.id,i.placeholder,i.getAttribute('aria-label'),i.className].join(' ').toLowerCase();if(/wage|salary|pay/.test(meta))return true;if(!/^(number|text|tel)$/.test((i.type||'text').toLowerCase()))return false;var box=i.closest('tr,li,[role="row"],[data-user-id],[data-userid],[class*="employee" i],[class*="staff" i],[class*="worker" i],[class*="row" i],form');if(!box)return false;var text=(box.textContent||'').toLowerCase();return /wage|salary|pay|daily pay/.test(text)||!!box.querySelector('a[href*="XID="],a[href*="userID="],a[href*="profiles.php"]');}
+function wageInputs(){return Array.from(document.querySelectorAll('input')).filter(looksLikePayInput);}
+function wageInput(){var a=wageInputs();return a.length?a[a.length-1]:null;}
+function employeeForInput(i){if(!i||!rows.length)return null;var box=i.closest('tr,li,[data-user-id],[data-userid],[class*="employee" i],[class*="staff" i],[class*="worker" i],[class*="row" i],[role="row"],[role="dialog"],form')||i.parentElement;var id='';if(box){var link=box.querySelector('a[href*="XID="],a[href*="userID="],a[href*="profiles.php"]');if(link){try{var u=new URL(link.href,location.href);id=u.searchParams.get('XID')||u.searchParams.get('userID')||'';}catch(e){}}id=id||box.getAttribute('data-user-id')||box.getAttribute('data-userid')||box.getAttribute('data-id')||'';if(id){var byId=rows.find(function(x){return x.id===String(id);});if(byId)return byId;}var text=(box.textContent||'').toLowerCase();var byName=rows.find(function(x){return x.name&&text.indexOf(x.name.toLowerCase())>=0;});if(byName)return byName;}var inputs=wageInputs(),at=inputs.indexOf(i);if(at>=0&&at<rows.length)return rows[at];return null;}
+function setNativeValue(i,value){var p=i,descriptor=null;while(p&&!descriptor){descriptor=Object.getOwnPropertyDescriptor(p,'value');p=Object.getPrototypeOf(p);}if(descriptor&&descriptor.set)descriptor.set.call(i,value);else i.value=value;}
+function fillInput(i,x){if(!cfg.fill||!i||!x||x.omit)return false;var value=String(Math.round(x.suggested));function apply(){setNativeValue(i,value);i.dataset.gb=x.id;try{i.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));}catch(e){i.dispatchEvent(new Event('input',{bubbles:true}));}i.dispatchEvent(new Event('change',{bubbles:true}));}i.focus();apply();setTimeout(apply,60);setTimeout(apply,180);setTimeout(apply,400);return true;}
+function fill(){if(!cfg.fill)return false;var x=rows.find(function(z){return z.id===selected;}),i=wageInput();return fillInput(i,x);}
+function fillClickedInput(i){if(!cfg.fill)return false;var x=employeeForInput(i);if(!x)return false;selected=x.id;return fillInput(i,x);}
+function choose(x){selected=x.id;close();var a=Array.from(document.querySelectorAll('a[href*="XID='+x.id+'"],a[href*="userID='+x.id+'"]')).filter(visible);if(a.length)a[0].click();if(cfg.fill){var z=0,t=setInterval(function(){if(fill()||++z>30)clearInterval(t);},160);}}
+function drag(b){var p=get('pos',null),d=null,m=false;function place(x,y){x=Math.max(5,Math.min(innerWidth-b.offsetWidth-5,n(x)));y=Math.max(5,Math.min(innerHeight-b.offsetHeight-5,n(y)));b.style.left=x+'px';b.style.top=y+'px';b.style.right='auto';b.style.bottom='auto';return{x:x,y:y};}requestAnimationFrame(function(){if(p)place(p.x,p.y);});b.onpointerdown=function(e){var r=b.getBoundingClientRect();d={id:e.pointerId,dx:e.clientX-r.left,dy:e.clientY-r.top,x:e.clientX,y:e.clientY};m=false;b.setPointerCapture(e.pointerId);};b.onpointermove=function(e){if(!d||d.id!==e.pointerId)return;if(Math.abs(e.clientX-d.x)>4||Math.abs(e.clientY-d.y)>4)m=true;e.preventDefault();place(e.clientX-d.dx,e.clientY-d.dy);};b.onpointerup=function(e){if(!d)return;var r=b.getBoundingClientRect();put('pos',place(r.left,r.top));d=null;if(!m)open();};}
+var host=document.getElementById(ID);if(host)host.remove();host=document.createElement('div');host.id=ID;document.body.appendChild(host);var S=host.attachShadow({mode:'open'});S.innerHTML='<style>:host{all:initial}button,input,select{font:inherit}#money{position:fixed;right:14px;bottom:100px;width:44px;height:44px;border-radius:50%;border:2px solid #9af0bf;background:#075c3a;color:#fff;font-size:21px;z-index:2147483646;box-shadow:0 4px 16px #000a;touch-action:none}#overlay{display:none;position:fixed;inset:0;background:#000d;z-index:2147483647;overflow:auto;font:13px Arial;color:#fff}#overlay.show{display:block}#panel{width:min(1150px,100vw);max-width:100vw;margin:10px auto 40px;background:#15191d;color:#f7f9fb;border:1px solid #82909c;border-radius:12px;overflow:hidden;box-sizing:border-box}header{display:flex;justify-content:space-between;align-items:center;padding:14px;background:#050607;color:#fff}header b{font-size:18px}header small{display:block;color:#e7edf2;margin-top:3px}nav{display:flex;gap:7px;flex-wrap:wrap;padding:11px;background:#20262c;color:#fff}button{border:1px solid #9aa7b3;border-radius:7px;padding:8px 10px;background:#36414b;color:#fff!important;font-weight:800}.green{background:#086642}.settings{display:none;padding:12px;background:#171c21;color:#f7f9fb}.settings.show{display:block}.grid{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}.field label{display:flex;gap:5px;align-items:center;font-weight:700;margin-bottom:5px}.field input,.field select{width:100%;box-sizing:border-box;padding:9px;background:#ffffff!important;color:#111820!important;-webkit-text-fill-color:#111820!important;border:1px solid #aab5bf;border-radius:7px;opacity:1}.q{width:20px;height:20px;border-radius:50%;padding:0}.check{display:flex;align-items:center;gap:6px;padding-top:23px}.err{margin:12px;padding:10px;background:#5c1e1e}.status{padding:14px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:12px}.summary div{padding:10px;background:#242c33;border:1px solid #7b8995;border-radius:8px;color:#fff}.summary small,.summary b{display:block}.summary b{font-size:16px;margin-top:4px}.wrap{display:block;width:100%;max-width:100vw;overflow-x:scroll!important;overflow-y:hidden;padding:0 12px 22px;box-sizing:border-box;-webkit-overflow-scrolling:touch;touch-action:none;overscroll-behavior-x:contain;cursor:grab;scrollbar-width:auto;scrollbar-color:#9eabb6 #080a0c}.wrap.dragging{cursor:grabbing}.wrap::-webkit-scrollbar{height:12px}.wrap::-webkit-scrollbar-track{background:#080a0c}.wrap::-webkit-scrollbar-thumb{background:#71808d;border:2px solid #080a0c;border-radius:999px}table{width:max-content!important;min-width:1200px;border-collapse:collapse;color:#f7f9fb;background:#171c21}th,td{padding:9px 8px;border-bottom:1px solid #5b6570;white-space:nowrap;text-align:right;color:#f7f9fb!important}th{background:#050607!important;color:#ffffff!important;position:sticky;top:0;z-index:1}th:nth-child(-n+4),td:nth-child(-n+4){text-align:left}td{background:#1c2228!important}tr:nth-child(even) td{background:#11161b!important}a{color:#9bd8ff!important;font-weight:800;text-decoration:underline}.omit td{opacity:.72}.up{color:#9ff3bd!important}.down{color:#ffaaaa!important}#tip{display:none;position:fixed;width:min(300px,calc(100vw - 20px));padding:12px;background:#080a0c!important;color:#fff!important;-webkit-text-fill-color:#fff!important;border:1px solid #b6c0c9;border-radius:9px;z-index:2147483647;box-sizing:border-box;box-shadow:0 8px 28px #000c}#tip.show{display:block}#tip b,#tip span{display:block;color:#fff!important;-webkit-text-fill-color:#fff!important;text-shadow:none!important}#tip span{margin-top:5px;line-height:1.45}#keybox{display:none;position:fixed;inset:0;background:#000b;z-index:2147483647;align-items:center;justify-content:center;padding:15px}#keybox.show{display:flex}#keybox>div{width:min(420px,100%);padding:16px;background:#15191d;border:1px solid #7a8792;border-radius:12px}#keybox input{width:100%;box-sizing:border-box;padding:10px;background:#fff;color:#111}.actions{display:flex;justify-content:flex-end;gap:7px;flex-wrap:wrap;margin-top:12px}@media(max-width:760px){#panel{margin:0;min-height:100vh;border-radius:0}.grid,.summary{grid-template-columns:repeat(2,1fr)}}@media(max-width:420px){.grid{grid-template-columns:1fr}}</style><button id="money" title="Open wage calculator">💵</button><div id="overlay"><div id="panel"></div></div><div id="tip"></div><div id="keybox"><div><h3>API Key</h3><p></p><small>The manual key is stored only on this device and is not uploaded to GitHub.</small><input type="password" placeholder="Paste Torn API key"><div class="actions"><button data-k="clear">Clear</button><button data-k="cancel">Cancel</button><button data-k="save" class="green">Save key</button></div></div></div>';
+S.querySelector('#overlay').onclick=function(e){if(e.target.id==='overlay')close();};S.addEventListener('click',function(e){if(!e.target.closest('[data-help]')&&!e.target.closest('#tip'))tip(false);});function handlePayTarget(target){var i=target&&target.closest?target.closest('input'):null;if(!cfg.fill||!looksLikePayInput(i))return;setTimeout(function(){fillClickedInput(i);},20);setTimeout(function(){fillClickedInput(i);},180);}
+document.addEventListener('pointerdown',function(e){handlePayTarget(e.target);},true);document.addEventListener('click',function(e){handlePayTarget(e.target);},true);document.addEventListener('focusin',function(e){handlePayTarget(e.target);},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(){fill();}).observe(document.documentElement,{childList:true,subtree:true});
+}());
