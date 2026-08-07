@@ -1,0 +1,44 @@
+name: Build wage calculator v1.5.5
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.5.5.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build employee pay-field autofill
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('ghost-byte-wage-calculator-v1.5.4.user.js').read_text(encoding='utf-8')
+          src = src.replace('// @version      1.5.4', '// @version      1.5.5')
+          src = src.replace("var ID='gb-wage-v154'", "var ID='gb-wage-v155'")
+          old = '''function wageInput(){var sel=['input[name*="wage" i]','input[id*="wage" i]','input[placeholder*="wage" i]','input[name*="salary" i]'];for(var j=0;j<sel.length;j++){var a=Array.from(document.querySelectorAll(sel[j])).filter(visible);if(a.length)return a[a.length-1];}return null;}\nfunction fill(){if(!cfg.fill||!selected)return false;var x=rows.find(function(z){return z.id===selected;}),i=wageInput();if(!x||x.omit||!i||i.dataset.gb===x.id)return false;var d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set)d.set.call(i,String(Math.round(x.suggested)));else i.value=String(Math.round(x.suggested));i.dataset.gb=x.id;i.dispatchEvent(new Event('input',{bubbles:true}));i.dispatchEvent(new Event('change',{bubbles:true}));i.focus();return true;}\nfunction choose(x){selected=x.id;close();var a=Array.from(document.querySelectorAll('a[href*="XID='+x.id+'"],a[href*="userID='+x.id+'"]')).filter(visible);if(a.length)a[0].click();if(cfg.fill){var z=0,t=setInterval(function(){if(fill()||++z>30)clearInterval(t);},160);}}'''
+          new = '''function wageInputs(){var sel=['input[name*="wage" i]','input[id*="wage" i]','input[placeholder*="wage" i]','input[aria-label*="wage" i]','input[name*="salary" i]','input[id*="salary" i]','input[placeholder*="salary" i]','input[name*="pay" i]','input[id*="pay" i]'];var out=[];for(var j=0;j<sel.length;j++)Array.from(document.querySelectorAll(sel[j])).forEach(function(i){if(visible(i)&&out.indexOf(i)<0)out.push(i);});return out;}\nfunction wageInput(){var a=wageInputs();return a.length?a[a.length-1]:null;}\nfunction employeeForInput(i){if(!i||!rows.length)return null;var box=i.closest('tr,li,[data-user-id],[data-userid],[class*="employee" i],[class*="staff" i],[class*="worker" i],[class*="row" i],[role="row"],[role="dialog"],form')||i.parentElement;var id='';if(box){var link=box.querySelector('a[href*="XID="],a[href*="userID="],a[href*="profiles.php"]');if(link){try{var u=new URL(link.href,location.href);id=u.searchParams.get('XID')||u.searchParams.get('userID')||'';}catch(e){}}id=id||box.getAttribute('data-user-id')||box.getAttribute('data-userid')||box.getAttribute('data-id')||'';if(id){var byId=rows.find(function(x){return x.id===String(id);});if(byId)return byId;}var text=(box.textContent||'').toLowerCase();var byName=rows.find(function(x){return x.name&&text.indexOf(x.name.toLowerCase())>=0;});if(byName)return byName;}var inputs=wageInputs(),at=inputs.indexOf(i);if(at>=0&&at<rows.length)return rows[at];return null;}\nfunction fillInput(i,x){if(!cfg.fill||!i||!x||x.omit)return false;if(i.dataset.gb===x.id&&n(i.value)===Math.round(x.suggested))return true;var d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');if(d&&d.set)d.set.call(i,String(Math.round(x.suggested)));else i.value=String(Math.round(x.suggested));i.dataset.gb=x.id;i.dispatchEvent(new Event('input',{bubbles:true}));i.dispatchEvent(new Event('change',{bubbles:true}));i.focus();return true;}\nfunction fill(){if(!cfg.fill)return false;var x=rows.find(function(z){return z.id===selected;}),i=wageInput();return fillInput(i,x);}\nfunction fillClickedInput(i){if(!cfg.fill)return false;var x=employeeForInput(i);if(!x)return false;selected=x.id;return fillInput(i,x);}\nfunction choose(x){selected=x.id;close();var a=Array.from(document.querySelectorAll('a[href*="XID='+x.id+'"],a[href*="userID='+x.id+'"]')).filter(visible);if(a.length)a[0].click();if(cfg.fill){var z=0,t=setInterval(function(){if(fill()||++z>30)clearInterval(t);},160);}}'''
+          if old not in src:
+              raise SystemExit('Could not find autofill block')
+          src = src.replace(old, new)
+          old_listener = "S.querySelector('#overlay').onclick=function(e){if(e.target.id==='overlay')close();};S.addEventListener('click',function(e){if(!e.target.closest('[data-help]')&&!e.target.closest('#tip'))tip(false);});keyBind();drag(S.querySelector('#money'));new MutationObserver(function(){fill();}).observe(document.documentElement,{childList:true,subtree:true});"
+          new_listener = "S.querySelector('#overlay').onclick=function(e){if(e.target.id==='overlay')close();};S.addEventListener('click',function(e){if(!e.target.closest('[data-help]')&&!e.target.closest('#tip'))tip(false);});document.addEventListener('pointerdown',function(e){var i=e.target&&e.target.closest?e.target.closest('input'):null;if(i&&wageInputs().indexOf(i)>=0&&cfg.fill)setTimeout(function(){fillClickedInput(i);},0);},true);document.addEventListener('focusin',function(e){var i=e.target;if(i&&i.tagName==='INPUT'&&wageInputs().indexOf(i)>=0&&cfg.fill)setTimeout(function(){fillClickedInput(i);},0);},true);keyBind();drag(S.querySelector('#money'));new MutationObserver(function(){fill();}).observe(document.documentElement,{childList:true,subtree:true});"
+          if old_listener not in src:
+              raise SystemExit('Could not find listener block')
+          src = src.replace(old_listener, new_listener)
+          Path('ghost-byte-wage-calculator-v1.5.5.user.js').write_text(src, encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.5.5.user.js
+      - name: Commit generated file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.5.5.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Fill clicked employee pay field"
+          git push
