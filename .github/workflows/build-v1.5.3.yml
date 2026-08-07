@@ -1,0 +1,40 @@
+name: Build wage calculator v1.5.3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.5.3.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build restricted company-page script
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('ghost-byte-wage-calculator-v1.5.2.user.js').read_text(encoding='utf-8')
+          src = src.replace('// @version      1.5.2', '// @version      1.5.3')
+          src = src.replace('// @match        https://www.torn.com/*\n// @match        https://torn.com/*', '// @match        https://www.torn.com/companies.php*\n// @match        https://torn.com/companies.php*')
+          src = src.replace("var ID='gb-wage-v152'", "var ID='gb-wage-v153'")
+          needle = "'use strict';\n"
+          guard = "'use strict';\nvar companyParams=new URLSearchParams(window.location.search);\nif(!/\\/companies\\.php$/i.test(window.location.pathname)||companyParams.get('step')!=='your')return;\n"
+          if needle not in src:
+              raise SystemExit('Could not find startup insertion point')
+          src = src.replace(needle, guard, 1)
+          Path('ghost-byte-wage-calculator-v1.5.3.user.js').write_text(src, encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.5.3.user.js
+      - name: Commit generated file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.5.3.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Restrict wage calculator to own company page"
+          git push
