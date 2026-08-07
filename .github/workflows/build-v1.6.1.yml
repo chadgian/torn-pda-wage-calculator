@@ -1,0 +1,42 @@
+name: Build wage calculator v1.6.1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.6.1.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build exact-value autofill release
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src=Path('ghost-byte-wage-calculator-v1.6.0.user.js').read_text(encoding='utf-8')
+          src=src.replace('// @version      1.6.0','// @version      1.6.1',1)
+          src=src.replace("var ID='gb-wage-v160'","var ID='gb-wage-v161'",1)
+          old="function fillInput(i,x){if(!cfg.fill||!i||!x||x.omit)return false;var value=String(Math.round(x.suggested));function apply(){setNativeValue(i,value);i.dataset.gb=x.id;try{i.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));}catch(e){i.dispatchEvent(new Event('input',{bubbles:true}));}i.dispatchEvent(new Event('change',{bubbles:true}));}i.focus();apply();setTimeout(apply,60);setTimeout(apply,180);setTimeout(apply,400);return true;}"
+          new="function fillInput(i,x){if(!cfg.fill||!i||!x||x.omit)return false;var value=String(Math.trunc(Number(x.suggested)||0));function apply(){try{i.step='1';}catch(e){}setNativeValue(i,value);i.dataset.gb=x.id;try{i.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));}catch(e){i.dispatchEvent(new Event('input',{bubbles:true}));}}try{i.focus({preventScroll:true});}catch(e){i.focus();}apply();setTimeout(apply,60);setTimeout(apply,180);setTimeout(apply,400);return true;}"
+          if old not in src:
+              raise SystemExit('fillInput block not found')
+          src=src.replace(old,new,1)
+          if "dispatchEvent(new Event('change'" in src[src.index('function fillInput'):src.index('function fill(){')]:
+              raise SystemExit('change event remains in fillInput')
+          Path('ghost-byte-wage-calculator-v1.6.1.user.js').write_text(src,encoding='utf-8')
+          Path('ghost-byte-wage-calculator.user.js').write_text(src,encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.6.1.user.js
+      - name: Commit generated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.6.1.user.js ghost-byte-wage-calculator.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Preserve exact suggested wage during autofill"
+          git push
