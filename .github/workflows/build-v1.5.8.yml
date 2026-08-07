@@ -1,0 +1,40 @@
+name: Build wage calculator v1.5.8
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-v1.5.8.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build stable-storage release
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s=Path('ghost-byte-wage-calculator-v1.5.7.user.js').read_text(encoding='utf-8')
+          s=s.replace('// @version      1.5.7','// @version      1.5.8',1)
+          old="var ID='gb-wage-v157',PDA_KEY='###PDA-APIKEY###',PFX=ID+':',staff=[],rows=[],selected='',busy=false,settingsOpen=false;"
+          new="var ID='gb-wage-v158',PDA_KEY='###PDA-APIKEY###',PFX='gb-wage:',staff=[],rows=[],selected='',busy=false,settingsOpen=false;\n(function migrate(){try{['cfg','excluded','key','pos'].forEach(function(k){if(localStorage.getItem(PFX+k)!=null)return;var old=['gb-wage-v157:','gb-wage-v156:','gb-wage-v155:','gb-wage-v154:','gb-wage-v153:','gb-wage-v152:','gb-wage-v151:'];for(var i=0;i<old.length;i++){var v=localStorage.getItem(old[i]+k);if(v!=null){localStorage.setItem(PFX+k,v);break;}}});}catch(e){}}());"
+          if old not in s: raise SystemExit('storage anchor missing')
+          s=s.replace(old,new,1)
+          Path('ghost-byte-wage-calculator-v1.5.8.user.js').write_text(s,encoding='utf-8')
+          main=s.replace('// @match        https://torn.com/companies.php*\n','// @match        https://torn.com/companies.php*\n// @updateURL    https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js\n// @downloadURL  https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js\n',1)
+          Path('ghost-byte-wage-calculator.user.js').write_text(main,encoding='utf-8')
+          PY
+          node --check ghost-byte-wage-calculator-v1.5.8.user.js
+          node --check ghost-byte-wage-calculator.user.js
+      - name: Commit generated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ghost-byte-wage-calculator-v1.5.8.user.js ghost-byte-wage-calculator.user.js
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Persist autofill settings and remember employee before pay editor"
+          git push
