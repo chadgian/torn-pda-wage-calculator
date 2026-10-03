@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.0.2
+// @version      2.0.3
 // @description  Generic Torn company helper for wage planning, position-fit analysis, payroll balancing, export, and safe wage autofill.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,8 +18,8 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.0.2';
-var ID = 'gb-wage-v202';
+var VERSION = '2.0.3';
+var ID = 'gb-wage-v203';
 var PFX = 'gb-wage:';
 var PDA_KEY = '###PDA-APIKEY###';
 var CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
@@ -1329,7 +1329,7 @@ launcher.style.setProperty('opacity', '1', 'important');
 launcher.style.setProperty('pointer-events', 'auto', 'important');
 
 var launcherBadge = document.createElement('span');
-launcherBadge.textContent = ';
+launcherBadge.textContent = '$';
 launcherBadge.setAttribute('aria-hidden', 'true');
 launcherBadge.style.cssText = 'position:absolute;right:-6px;top:-7px;width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#e9fff4;color:#075535;font:900 12px Arial,sans-serif;border:2px solid #075535;box-sizing:border-box;';
 launcher.appendChild(launcherBadge);
