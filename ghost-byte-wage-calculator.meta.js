@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         Ghost Byte Wage Calculator
 // @namespace    wyn.torn.company.tools
-// @version      1.5.7
-// @description  Self-contained Torn PDA employee wage calculator.
+// @version      2.0.1
+// @description  Generic Torn company helper for wage planning, position-fit analysis, payroll balancing, export, and safe wage autofill.
+// @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
 // @match        https://torn.com/companies.php*
 // @updateURL    https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.meta.js
