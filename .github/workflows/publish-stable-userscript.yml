@@ -1,9 +1,10 @@
-name: Publish stable userscript
+name: Publish stable Torn Company Helper
 
 on:
   push:
     branches: [main]
     paths:
+      - 'torn-company-helper-v*.user.js'
       - '.github/workflows/publish-stable-userscript.yml'
 
 permissions:
@@ -14,33 +15,77 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Publish canonical updateable file
+
+      - name: Publish newest versioned release
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
-          source = Path('ghost-byte-wage-calculator-v1.5.6.user.js')
-          target = Path('ghost-byte-wage-calculator.user.js')
+          candidates = []
+          for p in Path('.').glob('torn-company-helper-v*.user.js'):
+              m = re.fullmatch(r'torn-company-helper-v(\d+)\.(\d+)\.(\d+)\.user\.js', p.name)
+              if m:
+                  candidates.append((tuple(map(int, m.groups())), p))
+
+          if not candidates:
+              raise SystemExit('No versioned Torn Company Helper release found.')
+
+          version, source = max(candidates, key=lambda x: x[0])
           text = source.read_text(encoding='utf-8')
 
-          update_url = 'https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js'
-          metadata = (
-              f'// @updateURL    {update_url}\n'
-              f'// @downloadURL  {update_url}\n'
+          expected_version = '.'.join(map(str, version))
+          required = [
+              '// @name         Torn Company Helper',
+              f'// @version      {expected_version}',
+              '// @updateURL    https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/torn-company-helper.meta.js',
+              '// @downloadURL  https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/torn-company-helper.user.js',
+          ]
+          missing = [x for x in required if x not in text]
+          if missing:
+              raise SystemExit('Release metadata validation failed: ' + repr(missing))
+
+          marker = '// ==/UserScript=='
+          end = text.find(marker)
+          if end < 0:
+              raise SystemExit('Userscript metadata block not found.')
+
+          generic_meta = text[:end + len(marker)] + '\n'
+          legacy_meta = (
+              generic_meta
+              .replace('// @name         Torn Company Helper', '// @name         Ghost Byte Wage Calculator', 1)
+              .replace(
+                  'https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/torn-company-helper.meta.js',
+                  'https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.meta.js',
+                  1,
+              )
+              .replace(
+                  'https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/torn-company-helper.user.js',
+                  'https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/ghost-byte-wage-calculator.user.js',
+                  1,
+              )
           )
 
-          marker = '// @run-at       document-end\n'
-          if marker not in text:
-              raise SystemExit('Could not find userscript metadata insertion point')
-          text = text.replace(marker, metadata + marker, 1)
-          target.write_text(text, encoding='utf-8')
+          # New public install/update path.
+          Path('torn-company-helper.user.js').write_text(text, encoding='utf-8')
+          Path('torn-company-helper.meta.js').write_text(generic_meta, encoding='utf-8')
+
+          # Backward-compatible old install/update path. The script served here is
+          # already rebranded and points future updates to the new canonical URLs.
+          Path('ghost-byte-wage-calculator.user.js').write_text(text, encoding='utf-8')
+          Path('ghost-byte-wage-calculator.meta.js').write_text(legacy_meta, encoding='utf-8')
+
+          print(f'Published Torn Company Helper v{expected_version} from {source.name}')
           PY
+
+          node --check torn-company-helper.user.js
           node --check ghost-byte-wage-calculator.user.js
-      - name: Commit stable file
+
+      - name: Commit stable files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ghost-byte-wage-calculator.user.js
+          git add torn-company-helper.user.js torn-company-helper.meta.js ghost-byte-wage-calculator.user.js ghost-byte-wage-calculator.meta.js
           if git diff --cached --quiet; then exit 0; fi
-          git commit -m "Publish stable updateable userscript"
+          git commit -m "Publish stable Torn Company Helper"
           git push
