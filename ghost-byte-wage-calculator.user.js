@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.0.4
+// @version      2.1.0
 // @description  Generic Torn company helper for wage planning, position-fit analysis, payroll balancing, export, and safe wage autofill.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,9 +18,9 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.0.4';
+var VERSION = '2.1.0';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
-var ID = 'gb-wage-v204';
+var ID = 'gb-wage-v210';
 var PFX = 'gb-wage:';
 var PDA_KEY = '###PDA-APIKEY###';
 var CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
@@ -60,7 +60,7 @@ var errorState = null;
 var settingsOpen = false;
 var detailId = '';
 var lastLoadedAt = 0;
-var ui = { query: '', filter: 'all', sort: 'score', direction: 'desc' };
+var ui = { page: 'overview', query: '', filter: 'all', sort: 'score', direction: 'desc' };
 var pendingId = '';
 var pendingUntil = 0;
 
@@ -717,7 +717,8 @@ function render() {
     var result = staff.length ? calculate() : null;
     var visibleRows = result ? displayRows(result) : [];
     var stale = lastLoadedAt && Date.now() - lastLoadedAt > FRESH_AGE;
-    var companyLine = company ? [company.name, company.typeName, company.rating ? company.rating + '★' : ''].filter(Boolean).join(' • ') : 'Company wage planning';
+    var companyLine = company ? [company.name, company.typeName, company.rating ? company.rating + '★' : ''].filter(Boolean).join(' • ') : 'Company management assistant';
+    var page = ui.page || 'overview';
 
     var html = '';
     html += '<header>' +
@@ -725,96 +726,35 @@ function render() {
         '<div class="header-actions"><span class="refresh-state ' + (stale ? 'stale' : '') + '">' + (lastLoadedAt ? 'Updated ' + nowText(lastLoadedAt) : 'Not loaded') + '</span><button class="icon-btn" data-a="close" aria-label="Close">×</button></div>' +
     '</header>';
 
+    html += '<nav class="page-tabs" aria-label="Helper sections">' +
+        pageTab('overview', 'Overview', 'Summary and priorities') +
+        pageTab('employees', 'Employees', 'Wages and position fit', result ? result.rows.length : 0) +
+        pageTab('settings', 'Settings', 'Calculation preferences') +
+    '</nav>';
+
     html += '<div class="actionbar">' +
-        '<button class="primary" data-a="load"' + (busy ? ' disabled' : '') + '>' + (busy ? '<span class="spinner"></span> Refreshing' : '↻ Refresh API') + '</button>' +
-        '<button data-a="settings">⚙ Settings</button>' +
+        '<button class="primary" data-a="load"' + (busy ? ' disabled' : '') + '>' + (busy ? '<span class="spinner"></span> Refreshing' : '↻ Refresh') + '</button>' +
         '<button data-a="key">🔑 API Key</button>' +
         '<button data-a="copy"' + (!result ? ' disabled' : '') + '>⧉ Copy wages</button>' +
-        '<button data-a="csv"' + (!result ? ' disabled' : '') + '>⇩ Export CSV</button>' +
+        '<button data-a="csv"' + (!result ? ' disabled' : '') + '>⇩ CSV</button>' +
     '</div>';
-
-    if (settingsOpen) {
-        html += '<section class="settings">' +
-            '<div class="section-title"><div><h3>Wage model</h3><p>Changes update the recommendations immediately. Nothing is submitted to Torn.</p></div><button class="text-btn" data-a="reset-settings">Reset defaults</button></div>' +
-            '<div class="settings-grid">' +
-                settingField('mode', 'Payment model', 'Current keeps the included wage pool. Fixed uses your budget. Benchmark pays score × benchmark.', 'mode') +
-                settingField('budget', 'Fixed daily payroll', 'Used only in Fixed budget mode.') +
-                settingField('benchmark', 'Benchmark wage', 'A score of 1.000 receives approximately this daily wage.') +
-                settingField('target', 'Target effectiveness', 'Effectiveness treated as the baseline 1.000 contribution.') +
-                settingField('stats', 'Position-fit weight', 'Weight given to the employee work-stat efficiency in their current role.') +
-                settingField('eff', 'Total-effectiveness weight', 'Weight given to current total effectiveness, including modifiers.') +
-                settingField('min', 'Minimum wage', 'Floor applied to every included employee.') +
-                settingField('max', 'Maximum wage', 'Cap applied to every included employee.') +
-                settingField('round', 'Round to', 'Use 100, 1,000, 10,000, etc. The allocator tries to preserve the chosen total budget.') +
-            '</div>' +
-            '<div class="toggles">' +
-                toggle('director', 'Include director', 'Include the director in wage distribution.') +
-                toggle('fill', 'Safe wage autofill', 'When you tap a matching Torn wage field, fill the recommendation but never press Update/Save.') +
-                toggle('positionAdvice', 'Position-fit advice', 'Compare each employee against the actual positions for this company type.') +
-                toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when the panel opens and cached data is old.') +
-            '</div>' +
-        '</section>';
-    }
 
     if (errorState) {
         var info = errorInfo(errorState);
         html += '<div class="error-card"><div class="error-icon">!</div><div><b>' + esc(info.title) + '</b><p>' + esc(info.message) + '</p><small><strong>Suggested fix:</strong> ' + esc(info.solution) + '</small><div class="error-actions"><button data-a="copy-error">Copy error details</button><a href="' + esc(SUPPORT_URL) + '" target="_blank" rel="noopener noreferrer">Contact developer</a></div></div><button data-a="dismiss-error">×</button></div>';
     }
 
-    if (!result && !busy) {
+    if (page === 'settings') {
+        html += settingsPage();
+    } else if (!result && !busy) {
         html += '<section class="empty">' +
-            '<div class="empty-icon">$</div><h3>Load your company to start</h3><p>The calculator reads employees, wages, effectiveness, and your company type from the Torn API. It does not submit wage changes.</p>' +
-            '<div><button class="primary" data-a="load">Refresh API</button><button data-a="key">API Key</button></div>' +
+            '<div class="empty-icon">$</div><h3>Connect your company data</h3><p>Load employee wages, effectiveness, and company positions from the Torn API. The helper is advisory and never submits wage changes by itself.</p>' +
+            '<div><button class="primary" data-a="load">Refresh API</button><button data-a="key">Set API Key</button></div>' +
         '</section>';
-    }
-
-    if (result) {
-        var delta = result.suggestedIncluded - result.currentIncluded;
-        html += '<section class="summary">' +
-            summaryCard('Included employees', fmt(result.included), result.excluded ? fmt(result.excluded) + ' excluded' : 'All employees included') +
-            summaryCard('Included payroll', money(result.currentIncluded), 'Current daily total') +
-            summaryCard('Suggested payroll', money(result.suggestedIncluded), (delta > 0 ? '+' : '') + money(delta) + ' vs current', delta > 0 ? 'warn' : delta < 0 ? 'good' : '') +
-            summaryCard('Avg. effectiveness', fmt(result.avgEffectiveness), 'Avg. work-stat eff. ' + fmt(result.avgFit)) +
-            summaryCard('Budget variance', cfg.mode === 'benchmark' ? '—' : money(result.budgetGap), cfg.mode === 'benchmark' ? 'Not budget-constrained' : 'Difference after limits & rounding', Math.abs(result.budgetGap) > num(cfg.round) ? 'warn' : 'good') +
-        '</section>';
-
-        if (!positions.length) {
-            html += '<div class="notice"><b>Position-fit advice unavailable.</b> Wage calculations are active, but the company type position catalog could not be loaded.</div>';
-        }
-
-        html += '<section class="workspace">' +
-            '<div class="toolbar">' +
-                '<div class="search"><span>⌕</span><input data-ui="query" value="' + esc(ui.query) + '" placeholder="Search employee, ID, or position" aria-label="Search employees"></div>' +
-                '<select data-ui="sort" aria-label="Sort employees">' + sortOptions() + '</select>' +
-                '<button class="small" data-a="sort-dir" title="Toggle sort direction">' + (ui.direction === 'desc' ? '↓' : '↑') + '</button>' +
-                '<button class="small" data-a="reset-inclusions">Include all</button>' +
-            '</div>' +
-            '<div class="filters">' + filterButton('all', 'All', result.rows.length) + filterButton('included', 'Included', result.included) + filterButton('excluded', 'Excluded', result.excluded) + filterButton('raise', 'Raises', result.rows.filter(function(x){return !x.omit&&x.change>0;}).length) + filterButton('cut', 'Cuts', result.rows.filter(function(x){return !x.omit&&x.change<0;}).length) + filterButton('position', 'Position review', result.rows.filter(function(x){return x.recommendPosition;}).length) + '</div>' +
-            '<div class="table-meta"><span>Showing <b>' + fmt(visibleRows.length) + '</b> of ' + fmt(result.rows.length) + '</span><span>Drag horizontally on the table to view all columns.</span></div>' +
-            '<div class="table-wrap"><table><thead><tr>' +
-                '<th class="sticky-check">Use</th><th class="sticky-name">Employee</th><th>Current position</th><th>Position fit</th><th>MAN</th><th>INT</th><th>END</th><th>Eff.</th><th>Score</th><th>Current wage</th><th>Suggested</th><th>Change</th><th>Status</th><th></th>' +
-            '</tr></thead><tbody>';
-
-        visibleRows.forEach(function (x) {
-            var posFit = cfg.positionAdvice && x.bestPosition ? fmt(x.currentFit) + ' <span class="arrow">→</span> ' + fmt(x.bestFit) : fmt(x.currentFit);
-            html += '<tr class="' + (x.omit ? 'excluded-row' : '') + '">' +
-                '<td class="sticky-check"><input type="checkbox" data-inc="' + esc(x.id) + '"' + (!x.omit ? ' checked' : '') + ' aria-label="Include ' + esc(x.name) + '"></td>' +
-                '<td class="sticky-name"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small>[' + esc(x.id) + ']</small></td>' +
-                '<td><b>' + esc(x.position) + '</b><small class="cell-note">' + (x.days ? fmt(x.days) + ' days in company' : '') + '</small></td>' +
-                '<td class="fit-cell"><b>' + posFit + '</b>' + (x.recommendPosition ? '<small class="cell-note attention">Review: ' + esc(x.bestPosition.name) + '</small>' : '') + '</td>' +
-                '<td>' + fmt(x.manual) + '</td><td>' + fmt(x.intelligence) + '</td><td>' + fmt(x.endurance) + '</td>' +
-                '<td><b>' + fmt(x.effectiveness.total) + '</b><small class="cell-note">Work ' + fmt(x.currentFit) + '</small></td>' +
-                '<td>' + (x.omit ? '—' : x.score.toFixed(3)) + '</td>' +
-                '<td>' + (x.wage == null ? '<span class="subtle">Unavailable</span>' : money(x.wage)) + '</td>' +
-                '<td class="suggested"><b>' + money(x.suggested) + '</b></td>' +
-                '<td class="' + (x.change > 0 ? 'positive' : x.change < 0 ? 'negative' : '') + '">' + (x.change > 0 ? '+' : '') + money(x.change) + (x.wage > 0 && x.change ? '<small class="cell-note">' + (x.changePct > 0 ? '+' : '') + pct(x.changePct) + '</small>' : '') + '</td>' +
-                '<td>' + changeLabel(x) + '</td>' +
-                '<td><button class="row-action" data-copy-one="' + esc(x.id) + '" title="Copy suggested wage">⧉</button></td>' +
-            '</tr>';
-        });
-
-        if (!visibleRows.length) html += '<tr><td colspan="14" class="no-results">No employees match this view.</td></tr>';
-        html += '</tbody></table></div></section>';
+    } else if (result && page === 'employees') {
+        html += employeesPage(result, visibleRows);
+    } else if (result) {
+        html += overviewPage(result);
     }
 
     html += '<footer><span>API: ' + esc(keySource()) + '</span><span>Advisory only — wage changes are never submitted automatically.</span></footer>';
@@ -822,6 +762,111 @@ function render() {
 
     panel.innerHTML = html;
     bind(result);
+}
+
+function pageTab(key, label, note, count) {
+    return '<button class="page-tab ' + ((ui.page || 'overview') === key ? 'active' : '') + '" data-page="' + key + '">' +
+        '<span class="page-tab-main">' + esc(label) + (count != null ? '<b>' + fmt(count) + '</b>' : '') + '</span>' +
+        '<small>' + esc(note) + '</small>' +
+    '</button>';
+}
+
+function settingsPage() {
+    return '<section class="settings settings-page">' +
+        '<div class="page-heading"><div><small>Calculation setup</small><h3>Wage model & preferences</h3><p>Changes recalculate recommendations immediately. Nothing here submits changes to Torn.</p></div><button class="text-btn" data-a="reset-settings">Reset defaults</button></div>' +
+        '<div class="settings-group"><div class="settings-group-title"><b>Payment model</b><small>Choose how the suggested payroll is calculated.</small></div><div class="settings-grid">' +
+            settingField('mode', 'Payment model', 'Current redistributes the included payroll. Fixed uses your chosen budget. Benchmark pays score × benchmark.', 'mode') +
+            settingField('budget', 'Fixed daily payroll', 'Used only when Payment model is Fixed budget.') +
+            settingField('benchmark', 'Benchmark wage', 'A score of 1.000 receives approximately this amount.') +
+        '</div></div>' +
+        '<div class="settings-group"><div class="settings-group-title"><b>Scoring</b><small>Control how much position fit and total effectiveness matter.</small></div><div class="settings-grid">' +
+            settingField('target', 'Target effectiveness', 'Effectiveness treated as the baseline 1.000 contribution.') +
+            settingField('stats', 'Position-fit weight', 'Weight given to employee work-stat efficiency in the current role.') +
+            settingField('eff', 'Effectiveness weight', 'Weight given to total effectiveness, including modifiers.') +
+        '</div></div>' +
+        '<div class="settings-group"><div class="settings-group-title"><b>Limits & rounding</b><small>Set wage boundaries and clean recommendation increments.</small></div><div class="settings-grid">' +
+            settingField('min', 'Minimum wage', 'Floor applied to every included employee.') +
+            settingField('max', 'Maximum wage', 'Cap applied to every included employee.') +
+            settingField('round', 'Round to', 'Use 100, 1,000, 10,000, etc. The allocator tries to preserve the chosen total.') +
+        '</div></div>' +
+        '<div class="settings-group"><div class="settings-group-title"><b>Helper behavior</b><small>Optional conveniences and recommendations.</small></div><div class="toggles">' +
+            toggle('director', 'Include director', 'Include the director in wage distribution.') +
+            toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
+            toggle('positionAdvice', 'Position-fit advice', 'Compare each employee with positions for this company type.') +
+            toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
+        '</div></div>' +
+    '</section>';
+}
+
+function overviewPage(result) {
+    var delta = result.suggestedIncluded - result.currentIncluded;
+    var raises = result.rows.filter(function (x) { return !x.omit && x.change > 0; }).sort(function (a,b) { return b.change-a.change; });
+    var cuts = result.rows.filter(function (x) { return !x.omit && x.change < 0; }).sort(function (a,b) { return a.change-b.change; });
+    var reviews = result.rows.filter(function (x) { return x.recommendPosition; }).sort(function (a,b) { return (b.bestFit-b.currentFit)-(a.bestFit-a.currentFit); });
+
+    var html = '<section class="overview-page">' +
+        '<div class="page-heading"><div><small>Company overview</small><h3>What needs your attention</h3><p>Start here, then open Employees for the full wage list or Settings to change the calculation model.</p></div><button class="primary compact" data-page="employees">View employees</button></div>' +
+        '<section class="summary">' +
+            summaryCard('Employees included', fmt(result.included), result.excluded ? fmt(result.excluded) + ' excluded' : 'Everyone is included') +
+            summaryCard('Current payroll', money(result.currentIncluded), 'Included daily total') +
+            summaryCard('Suggested payroll', money(result.suggestedIncluded), (delta > 0 ? '+' : '') + money(delta) + ' vs current', delta > 0 ? 'warn' : delta < 0 ? 'good' : '') +
+            summaryCard('Avg. effectiveness', fmt(result.avgEffectiveness), 'Work-stat efficiency ' + fmt(result.avgFit)) +
+            summaryCard('Budget variance', cfg.mode === 'benchmark' ? '—' : money(result.budgetGap), cfg.mode === 'benchmark' ? 'Benchmark mode' : 'After limits and rounding', Math.abs(result.budgetGap) > num(cfg.round) ? 'warn' : 'good') +
+        '</section>';
+
+    if (!positions.length) {
+        html += '<div class="notice"><b>Position-fit advice unavailable.</b> Wage calculations are active, but position recommendations are temporarily hidden.</div>';
+    }
+
+    html += '<div class="insight-grid">' +
+        insightCard('Raises', raises, function (x) { return '+' + money(x.change); }, 'No suggested raises', 'raise') +
+        insightCard('Cuts', cuts, function (x) { return money(x.change); }, 'No suggested cuts', 'cut') +
+        insightCard('Position review', reviews, function (x) { return x.bestPosition ? x.bestPosition.name : 'Review' ; }, 'No position changes flagged', 'position') +
+    '</div>' +
+    '<div class="overview-help"><div><b>How to use this helper</b><p>Review the summary, inspect employees that need attention, then copy or autofill wages only after you are satisfied with the recommendations.</p></div><button data-page="settings">Adjust calculation</button></div>' +
+    '</section>';
+    return html;
+}
+
+function insightCard(title, list, valueFn, emptyText, filterKey) {
+    var shown = list.slice(0, 4);
+    var body = shown.length ? shown.map(function (x) {
+        return '<button class="insight-row" data-detail="' + esc(x.id) + '"><span><b>' + esc(x.name) + '</b><small>' + esc(x.position) + '</small></span><strong>' + esc(valueFn(x)) + '</strong></button>';
+    }).join('') : '<div class="insight-empty">✓ ' + esc(emptyText) + '</div>';
+    return '<div class="insight-card"><div class="insight-head"><div><b>' + esc(title) + '</b><small>' + fmt(list.length) + ' employee' + (list.length === 1 ? '' : 's') + '</small></div>' + (list.length ? '<button data-filter-jump="' + filterKey + '">See all</button>' : '') + '</div>' + body + '</div>';
+}
+
+function employeesPage(result, visibleRows) {
+    var html = '<section class="workspace employee-page">' +
+        '<div class="page-heading employees-heading"><div><small>Employee recommendations</small><h3>Wages & position fit</h3><p>Tap an employee name for work stats, effectiveness breakdown, and position requirements.</p></div><button class="small" data-a="reset-inclusions">Include all</button></div>' +
+        '<div class="toolbar">' +
+            '<div class="search"><span>⌕</span><input data-ui="query" value="' + esc(ui.query) + '" placeholder="Search name, ID, or position" aria-label="Search employees"></div>' +
+            '<select data-ui="sort" aria-label="Sort employees">' + sortOptions() + '</select>' +
+            '<button class="small" data-a="sort-dir" title="Toggle sort direction">' + (ui.direction === 'desc' ? '↓' : '↑') + '</button>' +
+        '</div>' +
+        '<div class="filters">' + filterButton('all', 'All', result.rows.length) + filterButton('included', 'Included', result.included) + filterButton('excluded', 'Excluded', result.excluded) + filterButton('raise', 'Raises', result.rows.filter(function(x){return !x.omit&&x.change>0;}).length) + filterButton('cut', 'Cuts', result.rows.filter(function(x){return !x.omit&&x.change<0;}).length) + filterButton('position', 'Position review', result.rows.filter(function(x){return x.recommendPosition;}).length) + '</div>' +
+        '<div class="table-meta"><span>Showing <b>' + fmt(visibleRows.length) + '</b> of ' + fmt(result.rows.length) + '</span><span>Tap a name to see full employee details.</span></div>' +
+        '<div class="table-wrap"><table class="employee-table"><colgroup><col class="col-use"><col class="col-employee"><col class="col-position"><col class="col-effect"><col class="col-current"><col class="col-suggested"><col class="col-change"><col class="col-action"></colgroup><thead><tr>' +
+            '<th class="use-col">Use</th><th class="employee-col">Employee</th><th class="position-col">Position</th><th class="effect-col">Eff.</th><th class="current-col">Current</th><th class="suggested-col">Suggested</th><th class="change-col">Change</th><th class="action-col"></th>' +
+        '</tr></thead><tbody>';
+
+    visibleRows.forEach(function (x) {
+        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">Review → ' + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
+        html += '<tr class="' + (x.omit ? 'excluded-row' : '') + '">' +
+            '<td class="use-col"><input type="checkbox" data-inc="' + esc(x.id) + '"' + (!x.omit ? ' checked' : '') + ' aria-label="Include ' + esc(x.name) + '"></td>' +
+            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small>[' + esc(x.id) + ']</small></td>' +
+            '<td class="position-col"><b>' + esc(x.position) + '</b>' + review + '</td>' +
+            '<td class="effect-col"><b>' + fmt(x.effectiveness.total) + '</b><small>Fit ' + fmt(x.currentFit) + '</small></td>' +
+            '<td class="current-col">' + (x.wage == null ? '<span class="subtle">—</span>' : money(x.wage)) + '</td>' +
+            '<td class="suggested-col suggested"><b>' + money(x.suggested) + '</b><small class="mobile-status">' + changeLabel(x) + '</small></td>' +
+            '<td class="change-col ' + (x.change > 0 ? 'positive' : x.change < 0 ? 'negative' : '') + '"><b>' + (x.change > 0 ? '+' : '') + money(x.change) + '</b>' + (x.wage > 0 && x.change ? '<small>' + (x.changePct > 0 ? '+' : '') + pct(x.changePct) + '</small>' : '<small>' + changeLabel(x) + '</small>') + '</td>' +
+            '<td class="action-col"><button class="row-action" data-copy-one="' + esc(x.id) + '" title="Copy suggested wage">⧉</button></td>' +
+        '</tr>';
+    });
+
+    if (!visibleRows.length) html += '<tr><td colspan="8" class="no-results">No employees match this view.</td></tr>';
+    html += '</tbody></table></div></section>';
+    return html;
 }
 
 function summaryCard(label, value, note, cls) {
@@ -848,8 +893,21 @@ function bind(result) {
     panel.querySelectorAll('[data-a="load"]').forEach(function (b) { b.onclick = load; });
     panel.querySelectorAll('[data-a="key"]').forEach(function (b) { b.onclick = showKey; });
 
-    var settings = panel.querySelector('[data-a="settings"]');
-    if (settings) settings.onclick = function () { settingsOpen = !settingsOpen; render(); };
+    panel.querySelectorAll('[data-page]').forEach(function (b) {
+        b.onclick = function () {
+            ui.page = b.dataset.page || 'overview';
+            detailId = '';
+            render();
+        };
+    });
+
+    panel.querySelectorAll('[data-filter-jump]').forEach(function (b) {
+        b.onclick = function () {
+            ui.filter = b.dataset.filterJump || 'all';
+            ui.page = 'employees';
+            render();
+        };
+    });
 
     var dismiss = panel.querySelector('[data-a="dismiss-error"]');
     if (dismiss) dismiss.onclick = function () { errorState = null; render(); };
@@ -977,6 +1035,7 @@ async function load() {
 
 function openPanel() {
     S.querySelector('#overlay').classList.add('show');
+    if (!ui.page) ui.page = 'overview';
     render();
     if (cfg.autoRefresh && apiKey() && (!lastLoadedAt || Date.now() - lastLoadedAt > FRESH_AGE) && !busy) load();
 }
@@ -1273,7 +1332,7 @@ document.documentElement.appendChild(host);
 var S = host.attachShadow({ mode:'open' });
 
 S.innerHTML = '<style>' +
-':host{all:initial;--bg:#111417;--panel:#171b1f;--panel2:#1d2329;--panel3:#242b32;--border:#37414a;--border2:#4a5661;--text:#f3f6f8;--muted:#9ba8b3;--green:#22c77a;--green2:#0d6c47;--red:#ff6b6b;--amber:#f2b84b;--blue:#76c7ff;font-family:Inter,Arial,sans-serif;color:var(--text)}*{box-sizing:border-box}button,input,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}#fab{position:fixed;right:14px;bottom:100px;width:50px;height:50px;border-radius:16px;border:1px solid #5ccf94;background:linear-gradient(145deg,#0b6a45,#0a5037);color:#fff;z-index:2147483645;box-shadow:0 10px 25px #0008;font-weight:900;font-size:13px;letter-spacing:.4px;touch-action:none}#fab::after{content:"$";position:absolute;right:-5px;top:-6px;width:19px;height:19px;border-radius:50%;display:grid;place-items:center;background:#e9fff4;color:#075535;font-size:12px;border:2px solid #075535}#overlay{display:none;position:fixed;inset:0;background:#080a0ccc;z-index:2147483646;overflow:auto;color:var(--text);-webkit-text-fill-color:initial}#overlay.show{display:block}#panel{width:min(1380px,calc(100vw - 20px));min-height:calc(100vh - 20px);margin:10px auto;background:var(--bg);border:1px solid var(--border2);border-radius:16px;overflow:hidden;box-shadow:0 24px 70px #000b}header{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:#0b0e11eF;border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand{display:flex;align-items:center;gap:11px;min-width:0}.logo{width:38px;height:38px;display:grid;place-items:center;border-radius:10px;background:#0b6a45;border:1px solid #42c889;color:white;font-weight:900}.brand h2{margin:0;font-size:16px;line-height:1.2;color:var(--text)}.brand h2 span{color:var(--muted);font-size:11px;font-weight:700}.brand p{margin:3px 0 0;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70vw}.header-actions{display:flex;align-items:center;gap:9px}.refresh-state{font-size:11px;color:#a9e6c8}.refresh-state.stale{color:var(--amber)}.icon-btn{width:34px;height:34px;padding:0;border-radius:9px;border:1px solid var(--border2);background:var(--panel2);color:#fff!important;font-size:20px}.actionbar{display:flex;gap:7px;flex-wrap:wrap;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--border)}.actionbar button,.settings button,.empty button,.toolbar button{border:1px solid var(--border2);border-radius:9px;padding:8px 11px;background:var(--panel3);color:var(--text)!important;font-weight:750}.actionbar .primary,.empty .primary{background:var(--green2);border-color:#2f9d70}.spinner{display:inline-block;width:12px;height:12px;border:2px solid #ffffff55;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:5px}@keyframes spin{to{transform:rotate(360deg)}}.settings{padding:14px;background:#14191e;border-bottom:1px solid var(--border)}.section-title{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:12px}.section-title h3{margin:0;font-size:15px}.section-title p{margin:3px 0 0;color:var(--muted);font-size:11px}.text-btn{padding:5px 8px!important;background:transparent!important;color:var(--blue)!important}.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(190px,1fr));gap:10px}.setting{display:block;padding:10px;border:1px solid var(--border);background:var(--panel);border-radius:10px}.setting>span{display:block;font-size:12px;font-weight:800;margin-bottom:6px}.setting input,.setting select{width:100%;height:36px;padding:7px 9px;border:1px solid #5a6570;border-radius:7px;background:#f8fafb!important;color:#101417!important;-webkit-text-fill-color:#101417!important}.setting small{display:block;color:var(--muted);font-size:10px;line-height:1.35;margin-top:6px}.toggles{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:8px;margin-top:10px}.toggle{display:flex;align-items:center;gap:9px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel);cursor:pointer}.toggle input{position:absolute;opacity:0}.switch{width:36px;height:20px;border-radius:999px;background:#4a535c;position:relative;flex:0 0 auto}.switch::after{content:"";position:absolute;width:14px;height:14px;top:3px;left:3px;border-radius:50%;background:white;transition:.15s}.toggle input:checked+.switch{background:var(--green2)}.toggle input:checked+.switch::after{left:19px}.toggle b,.toggle small{display:block}.toggle b{font-size:12px}.toggle small{margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35}.error-card{display:grid;grid-template-columns:34px 1fr 28px;gap:10px;align-items:start;margin:12px 14px;padding:11px;border:1px solid #9d4b4b;background:#3d1c1f;border-radius:11px}.error-icon{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:#7d2e34;font-weight:900}.error-card b{font-size:12px}.error-card p{margin:4px 0;font-size:11px;color:#ffd9d9}.error-card small{font-size:10px;line-height:1.4;color:#ffd9d9}.error-card>button{border:0;background:transparent;color:#fff;font-size:18px}.error-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.error-actions button,.error-actions a{display:inline-flex;align-items:center;padding:6px 8px;border-radius:7px;border:1px solid #a45d5d;background:#582a2d;color:#fff!important;text-decoration:none;font-size:10px;font-weight:800}.error-actions a{background:#272f36;border-color:#596672}.notice{margin:0 14px 10px;padding:9px 11px;background:#3b321b;border:1px solid #806b2f;border-radius:9px;color:#ffe3a0;font-size:11px}.empty{min-height:55vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:30px}.empty-icon{width:60px;height:60px;border-radius:18px;display:grid;place-items:center;background:#0f6546;border:1px solid #42b982;font-size:28px;font-weight:900}.empty h3{margin:14px 0 5px;font-size:18px}.empty p{max-width:520px;margin:0 0 14px;color:var(--muted);font-size:12px;line-height:1.55}.empty>div{display:flex;gap:8px}.summary{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:8px;padding:12px 14px}.summary-card{padding:11px;border:1px solid var(--border);border-radius:11px;background:linear-gradient(180deg,var(--panel2),var(--panel));min-width:0}.summary-card small,.summary-card b,.summary-card span{display:block}.summary-card small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.summary-card b{margin-top:4px;font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.summary-card span{margin-top:4px;color:var(--muted);font-size:10px}.summary-card.good b{color:#8ff0bd}.summary-card.warn b{color:#ffd27d}.workspace{padding:0 14px 16px}.toolbar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:0 0 8px}.search{flex:1 1 290px;display:flex;align-items:center;gap:6px;height:38px;padding:0 10px;border:1px solid var(--border2);border-radius:9px;background:var(--panel)}.search span{color:var(--muted);font-size:18px}.search input{width:100%;border:0;outline:0;background:transparent!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar select{height:38px;padding:0 9px;border:1px solid var(--border2);border-radius:9px;background:var(--panel3)!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar .small{height:38px}.filters{display:flex;gap:6px;overflow-x:auto;padding-bottom:3px}.filter{display:flex;align-items:center;gap:6px;padding:6px 9px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--muted);white-space:nowrap}.filter span{min-width:20px;padding:2px 5px;border-radius:999px;background:#2c343c;font-size:9px;text-align:center}.filter.active{background:#123829;border-color:#2e8b64;color:#bdf4d6}.table-meta{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:10px;padding:7px 2px}.table-wrap{width:100%;overflow:auto;border:1px solid var(--border);border-radius:11px;background:var(--panel);-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;max-height:62vh}.table-wrap::-webkit-scrollbar{height:10px;width:10px}.table-wrap::-webkit-scrollbar-thumb{background:#55616c;border:2px solid #1a2026;border-radius:99px}.table-wrap::-webkit-scrollbar-track{background:#1a2026}table{width:max-content;min-width:1320px;border-collapse:separate;border-spacing:0;font-size:11px}th,td{padding:8px 9px;border-bottom:1px solid #303840;white-space:nowrap;text-align:right;background:var(--panel);color:var(--text)!important}th{position:sticky;top:0;z-index:6;background:#0c1013!important;color:#cbd4db!important;font-size:9px;text-transform:uppercase;letter-spacing:.35px}tbody tr:nth-child(even) td{background:#151a1f}.sticky-check{position:sticky;left:0;z-index:8!important;width:46px;min-width:46px;text-align:center!important}.sticky-name{position:sticky;left:46px;z-index:7!important;width:165px;min-width:165px;text-align:left!important;border-right:1px solid var(--border2);box-shadow:7px 0 12px -12px #000}thead .sticky-check,thead .sticky-name{z-index:10!important;background:#0c1013!important}.excluded-row td{opacity:.62}.employee-link{padding:0;border:0;background:transparent;color:#9bd8ff!important;font-weight:850;text-align:left}.sticky-name small{display:block;margin-top:2px;color:var(--muted);font-size:9px}.cell-note{display:block;margin-top:2px;color:var(--muted);font-size:9px;font-weight:500}.cell-note.attention{color:#ffd27d}.fit-cell .arrow{color:var(--muted);padding:0 2px}.suggested b{color:#b8f5d2}.positive{color:#8ff0bd!important}.negative{color:#ff9d9d!important}.tag{display:inline-flex;align-items:center;padding:3px 6px;border-radius:999px;font-size:9px;font-weight:800}.tag.raise{background:#123d2d;color:#9cf0c1}.tag.cut{background:#4a2226;color:#ffb1b1}.tag.keep{background:#293239;color:#ccd5dc}.tag.muted{background:#2b2e31;color:#9da6ad}.row-action{width:28px;height:28px;padding:0;border-radius:7px;border:1px solid var(--border);background:#262e35;color:#fff!important}.subtle{color:var(--muted)}.no-results{text-align:center!important;padding:28px!important;color:var(--muted)!important}footer{display:flex;justify-content:space-between;gap:12px;padding:10px 14px;border-top:1px solid var(--border);color:var(--muted);font-size:9px;background:#0f1316}.detail-overlay{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:14px;background:#050607cc}.detail-shell{width:min(680px,100%);max-height:90vh;overflow:auto}.detail-card{border:1px solid var(--border2);border-radius:14px;background:#14191e;box-shadow:0 20px 60px #000c;padding:14px}.detail-head{display:flex;justify-content:space-between;gap:10px}.detail-head small{color:var(--muted);font-size:10px;text-transform:uppercase}.detail-head h3{margin:3px 0 0;font-size:18px}.detail-head h3 span{color:var(--muted);font-size:11px}.detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:12px}.detail-grid>div{padding:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.detail-grid small,.detail-grid b{display:block}.detail-grid small{color:var(--muted);font-size:9px}.detail-grid b{margin-top:3px;font-size:13px}.detail-card h4{margin:14px 0 7px;font-size:11px;text-transform:uppercase;color:#c6d1d9}.breakdown{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}.breakdown>div{display:flex;justify-content:space-between;padding:7px 8px;border-radius:8px;background:var(--panel);font-size:10px}.breakdown .pos{color:#9cf0c1}.breakdown .neg{color:#ff9d9d}.position-box{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px;border:1px solid #35694f;background:#123024;border-radius:9px}.position-box b,.position-box small{display:block}.position-box small{margin-top:3px;color:#a9c7b9;font-size:9px}.position-box strong{font-size:20px;color:#baf2d2}.requirements{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:9px;color:var(--muted)}.requirements b{padding:3px 6px;border-radius:6px;background:#252e35;color:#dce4e9}.detail-note{margin:12px 0 0;color:var(--muted);font-size:9px;line-height:1.45}#keybox{display:none;position:fixed;inset:0;z-index:2147483647;background:#050607dd;align-items:center;justify-content:center;padding:14px}#keybox.show{display:flex}.key-card{width:min(460px,100%);padding:15px;border:1px solid var(--border2);border-radius:14px;background:#151a1f;color:var(--text)}.key-card h3{margin:0;font-size:16px}.key-card p{margin:5px 0 10px;color:var(--muted);font-size:10px;line-height:1.45}.key-card input[type=password]{width:100%;height:39px;padding:8px 10px;border:1px solid #6a7580;border-radius:8px;background:#fff!important;color:#111!important;-webkit-text-fill-color:#111!important}.remember{display:flex;align-items:center;gap:7px;margin-top:9px;color:#d3dce3;font-size:10px}.key-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:12px;flex-wrap:wrap}.key-actions button{padding:8px 10px;border-radius:8px;border:1px solid var(--border2);background:var(--panel3);color:#fff!important;font-weight:800}.key-actions .save{background:var(--green2)}#toast{position:fixed;left:50%;bottom:28px;z-index:2147483647;transform:translate(-50%,18px);opacity:0;pointer-events:none;padding:9px 12px;border-radius:9px;color:#fff;font:800 11px Arial;box-shadow:0 8px 25px #000b;transition:.18s}#toast.show{opacity:1;transform:translate(-50%,0)}#toast.ok{background:#0b6947}#toast.bad{background:#7d2e34}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #82d9ff;outline-offset:2px}@media(max-width:1000px){.summary{grid-template-columns:repeat(3,1fr)}.settings-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:700px){#panel{width:100vw;min-height:100vh;margin:0;border-radius:0;border-left:0;border-right:0}.brand p{max-width:55vw}.refresh-state{display:none}.summary{grid-template-columns:repeat(2,1fr);padding:10px}.summary-card b{font-size:15px}.workspace{padding:0 8px 12px}.settings-grid,.toggles{grid-template-columns:1fr}.table-wrap{max-height:66vh}.table-meta span:last-child{display:none}.detail-grid{grid-template-columns:repeat(2,1fr)}footer{flex-direction:column}.actionbar{padding:8px}.actionbar button{flex:1 1 auto}.sticky-name{width:145px;min-width:145px}.section-title{align-items:center}}@media(max-width:420px){.summary{grid-template-columns:1fr 1fr}.breakdown{grid-template-columns:1fr}.detail-grid{grid-template-columns:1fr 1fr}}' +
+':host{all:initial;--bg:#111417;--panel:#171b1f;--panel2:#1d2329;--panel3:#242b32;--border:#37414a;--border2:#4a5661;--text:#f3f6f8;--muted:#9ba8b3;--green:#22c77a;--green2:#0d6c47;--red:#ff6b6b;--amber:#f2b84b;--blue:#76c7ff;font-family:Inter,Arial,sans-serif;color:var(--text)}*{box-sizing:border-box}button,input,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}#fab{position:fixed;right:14px;bottom:100px;width:50px;height:50px;border-radius:16px;border:1px solid #5ccf94;background:linear-gradient(145deg,#0b6a45,#0a5037);color:#fff;z-index:2147483645;box-shadow:0 10px 25px #0008;font-weight:900;font-size:13px;letter-spacing:.4px;touch-action:none}#fab::after{content:"$";position:absolute;right:-5px;top:-6px;width:19px;height:19px;border-radius:50%;display:grid;place-items:center;background:#e9fff4;color:#075535;font-size:12px;border:2px solid #075535}#overlay{display:none;position:fixed;inset:0;background:#080a0ccc;z-index:2147483646;overflow:auto;color:var(--text);-webkit-text-fill-color:initial}#overlay.show{display:block}#panel{width:min(1380px,calc(100vw - 20px));min-height:calc(100vh - 20px);margin:10px auto;background:var(--bg);border:1px solid var(--border2);border-radius:16px;overflow:hidden;box-shadow:0 24px 70px #000b}header{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:#0b0e11eF;border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand{display:flex;align-items:center;gap:11px;min-width:0}.logo{width:38px;height:38px;display:grid;place-items:center;border-radius:10px;background:#0b6a45;border:1px solid #42c889;color:white;font-weight:900}.brand h2{margin:0;font-size:16px;line-height:1.2;color:var(--text)}.brand h2 span{color:var(--muted);font-size:11px;font-weight:700}.brand p{margin:3px 0 0;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70vw}.header-actions{display:flex;align-items:center;gap:9px}.refresh-state{font-size:11px;color:#a9e6c8}.refresh-state.stale{color:var(--amber)}.icon-btn{width:34px;height:34px;padding:0;border-radius:9px;border:1px solid var(--border2);background:var(--panel2);color:#fff!important;font-size:20px}.page-tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:0;background:#101418;border-bottom:1px solid var(--border)}.page-tab{min-width:0;padding:11px 14px;border:0;border-right:1px solid var(--border);background:transparent;color:var(--muted)!important;text-align:left}.page-tab:last-child{border-right:0}.page-tab-main{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:900}.page-tab-main b{min-width:22px;padding:2px 6px;border-radius:999px;background:#2b333a;color:#cfd8df;font-size:9px;text-align:center}.page-tab small{display:block;margin-top:2px;font-size:9px;color:#74818b}.page-tab.active{background:#163226;color:#c9f5dd!important;box-shadow:inset 0 -3px 0 #39c989}.page-tab.active small{color:#9ec7b2}.actionbar{display:flex;gap:7px;flex-wrap:wrap;padding:9px 14px;background:var(--panel);border-bottom:1px solid var(--border)}.actionbar button,.settings button,.empty button,.toolbar button{border:1px solid var(--border2);border-radius:9px;padding:8px 11px;background:var(--panel3);color:var(--text)!important;font-weight:750}.actionbar .primary,.empty .primary{background:var(--green2);border-color:#2f9d70}.spinner{display:inline-block;width:12px;height:12px;border:2px solid #ffffff55;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:5px}@keyframes spin{to{transform:rotate(360deg)}}.settings{padding:14px;background:#14191e}.settings-page{min-height:55vh}.page-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;padding:14px}.page-heading>div{min-width:0}.page-heading>div>small{display:block;color:#69d49f;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.7px}.page-heading h3{margin:3px 0 3px;font-size:18px}.page-heading p{margin:0;max-width:720px;color:var(--muted);font-size:10px;line-height:1.45}.page-heading .compact{white-space:nowrap}.settings-group{margin:0 14px 12px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--panel)}.settings-group-title{margin-bottom:10px}.settings-group-title b,.settings-group-title small{display:block}.settings-group-title b{font-size:12px}.settings-group-title small{margin-top:2px;color:var(--muted);font-size:9px}.section-title{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:12px}.section-title h3{margin:0;font-size:15px}.section-title p{margin:3px 0 0;color:var(--muted);font-size:11px}.text-btn{padding:5px 8px!important;background:transparent!important;color:var(--blue)!important}.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(190px,1fr));gap:10px}.setting{display:block;padding:10px;border:1px solid var(--border);background:var(--panel);border-radius:10px}.setting>span{display:block;font-size:12px;font-weight:800;margin-bottom:6px}.setting input,.setting select{width:100%;height:36px;padding:7px 9px;border:1px solid #5a6570;border-radius:7px;background:#f8fafb!important;color:#101417!important;-webkit-text-fill-color:#101417!important}.setting small{display:block;color:var(--muted);font-size:10px;line-height:1.35;margin-top:6px}.toggles{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:8px;margin-top:10px}.toggle{display:flex;align-items:center;gap:9px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel);cursor:pointer}.toggle input{position:absolute;opacity:0}.switch{width:36px;height:20px;border-radius:999px;background:#4a535c;position:relative;flex:0 0 auto}.switch::after{content:"";position:absolute;width:14px;height:14px;top:3px;left:3px;border-radius:50%;background:white;transition:.15s}.toggle input:checked+.switch{background:var(--green2)}.toggle input:checked+.switch::after{left:19px}.toggle b,.toggle small{display:block}.toggle b{font-size:12px}.toggle small{margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35}.error-card{display:grid;grid-template-columns:34px 1fr 28px;gap:10px;align-items:start;margin:12px 14px;padding:11px;border:1px solid #9d4b4b;background:#3d1c1f;border-radius:11px}.error-icon{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:#7d2e34;font-weight:900}.error-card b{font-size:12px}.error-card p{margin:4px 0;font-size:11px;color:#ffd9d9}.error-card small{font-size:10px;line-height:1.4;color:#ffd9d9}.error-card>button{border:0;background:transparent;color:#fff;font-size:18px}.error-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.error-actions button,.error-actions a{display:inline-flex;align-items:center;padding:6px 8px;border-radius:7px;border:1px solid #a45d5d;background:#582a2d;color:#fff!important;text-decoration:none;font-size:10px;font-weight:800}.error-actions a{background:#272f36;border-color:#596672}.notice{margin:0 14px 10px;padding:9px 11px;background:#3b321b;border:1px solid #806b2f;border-radius:9px;color:#ffe3a0;font-size:11px}.empty{min-height:55vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:30px}.empty-icon{width:60px;height:60px;border-radius:18px;display:grid;place-items:center;background:#0f6546;border:1px solid #42b982;font-size:28px;font-weight:900}.empty h3{margin:14px 0 5px;font-size:18px}.empty p{max-width:520px;margin:0 0 14px;color:var(--muted);font-size:12px;line-height:1.55}.empty>div{display:flex;gap:8px}.overview-page{padding-bottom:14px}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;padding:0 14px 12px}.summary-card{padding:11px;border:1px solid var(--border);border-radius:11px;background:linear-gradient(180deg,var(--panel2),var(--panel));min-width:0}.summary-card small,.summary-card b,.summary-card span{display:block}.summary-card small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.summary-card b{margin-top:4px;font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.summary-card span{margin-top:4px;color:var(--muted);font-size:10px}.summary-card.good b{color:#8ff0bd}.summary-card.warn b{color:#ffd27d}.insight-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:0 14px 12px}.insight-card{min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--panel);overflow:hidden}.insight-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px;border-bottom:1px solid var(--border)}.insight-head b,.insight-head small{display:block}.insight-head b{font-size:11px}.insight-head small{margin-top:2px;color:var(--muted);font-size:9px}.insight-head button{border:0;background:transparent;color:var(--blue)!important;font-size:9px;font-weight:800}.insight-row{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border:0;border-bottom:1px solid #2b333a;background:transparent;color:var(--text)!important;text-align:left}.insight-row:last-child{border-bottom:0}.insight-row span{min-width:0}.insight-row b,.insight-row small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.insight-row b{font-size:10px}.insight-row small{margin-top:2px;color:var(--muted);font-size:8px}.insight-row strong{max-width:45%;font-size:10px;color:#bcefd3;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.insight-empty{padding:18px 10px;color:#9fcdb4;font-size:10px}.overview-help{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 14px;padding:12px;border:1px solid #365846;border-radius:11px;background:#13281f}.overview-help b{font-size:11px}.overview-help p{margin:3px 0 0;color:#a9b9b0;font-size:9px;line-height:1.45}.overview-help button{flex:0 0 auto;border:1px solid #4d765f;border-radius:8px;padding:7px 9px;background:#1b372a;color:#c9f5dd!important;font-weight:800}.workspace{padding:0 14px 16px}.employee-page>.page-heading{padding-left:0;padding-right:0}.toolbar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:0 0 8px}.search{flex:1 1 290px;display:flex;align-items:center;gap:6px;height:38px;padding:0 10px;border:1px solid var(--border2);border-radius:9px;background:var(--panel)}.search span{color:var(--muted);font-size:18px}.search input{width:100%;border:0;outline:0;background:transparent!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar select{height:38px;padding:0 9px;border:1px solid var(--border2);border-radius:9px;background:var(--panel3)!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar .small{height:38px}.filters{display:flex;gap:6px;overflow-x:auto;padding-bottom:3px}.filter{display:flex;align-items:center;gap:6px;padding:6px 9px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--muted);white-space:nowrap}.filter span{min-width:20px;padding:2px 5px;border-radius:999px;background:#2c343c;font-size:9px;text-align:center}.filter.active{background:#123829;border-color:#2e8b64;color:#bdf4d6}.table-meta{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:10px;padding:7px 2px}.table-wrap{width:100%;overflow-x:hidden;overflow-y:auto;border:1px solid var(--border);border-radius:11px;background:var(--panel);max-height:64vh}.employee-table{width:100%;min-width:0;table-layout:fixed;border-collapse:separate;border-spacing:0;font-size:10px}.employee-table col.col-use{width:6%}.employee-table col.col-employee{width:20%}.employee-table col.col-position{width:19%}.employee-table col.col-effect{width:9%}.employee-table col.col-current{width:13%}.employee-table col.col-suggested{width:14%}.employee-table col.col-change{width:14%}.employee-table col.col-action{width:5%}.employee-table th,.employee-table td{padding:8px 7px;border-bottom:1px solid #303840;white-space:normal;overflow-wrap:anywhere;text-align:right;vertical-align:middle;background:var(--panel);color:var(--text)!important}.employee-table th{position:sticky;top:0;z-index:5;background:#0c1013!important;color:#cbd4db!important;font-size:8px;text-transform:uppercase;letter-spacing:.25px}.employee-table tbody tr:nth-child(even) td{background:#151a1f}.employee-table .use-col{text-align:center}.employee-table .employee-col,.employee-table .position-col{text-align:left}.excluded-row td{opacity:.62}.employee-link{max-width:100%;padding:0;border:0;background:transparent;color:#9bd8ff!important;font-weight:850;text-align:left;white-space:normal;overflow-wrap:anywhere}.employee-col small,.position-col small,.effect-col small,.suggested-col small,.change-col small{display:block;margin-top:2px;color:var(--muted);font-size:8px;line-height:1.25}.position-col .attention{color:#ffd27d}.suggested b{color:#b8f5d2}.positive{color:#8ff0bd!important}.negative{color:#ff9d9d!important}.tag{display:inline-flex;align-items:center;padding:3px 6px;border-radius:999px;font-size:8px;font-weight:800}.tag.raise{background:#123d2d;color:#9cf0c1}.tag.cut{background:#4a2226;color:#ffb1b1}.tag.keep{background:#293239;color:#ccd5dc}.tag.muted{background:#2b2e31;color:#9da6ad}.mobile-status{display:none!important}.row-action{width:26px;height:26px;padding:0;border-radius:7px;border:1px solid var(--border);background:#262e35;color:#fff!important}.subtle{color:var(--muted)}.no-results{text-align:center!important;padding:28px!important;color:var(--muted)!important}footer{display:flex;justify-content:space-between;gap:12px;padding:10px 14px;border-top:1px solid var(--border);color:var(--muted);font-size:9px;background:#0f1316}.detail-overlay{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:14px;background:#050607cc}.detail-shell{width:min(680px,100%);max-height:90vh;overflow:auto}.detail-card{border:1px solid var(--border2);border-radius:14px;background:#14191e;box-shadow:0 20px 60px #000c;padding:14px}.detail-head{display:flex;justify-content:space-between;gap:10px}.detail-head small{color:var(--muted);font-size:10px;text-transform:uppercase}.detail-head h3{margin:3px 0 0;font-size:18px}.detail-head h3 span{color:var(--muted);font-size:11px}.detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:12px}.detail-grid>div{padding:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.detail-grid small,.detail-grid b{display:block}.detail-grid small{color:var(--muted);font-size:9px}.detail-grid b{margin-top:3px;font-size:13px}.detail-card h4{margin:14px 0 7px;font-size:11px;text-transform:uppercase;color:#c6d1d9}.breakdown{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}.breakdown>div{display:flex;justify-content:space-between;padding:7px 8px;border-radius:8px;background:var(--panel);font-size:10px}.breakdown .pos{color:#9cf0c1}.breakdown .neg{color:#ff9d9d}.position-box{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px;border:1px solid #35694f;background:#123024;border-radius:9px}.position-box b,.position-box small{display:block}.position-box small{margin-top:3px;color:#a9c7b9;font-size:9px}.position-box strong{font-size:20px;color:#baf2d2}.requirements{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:9px;color:var(--muted)}.requirements b{padding:3px 6px;border-radius:6px;background:#252e35;color:#dce4e9}.detail-note{margin:12px 0 0;color:var(--muted);font-size:9px;line-height:1.45}#keybox{display:none;position:fixed;inset:0;z-index:2147483647;background:#050607dd;align-items:center;justify-content:center;padding:14px}#keybox.show{display:flex}.key-card{width:min(460px,100%);padding:15px;border:1px solid var(--border2);border-radius:14px;background:#151a1f;color:var(--text)}.key-card h3{margin:0;font-size:16px}.key-card p{margin:5px 0 10px;color:var(--muted);font-size:10px;line-height:1.45}.key-card input[type=password]{width:100%;height:39px;padding:8px 10px;border:1px solid #6a7580;border-radius:8px;background:#fff!important;color:#111!important;-webkit-text-fill-color:#111!important}.remember{display:flex;align-items:center;gap:7px;margin-top:9px;color:#d3dce3;font-size:10px}.key-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:12px;flex-wrap:wrap}.key-actions button{padding:8px 10px;border-radius:8px;border:1px solid var(--border2);background:var(--panel3);color:#fff!important;font-weight:800}.key-actions .save{background:var(--green2)}#toast{position:fixed;left:50%;bottom:28px;z-index:2147483647;transform:translate(-50%,18px);opacity:0;pointer-events:none;padding:9px 12px;border-radius:9px;color:#fff;font:800 11px Arial;box-shadow:0 8px 25px #000b;transition:.18s}#toast.show{opacity:1;transform:translate(-50%,0)}#toast.ok{background:#0b6947}#toast.bad{background:#7d2e34}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #82d9ff;outline-offset:2px}@media(max-width:1000px){.summary{grid-template-columns:repeat(3,minmax(0,1fr))}.insight-grid{grid-template-columns:1fr 1fr}.insight-card:last-child{grid-column:1/-1}.settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.employee-table .position-col{display:none}.employee-table col.col-position{width:0}.employee-table col.col-employee{width:24%}.employee-table col.col-effect{width:10%}.employee-table col.col-current{width:15%}.employee-table col.col-suggested{width:17%}.employee-table col.col-change{width:17%}.employee-table col.col-action{width:6%}.employee-table col.col-use{width:7%}}@media(max-width:700px){#panel{width:100vw;min-height:100vh;margin:0;border-radius:0;border-left:0;border-right:0}.brand p{max-width:50vw}.refresh-state{display:none}.page-tabs{position:sticky;top:67px;z-index:18}.page-tab{padding:9px 8px;text-align:center}.page-tab-main{justify-content:center;font-size:11px}.page-tab small{display:none}.actionbar{display:grid;grid-template-columns:repeat(4,1fr);padding:7px;gap:5px}.actionbar button{min-width:0;padding:7px 4px;font-size:9px}.page-heading{padding:12px 10px}.page-heading h3{font-size:16px}.page-heading p{font-size:9px}.summary{grid-template-columns:repeat(2,minmax(0,1fr));padding:0 10px 10px}.summary-card{padding:9px}.summary-card b{font-size:14px}.insight-grid{grid-template-columns:1fr;padding:0 10px 10px}.insight-card:last-child{grid-column:auto}.overview-help{margin:0 10px;align-items:flex-start}.overview-help button{white-space:nowrap}.workspace{padding:0 7px 10px}.employees-heading{padding:10px 0}.toolbar{display:grid;grid-template-columns:1fr auto}.search{grid-column:1/-1;min-width:0}.toolbar select{min-width:0;width:100%}.filters{margin-right:-1px}.table-meta span:last-child{display:none}.table-wrap{max-height:68vh}.employee-table col.col-use{width:9%}.employee-table col.col-employee{width:31%}.employee-table col.col-effect{width:12%}.employee-table col.col-current{width:0}.employee-table col.col-suggested{width:24%}.employee-table col.col-change{width:18%}.employee-table col.col-action{width:6%}.employee-table .current-col{display:none}.employee-table th,.employee-table td{padding:7px 4px;font-size:9px}.employee-table th{font-size:7px}.employee-table .tag{display:none}.employee-table .mobile-status{display:block!important}.employee-table .row-action{width:22px;height:24px;font-size:10px}.settings-group{margin:0 9px 10px;padding:10px}.settings-grid,.toggles{grid-template-columns:1fr}.detail-grid{grid-template-columns:repeat(2,1fr)}footer{flex-direction:column}.section-title{align-items:center}}@media(max-width:430px){.brand .logo{display:none}.page-tab-main b{display:none}.summary{grid-template-columns:1fr 1fr}.summary-card small{font-size:8px}.summary-card span{font-size:8px}.overview-help{flex-direction:column}.employee-table col.col-use{width:10%}.employee-table col.col-employee{width:38%}.employee-table col.col-effect{width:0}.employee-table col.col-suggested{width:29%}.employee-table col.col-change{width:17%}.employee-table col.col-action{width:6%}.employee-table .effect-col{display:none}.employee-table .change-col small{display:none}.breakdown{grid-template-columns:1fr}.detail-grid{grid-template-columns:1fr 1fr}}' +
 '</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
 '<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored in local storage on this device)</label><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="save" class="save">Save key</button></div></div></div>' +
