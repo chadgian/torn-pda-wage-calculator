@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.1.0
+// @version      2.2.0
 // @description  Generic Torn company helper for wage planning, position-fit analysis, payroll balancing, export, and safe wage autofill.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
