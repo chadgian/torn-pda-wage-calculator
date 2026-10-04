@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.3.0
+// @version      2.4.0
 // @description  Generic Torn company helper for wage planning, position-fit analysis, payroll balancing, export, and safe wage autofill.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,9 +18,9 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.3.0';
+var VERSION = '2.4.0';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
-var ID = 'gb-wage-v230';
+var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
 var PDA_KEY = '###PDA-APIKEY###';
 var CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
@@ -381,11 +381,215 @@ function currentPosition(employee) {
     return positions.find(function (p) { return p.name.toLowerCase() === name; }) || null;
 }
 
-function bestPosition(employee) {
+function individualBestPosition(employee) {
     if (!positions.length || employee.director) return null;
     var ranked = positions.map(function (p) { return { position: p, fit: positionFit(employee, p) }; });
     ranked.sort(function (a, b) { return b.fit - a.fit || a.position.name.localeCompare(b.position.name); });
     return ranked[0] || null;
+}
+
+var POSITION_STABILITY_BONUS = 2;
+
+function positionKey(position) {
+    if (!position) return '';
+    return String(position.id || position.name || '');
+}
+
+function samePosition(employee, position) {
+    var current = currentPosition(employee);
+    return !!(current && position && positionKey(current) === positionKey(position));
+}
+
+function currentStaffingCounts() {
+    var counts = {};
+    staff.forEach(function (employee) {
+        if (employee.director) return;
+        var p = currentPosition(employee);
+        if (!p) {
+            var fallback = individualBestPosition(employee);
+            p = fallback && fallback.position;
+        }
+        if (!p) return;
+        var key = positionKey(p);
+        counts[key] = (counts[key] || 0) + 1;
+    });
+    return counts;
+}
+
+function staffingPlanStorageKey() {
+    if (!company) return '';
+    return String(company.id || ('type-' + company.typeId));
+}
+
+function normalizedStaffingPlan(raw) {
+    var out = {};
+    positions.forEach(function (p) {
+        out[positionKey(p)] = Math.max(0, Math.round(num(raw && raw[positionKey(p)])));
+    });
+    return out;
+}
+
+function staffingPlanInfo() {
+    var current = currentStaffingCounts();
+    var store = get('staffingPlans', {});
+    var storageKey = staffingPlanStorageKey();
+    var saved = storageKey && store && store[storageKey] ? normalizedStaffingPlan(store[storageKey]) : null;
+    var target = saved || normalizedStaffingPlan(current);
+    var employeeTotal = staff.filter(function (x) { return !x.director; }).length;
+    var targetTotal = positions.reduce(function (t, p) { return t + num(target[positionKey(p)]); }, 0);
+    var currentTotal = positions.reduce(function (t, p) { return t + num(current[positionKey(p)]); }, 0);
+    var valid = targetTotal === employeeTotal;
+    var effective = valid ? target : normalizedStaffingPlan(current);
+
+    return {
+        current: current,
+        target: target,
+        effective: effective,
+        employeeTotal: employeeTotal,
+        targetTotal: targetTotal,
+        currentTotal: currentTotal,
+        valid: valid,
+        custom: !!saved
+    };
+}
+
+function saveStaffingTarget(key, value) {
+    if (!company || !key) return;
+    var storageKey = staffingPlanStorageKey();
+    var store = get('staffingPlans', {});
+    var existing = store[storageKey] ? normalizedStaffingPlan(store[storageKey]) : normalizedStaffingPlan(currentStaffingCounts());
+    existing[key] = Math.max(0, Math.round(num(value)));
+    store[storageKey] = existing;
+    put('staffingPlans', store);
+}
+
+function resetStaffingPlan() {
+    var storageKey = staffingPlanStorageKey();
+    if (!storageKey) return;
+    var store = get('staffingPlans', {});
+    delete store[storageKey];
+    put('staffingPlans', store);
+}
+
+function maxWeightAssignment(matrix) {
+    var n = matrix.length;
+    if (!n) return [];
+    var m = matrix[0].length;
+    if (m < n) return [];
+
+    var maxValue = 0;
+    matrix.forEach(function (row) {
+        row.forEach(function (value) { if (value > maxValue) maxValue = value; });
+    });
+
+    var u = new Array(n + 1).fill(0);
+    var v = new Array(m + 1).fill(0);
+    var p = new Array(m + 1).fill(0);
+    var way = new Array(m + 1).fill(0);
+
+    for (var i = 1; i <= n; i++) {
+        p[0] = i;
+        var j0 = 0;
+        var minv = new Array(m + 1).fill(Infinity);
+        var used = new Array(m + 1).fill(false);
+
+        do {
+            used[j0] = true;
+            var i0 = p[j0];
+            var delta = Infinity;
+            var j1 = 0;
+
+            for (var j = 1; j <= m; j++) {
+                if (used[j]) continue;
+                var cost = maxValue - num(matrix[i0 - 1][j - 1]);
+                var cur = cost - u[i0] - v[j];
+                if (cur < minv[j]) {
+                    minv[j] = cur;
+                    way[j] = j0;
+                }
+                if (minv[j] < delta) {
+                    delta = minv[j];
+                    j1 = j;
+                }
+            }
+
+            for (var k = 0; k <= m; k++) {
+                if (used[k]) {
+                    u[p[k]] += delta;
+                    v[k] -= delta;
+                } else {
+                    minv[k] -= delta;
+                }
+            }
+            j0 = j1;
+        } while (p[j0] !== 0);
+
+        do {
+            var prev = way[j0];
+            p[j0] = p[prev];
+            j0 = prev;
+        } while (j0 !== 0);
+    }
+
+    var assignment = new Array(n).fill(-1);
+    for (var col = 1; col <= m; col++) {
+        if (p[col] > 0 && p[col] <= n) assignment[p[col] - 1] = col - 1;
+    }
+    return assignment;
+}
+
+function companyPositionAssignment() {
+    var employees = staff.filter(function (x) { return !x.director; });
+    var plan = staffingPlanInfo();
+    var slots = [];
+
+    positions.forEach(function (p) {
+        var count = Math.max(0, Math.round(num(plan.effective[positionKey(p)])));
+        for (var i = 0; i < count; i++) slots.push(p);
+    });
+
+    if (!employees.length || !positions.length || slots.length !== employees.length) {
+        return { byEmployee:{}, plan:plan, currentFit:0, suggestedFit:0 };
+    }
+
+    var matrix = employees.map(function (employee) {
+        return slots.map(function (position) {
+            return positionFit(employee, position) + (samePosition(employee, position) ? POSITION_STABILITY_BONUS : 0);
+        });
+    });
+
+    var assignedCols = maxWeightAssignment(matrix);
+    var byEmployee = {};
+    var currentFit = 0;
+    var suggestedFit = 0;
+
+    employees.forEach(function (employee, index) {
+        var current = currentPosition(employee);
+        var pure = individualBestPosition(employee);
+        var slot = assignedCols[index] >= 0 ? slots[assignedCols[index]] : (current || (pure && pure.position));
+        var slotFit = slot ? positionFit(employee, slot) : 0;
+        var currentPredicted = current ? positionFit(employee, current) : 0;
+
+        currentFit += currentPredicted;
+        suggestedFit += slotFit;
+
+        byEmployee[employee.id] = {
+            position: slot || null,
+            fit: slotFit,
+            statBestPosition: pure && pure.position || null,
+            statBestFit: pure ? pure.fit : 0,
+            targetCount: slot ? num(plan.effective[positionKey(slot)]) : 0,
+            currentCount: slot ? num(plan.current[positionKey(slot)]) : 0,
+            currentPredictedFit: currentPredicted
+        };
+    });
+
+    return {
+        byEmployee: byEmployee,
+        plan: plan,
+        currentFit: currentFit,
+        suggestedFit: suggestedFit
+    };
 }
 
 function constrainedRaw(weights, target, minimum, maximum) {
@@ -470,6 +674,7 @@ function roundBalanced(raw, target, minimum, maximum, step) {
 }
 
 function calculate() {
+    var positionAssignment = cfg.positionAdvice ? companyPositionAssignment() : { byEmployee:{}, plan:staffingPlanInfo(), currentFit:0, suggestedFit:0 };
     var included = staff.filter(function (x) {
         return excluded.indexOf(x.id) < 0 && (cfg.director || !x.director);
     });
@@ -485,13 +690,18 @@ function calculate() {
         var statFactor = clamp(actualWorkFit / 100, 0.05, 3);
         var effFactor = clamp(totalEff / targetEff, 0.05, 3);
         var score = (statFactor * num(cfg.stats) + effFactor * num(cfg.eff)) / totalWeight;
-        var best = cfg.positionAdvice ? bestPosition(employee) : null;
+        var assigned = positionAssignment.byEmployee[employee.id] || null;
+        var pure = individualBestPosition(employee);
         return Object.assign({}, employee, {
             score: score,
             currentFit: actualWorkFit,
             predictedCurrentFit: predictedFit,
-            bestPosition: best && best.position || null,
-            bestFit: best ? best.fit : 0
+            bestPosition: assigned && assigned.position || null,
+            bestFit: assigned ? assigned.fit : 0,
+            statBestPosition: assigned && assigned.statBestPosition || pure && pure.position || null,
+            statBestFit: assigned ? assigned.statBestFit : pure ? pure.fit : 0,
+            staffingTarget: assigned ? assigned.targetCount : 0,
+            staffingCurrent: assigned ? assigned.currentCount : 0
         });
     });
 
@@ -524,13 +734,18 @@ function calculate() {
         var inCalc = includedMap[employee.id];
         if (inCalc) return inCalc;
         var currentPos = currentPosition(employee);
-        var best = cfg.positionAdvice ? bestPosition(employee) : null;
+        var assigned = positionAssignment.byEmployee[employee.id] || null;
+        var pure = individualBestPosition(employee);
         return Object.assign({}, employee, {
             score: 0,
             currentFit: employee.effectiveness.working_stats == null ? (currentPos ? positionFit(employee, currentPos) : 0) : num(employee.effectiveness.working_stats),
             predictedCurrentFit: currentPos ? positionFit(employee, currentPos) : 0,
-            bestPosition: best && best.position || null,
-            bestFit: best ? best.fit : 0,
+            bestPosition: assigned && assigned.position || null,
+            bestFit: assigned ? assigned.fit : 0,
+            statBestPosition: assigned && assigned.statBestPosition || pure && pure.position || null,
+            statBestFit: assigned ? assigned.statBestFit : pure ? pure.fit : 0,
+            staffingTarget: assigned ? assigned.targetCount : 0,
+            staffingCurrent: assigned ? assigned.currentCount : 0,
             suggested: employee.wage == null ? 0 : employee.wage,
             change: 0,
             changePct: 0,
@@ -540,7 +755,7 @@ function calculate() {
 
     rows.forEach(function (x) {
         x.omit = !includedMap[x.id];
-        x.recommendPosition = !!(x.bestPosition && !x.director && x.bestPosition.name !== x.position && x.bestFit >= x.predictedCurrentFit + 3);
+        x.recommendPosition = !!(cfg.positionAdvice && x.bestPosition && !x.director && x.bestPosition.name !== x.position);
     });
 
     var suggestedIncluded = sum(calcRows, function (x) { return x.suggested; });
@@ -559,7 +774,10 @@ function calculate() {
         target: effectiveTarget,
         budgetGap: cfg.mode === 'benchmark' ? 0 : suggestedIncluded - budgetTarget,
         avgEffectiveness: avg(calcRows, function (x) { return x.effectiveness.total; }),
-        avgFit: avg(calcRows, function (x) { return x.currentFit; })
+        avgFit: avg(calcRows, function (x) { return x.currentFit; }),
+        positionPlan: positionAssignment.plan,
+        positionCurrentFit: positionAssignment.currentFit,
+        positionSuggestedFit: positionAssignment.suggestedFit
     };
 }
 
@@ -659,7 +877,14 @@ function detailHtml(x) {
     if (!x) return '';
     var e = x.effectiveness || {};
     var best = x.bestPosition;
+    var pure = x.statBestPosition;
     var req = best && best.required;
+    var staffingNote = '';
+
+    if (best && pure && pure.name !== best.name) {
+        staffingNote = '<div class="staffing-reason"><b>Why not ' + esc(pure.name) + '?</b><p>' + esc(pure.name) + ' is the pure stat-fit winner for this employee (' + fmt(x.statBestFit) + '), but the staffing plan assigns ' + esc(best.name) + ' so the company keeps the required number of people in each role.</p></div>';
+    }
+
     return '<div class="detail-card">' +
         '<div class="detail-head"><div><small>Employee analysis</small><h3>' + esc(x.name) + ' <span>[' + esc(x.id) + ']</span></h3></div><button class="icon-btn" data-a="detail-close" aria-label="Close employee analysis">×</button></div>' +
         '<div class="detail-grid">' +
@@ -682,11 +907,12 @@ function detailHtml(x) {
             effectLine('Addiction', e.addiction) +
             effectLine('Inactivity', e.inactivity) +
         '</div>' +
-        (best && !x.director ? '<h4>Best stat-fit position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>' + esc(best.description || best.ability || 'Based on work-stat requirements only.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
-        '<div class="requirements"><span>Requires:</span>' + requirementBadge('MAN', req.manual) + requirementBadge('INT', req.intelligence) + requirementBadge('END', req.endurance) + '</div>' : '') +
-        '<p class="detail-note">Position recommendations compare work-stat fit only. They do not replace company-specific staffing strategy, position abilities, or director judgment.</p>' +
+        (best && !x.director ? '<h4>Staffing-aware position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>Target: ' + fmt(x.staffingTarget) + ' employee' + (num(x.staffingTarget) === 1 ? '' : 's') + ' in this role. ' + esc(best.description || best.ability || 'Assigned using the company-wide staffing plan.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
+        '<div class="requirements"><span>Requires:</span>' + requirementBadge('MAN', req.manual) + requirementBadge('INT', req.intelligence) + requirementBadge('END', req.endurance) + '</div>' + staffingNote : '') +
+        '<p class="detail-note">Position recommendations optimize the whole company. Target counts decide how many slots each position must have; work stats decide which employees should fill those slots.</p>' +
     '</div>';
 }
+
 
 function effectLine(label, value) {
     if (!num(value)) return '';
@@ -784,6 +1010,38 @@ function pageTab(key, label, note, count) {
     '</button>';
 }
 
+function staffingPlanEditor() {
+    if (!staff.length || !positions.length || !company) {
+        return '<div class="staffing-empty">Load company data first to configure position counts.</div>';
+    }
+
+    var info = staffingPlanInfo();
+    var positionRows = positions.slice().sort(function (a, b) {
+        var ac = num(info.target[positionKey(a)]) + num(info.current[positionKey(a)]);
+        var bc = num(info.target[positionKey(b)]) + num(info.current[positionKey(b)]);
+        return bc - ac || a.name.localeCompare(b.name);
+    });
+    var stateClass = info.valid ? 'valid' : 'invalid';
+    var statusText = info.valid ?
+        'Target slots match your ' + fmt(info.employeeTotal) + ' non-director employees.' :
+        'Target slots total ' + fmt(info.targetTotal) + ', but you have ' + fmt(info.employeeTotal) + ' non-director employees. Current position counts are used until the totals match.';
+
+    var html = '<div class="staffing-summary ' + stateClass + '"><div><b>' + (info.custom ? 'Custom staffing targets' : 'Current position counts preserved') + '</b><small>' + esc(statusText) + '</small></div><button data-a="reset-staffing">Use current counts</button></div>';
+    html += '<div class="staffing-table"><div class="staffing-head"><span>Position</span><span>Current</span><span>Target</span></div>';
+
+    positionRows.forEach(function (p) {
+        var key = positionKey(p);
+        var special = p.ability && p.ability !== 'None' ? p.ability : '';
+        html += '<label class="staffing-row"><span class="staffing-role"><b>' + esc(p.name) + '</b>' + (special ? '<small>Special: ' + esc(special) + '</small>' : '') + '</span>' +
+            '<span class="staffing-current">' + fmt(info.current[key] || 0) + '</span>' +
+            '<input type="number" min="0" max="' + fmt(info.employeeTotal) + '" inputmode="numeric" data-staffing-target="' + esc(key) + '" value="' + fmt(info.target[key] || 0) + '">' +
+        '</label>';
+    });
+
+    html += '</div>';
+    return html;
+}
+
 function settingsPage() {
     return '<section class="settings settings-page">' +
         '<div class="page-heading"><div><small>Calculation setup</small><h3>Wage model & preferences</h3><p>Changes recalculate recommendations immediately. Nothing here submits changes to Torn.</p></div><button class="text-btn" data-a="reset-settings">Reset defaults</button></div>' +
@@ -802,10 +1060,13 @@ function settingsPage() {
             settingField('max', 'Maximum wage', 'Cap applied to every included employee.') +
             settingField('round', 'Round to', 'Use 100, 1,000, 10,000, etc. The allocator tries to preserve the chosen total.') +
         '</div></div>' +
+        '<div class="settings-group staffing-group"><div class="settings-group-title"><b>Position staffing plan</b><small>Position recommendations must fill these role counts. The default is your current company composition; change Target only when you intentionally want a different staffing mix.</small></div>' +
+            staffingPlanEditor() +
+        '</div>' +
         '<div class="settings-group"><div class="settings-group-title"><b>Helper behavior</b><small>Optional conveniences and recommendations.</small></div><div class="toggles">' +
             toggle('director', 'Include director', 'Include the director in wage distribution.') +
             toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
-            toggle('positionAdvice', 'Position-fit advice', 'Compare each employee with positions for this company type.') +
+            toggle('positionAdvice', 'Staffing-aware position advice', 'Optimize the whole team while respecting the target number of employees in each role.') +
             toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
         '</div></div>' +
     '</section>';
@@ -840,8 +1101,9 @@ function calculationGuidePage() {
             guideCard('7', 'Minimum and maximum wages', 'For Current and Fixed modes, the target itself is constrained to a feasible range. The allocator starts each included employee at the minimum wage, distributes the remainder by score, caps employees that reach the maximum, and redistributes what remains.', 'Feasible target = clamp(Target, Minimum × Employees, Maximum × Employees)', 'For 5 included employees with a $100,000 minimum, the target cannot be lower than $500,000. A maximum wage can similarly cap the highest possible total.') +
             guideCard('8', 'Rounding and payroll balancing', 'Each raw wage is rounded to the Round to increment. In Current and Fixed modes, the helper then moves eligible wages up or down by one increment at a time to keep the final payroll as close as possible to the target.', 'Rounded wage = round(Raw wage ÷ Step) × Step', 'With Round to $10,000, $1,067,500 becomes $1,070,000. If this pushes the total payroll too high, another eligible recommendation can be reduced by $10,000.') +
             guideCard('9', 'Raise, cut, and change percentage', 'The employee list compares the suggested wage with the current wage. A positive difference is a raise; a negative difference is a cut.', 'Change = Suggested − Current; Change % = Change ÷ Current × 100', 'Current $1,000,000 and suggested $1,250,000 gives +$250,000, or +25%.') +
-            guideCard('10', 'Position review', 'Every non-director employee is compared with the positions available for the company type. A review is flagged only when another position has a calculated fit at least 3 points above the calculated fit of the current position.', 'Flag when BestFit ≥ CurrentPredictedFit + 3', 'If current predicted fit is 92 and another position scores 96, the employee is flagged for review. Position abilities and company strategy are not part of this comparison.') +
-            guideCard('11', 'Summary values', 'The Overview page averages included employees only. Budget variance is the final included payroll minus the target payroll. In Benchmark mode there is no fixed company target, so budget variance is shown as not applicable.', 'Budget variance = Suggested included payroll − Target payroll', 'If the target is $10,000,000 and rounded recommendations total $10,010,000, budget variance is +$10,000.') +
+            guideCard('10', 'Staffing-aware position assignment', 'The helper does not choose a position independently for every employee anymore. It creates the exact number of slots for each role from the Position staffing plan, then finds the company-wide employee-to-slot assignment with the highest combined stat fit. Staying in the current role receives a small 2-point stability bonus to avoid unnecessary reshuffling.', 'Maximize total(PositionFit + 2 when employee stays in current role), subject to exact target slots per position', 'If the plan requires 2 Cashiers, 1 Technician, 1 Admin, and 1 Cleaner, exactly those slots must be filled. Even if three employees individually score highest as Cleaner, only one Cleaner slot exists.') +
+            guideCard('11', 'Custom staffing targets', 'Settings lets the director choose how many employees the company should have in each position. Target counts must add up to the number of non-director employees. If they do not match, the helper safely falls back to the current position counts until the plan is valid.', 'Sum of target position slots = non-director employees', 'For 10 non-director employees, a valid plan could be 3 Cashiers + 2 Technicians + 1 Admin + 1 Cleaner + 3 employees in other roles = 10 slots.') +
+            guideCard('12', 'Summary values', 'The Overview page averages included employees only. Budget variance is the final included payroll minus the target payroll. In Benchmark mode there is no fixed company target, so budget variance is shown as not applicable.', 'Budget variance = Suggested included payroll − Target payroll', 'If the target is $10,000,000 and rounded recommendations total $10,010,000, budget variance is +$10,000.') +
         '</div>' +
         '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. It never submits wage or position changes automatically.</div>' +
     '</section>';
@@ -857,7 +1119,7 @@ function overviewPage(result) {
     var delta = result.suggestedIncluded - result.currentIncluded;
     var raises = result.rows.filter(function (x) { return !x.omit && x.change > 0; }).sort(function (a,b) { return b.change-a.change; });
     var cuts = result.rows.filter(function (x) { return !x.omit && x.change < 0; }).sort(function (a,b) { return a.change-b.change; });
-    var reviews = result.rows.filter(function (x) { return x.recommendPosition; }).sort(function (a,b) { return (b.bestFit-b.currentFit)-(a.bestFit-a.currentFit); });
+    var reviews = result.rows.filter(function (x) { return x.recommendPosition; }).sort(function (a,b) { return (b.bestFit-b.predictedCurrentFit)-(a.bestFit-a.predictedCurrentFit); });
 
     var html = '<section class="overview-page">' +
         '<div class="page-heading"><div><small>Company overview</small><h3>What needs your attention</h3><p>Start here, then open Employees for the full wage list or Settings to change the calculation model.</p></div><button class="primary compact" data-page="employees">View employees</button></div>' +
@@ -906,10 +1168,10 @@ function employeesPage(result, visibleRows) {
         '</tr></thead><tbody>';
 
     visibleRows.forEach(function (x) {
-        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">Review → ' + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
+        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">Suggested → ' + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
         html += '<tr class="' + (x.omit ? 'excluded-row' : '') + '">' +
             '<td class="use-col"><input type="checkbox" data-inc="' + esc(x.id) + '"' + (!x.omit ? ' checked' : '') + ' aria-label="Include ' + esc(x.name) + '"></td>' +
-            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? ' · Review → ' + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
+            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? ' · Suggested → ' + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
             '<td class="position-col"><b>' + esc(x.position) + '</b>' + review + '</td>' +
             '<td class="effect-col"><b>' + fmt(x.effectiveness.total) + '</b><small>Fit ' + fmt(x.currentFit) + '</small></td>' +
             '<td class="current-col">' + (x.wage == null ? '<span class="subtle">—</span>' : money(x.wage)) + '</td>' +
@@ -978,6 +1240,20 @@ function bind(result) {
         toast('Settings reset to defaults.', true);
         render();
     };
+
+    var resetStaffing = panel.querySelector('[data-a="reset-staffing"]');
+    if (resetStaffing) resetStaffing.onclick = function () {
+        resetStaffingPlan();
+        toast('Staffing targets reset to current position counts.', true);
+        render();
+    };
+
+    panel.querySelectorAll('[data-staffing-target]').forEach(function (input) {
+        input.onchange = function () {
+            saveStaffingTarget(input.dataset.staffingTarget, input.value);
+            render();
+        };
+    });
 
     var resetInc = panel.querySelector('[data-a="reset-inclusions"]');
     if (resetInc) resetInc.onclick = function () {
@@ -1173,9 +1449,9 @@ function copyText(text) {
 }
 
 function exportCsv(data) {
-    var headers = ['Employee','Torn ID','Included','Current Position','Best Stat-Fit Position','MAN','INT','END','Work-Stat Efficiency','Total Effectiveness','Score','Current Wage','Suggested Wage','Change'];
+    var headers = ['Employee','Torn ID','Included','Current Position','Staffing-Aware Suggested Position','Pure Stat-Best Position','MAN','INT','END','Work-Stat Efficiency','Total Effectiveness','Score','Current Wage','Suggested Wage','Change'];
     var lines = [headers].concat(data.map(function (x) {
-        return [x.name,x.id,x.omit?'No':'Yes',x.position,x.bestPosition?x.bestPosition.name:'',x.manual,x.intelligence,x.endurance,x.currentFit,x.effectiveness.total,x.omit?'':x.score.toFixed(3),x.wage == null ? '' : x.wage,x.suggested,x.change];
+        return [x.name,x.id,x.omit?'No':'Yes',x.position,x.bestPosition?x.bestPosition.name:'',x.statBestPosition?x.statBestPosition.name:'',x.manual,x.intelligence,x.endurance,x.currentFit,x.effectiveness.total,x.omit?'':x.score.toFixed(3),x.wage == null ? '' : x.wage,x.suggested,x.change];
     })).map(function (row) {
         return row.map(function (v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }).join(',');
     }).join('\r\n');
@@ -1401,7 +1677,7 @@ document.documentElement.appendChild(host);
 var S = host.attachShadow({ mode:'open' });
 
 S.innerHTML = '<style>' +
-':host{all:initial;--bg:#111417;--panel:#171b1f;--panel2:#1d2329;--panel3:#242b32;--border:#37414a;--border2:#4a5661;--text:#f3f6f8;--muted:#9ba8b3;--green:#22c77a;--green2:#0d6c47;--red:#ff6b6b;--amber:#f2b84b;--blue:#76c7ff;font-family:Inter,Arial,sans-serif;color:var(--text)}*{box-sizing:border-box}button,input,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}#fab{position:fixed;right:14px;bottom:100px;width:50px;height:50px;border-radius:16px;border:1px solid #5ccf94;background:linear-gradient(145deg,#0b6a45,#0a5037);color:#fff;z-index:2147483645;box-shadow:0 10px 25px #0008;font-weight:900;font-size:13px;letter-spacing:.4px;touch-action:none}#fab::after{content:"$";position:absolute;right:-5px;top:-6px;width:19px;height:19px;border-radius:50%;display:grid;place-items:center;background:#e9fff4;color:#075535;font-size:12px;border:2px solid #075535}#overlay{display:none;position:fixed;inset:0;background:#080a0ccc;z-index:2147483646;overflow:auto;color:var(--text);-webkit-text-fill-color:initial}#overlay.show{display:block}#panel{width:min(1180px,calc(100vw - 20px));min-height:calc(100vh - 20px);margin:10px auto;background:var(--bg);border:1px solid var(--border2);border-radius:16px;overflow:hidden;box-shadow:0 24px 70px #000b}header{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:#0b0e11eF;border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand{display:flex;align-items:center;gap:11px;min-width:0}.logo{width:42px;height:42px;display:grid;place-items:center;border-radius:14px;background:linear-gradient(180deg,#153025,#0d2219);border:1px solid #2f8f62;box-shadow:inset 0 1px 0 #5fd79a22}.brand-logo{width:30px;height:30px;display:block}.brand h2{margin:0;font-size:16px;line-height:1.2;color:var(--text)}.brand h2 span{color:var(--muted);font-size:11px;font-weight:700}.brand p{margin:3px 0 0;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70vw}.header-actions{display:flex;align-items:center;gap:9px}.refresh-state{font-size:11px;color:#a9e6c8}.refresh-state.stale{color:var(--amber)}.icon-btn{width:34px;height:34px;padding:0;border-radius:9px;border:1px solid var(--border2);background:var(--panel2);color:#fff!important;font-size:20px}.page-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;background:#101418;border-bottom:1px solid var(--border)}.page-tab{min-width:0;padding:11px 14px;border:0;border-right:1px solid var(--border);background:transparent;color:var(--muted)!important;text-align:left}.page-tab:last-child{border-right:0}.page-tab-main{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:900}.page-tab-main b{min-width:22px;padding:2px 6px;border-radius:999px;background:#2b333a;color:#cfd8df;font-size:9px;text-align:center}.page-tab small{display:block;margin-top:2px;font-size:9px;color:#74818b}.page-tab.active{background:#163226;color:#c9f5dd!important;box-shadow:inset 0 -3px 0 #39c989}.page-tab.active small{color:#9ec7b2}.actionbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--border)}.actionbar button,.settings button,.empty button,.toolbar button,.page-heading button,.insight-head button,.overview-help button{border:1px solid var(--border2);border-radius:9px;padding:8px 11px;background:var(--panel3);color:var(--text)!important;font-weight:750}.actionbar .primary,.empty .primary{background:var(--green2);border-color:#2f9d70}.spinner{display:inline-block;width:12px;height:12px;border:2px solid #ffffff55;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:5px}@keyframes spin{to{transform:rotate(360deg)}}.settings{padding:14px;background:#14191e}.settings-page{min-height:55vh}.page-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;padding:14px}.page-heading>div{min-width:0}.page-heading>div>small{display:block;color:#69d49f;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.7px}.page-heading h3{margin:3px 0 3px;font-size:18px}.page-heading p{margin:0;max-width:720px;color:var(--muted);font-size:10px;line-height:1.45}.page-heading .compact{white-space:nowrap}.settings-group{margin:0 14px 12px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--panel)}.settings-group-title{margin-bottom:10px}.settings-group-title b,.settings-group-title small{display:block}.settings-group-title b{font-size:12px}.settings-group-title small{margin-top:2px;color:var(--muted);font-size:9px}.section-title{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:12px}.section-title h3{margin:0;font-size:15px}.section-title p{margin:3px 0 0;color:var(--muted);font-size:11px}.text-btn{padding:5px 8px!important;background:transparent!important;color:var(--blue)!important}.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(190px,1fr));gap:10px}.setting{display:block;padding:10px;border:1px solid var(--border);background:var(--panel);border-radius:10px}.setting>span{display:block;font-size:12px;font-weight:800;margin-bottom:6px}.setting input,.setting select{width:100%;height:38px;padding:7px 10px;border:1px solid #43515d;border-radius:8px;background:#10171b!important;color:#eef3f6!important;-webkit-text-fill-color:#eef3f6!important;outline:none;color-scheme:dark}.setting input:focus,.setting select:focus{border-color:#42c889;box-shadow:0 0 0 2px #42c88922}.setting select option{background:#10171b;color:#eef3f6}.setting small{display:block;color:var(--muted);font-size:10px;line-height:1.35;margin-top:6px}.toggles{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:8px;margin-top:10px}.toggle{display:flex;align-items:center;gap:9px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel);cursor:pointer}.toggle input{position:absolute;opacity:0}.switch{width:36px;height:20px;border-radius:999px;background:#4a535c;position:relative;flex:0 0 auto}.switch::after{content:"";position:absolute;width:14px;height:14px;top:3px;left:3px;border-radius:50%;background:white;transition:.15s}.toggle input:checked+.switch{background:var(--green2)}.toggle input:checked+.switch::after{left:19px}.toggle b,.toggle small{display:block}.toggle b{font-size:12px}.toggle small{margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35}.error-card{display:grid;grid-template-columns:34px 1fr 28px;gap:10px;align-items:start;margin:12px 14px;padding:11px;border:1px solid #9d4b4b;background:#3d1c1f;border-radius:11px}.error-icon{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:#7d2e34;font-weight:900}.error-card b{font-size:12px}.error-card p{margin:4px 0;font-size:11px;color:#ffd9d9}.error-card small{font-size:10px;line-height:1.4;color:#ffd9d9}.error-card>button{border:0;background:transparent;color:#fff;font-size:18px}.error-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.error-actions button,.error-actions a{display:inline-flex;align-items:center;padding:6px 8px;border-radius:7px;border:1px solid #a45d5d;background:#582a2d;color:#fff!important;text-decoration:none;font-size:10px;font-weight:800}.error-actions a{background:#272f36;border-color:#596672}.notice{margin:0 14px 10px;padding:9px 11px;background:#3b321b;border:1px solid #806b2f;border-radius:9px;color:#ffe3a0;font-size:11px}.empty{min-height:55vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:30px}.empty-icon{width:72px;height:72px;border-radius:22px;display:grid;place-items:center;background:#10261c;border:1px solid #2f8f62}.empty-logo{width:42px;height:42px;display:block}.empty h3{margin:14px 0 5px;font-size:18px}.empty p{max-width:520px;margin:0 0 14px;color:var(--muted);font-size:12px;line-height:1.55}.empty>div{display:flex;gap:8px}.overview-page{padding-bottom:14px}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;padding:0 14px 12px}.summary-card{padding:11px;border:1px solid var(--border);border-radius:11px;background:linear-gradient(180deg,var(--panel2),var(--panel));min-width:0}.summary-card small,.summary-card b,.summary-card span{display:block}.summary-card small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.summary-card b{margin-top:4px;font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.summary-card span{margin-top:4px;color:var(--muted);font-size:10px}.summary-card.good b{color:#8ff0bd}.summary-card.warn b{color:#ffd27d}.insight-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:0 14px 12px}.insight-card{min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--panel);overflow:hidden}.insight-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px;border-bottom:1px solid var(--border)}.insight-head b,.insight-head small{display:block}.insight-head b{font-size:11px}.insight-head small{margin-top:2px;color:var(--muted);font-size:9px}.insight-head button{border:0;background:transparent;color:var(--blue)!important;font-size:9px;font-weight:800}.insight-row{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border:0;border-bottom:1px solid #2b333a;background:transparent;color:var(--text)!important;text-align:left}.insight-row:last-child{border-bottom:0}.insight-row span{min-width:0}.insight-row b,.insight-row small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.insight-row b{font-size:10px}.insight-row small{margin-top:2px;color:var(--muted);font-size:8px}.insight-row strong{max-width:45%;font-size:10px;color:#bcefd3;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.insight-empty{padding:18px 10px;color:#9fcdb4;font-size:10px}.overview-help{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 14px;padding:12px;border:1px solid #365846;border-radius:11px;background:#13281f}.overview-help b{font-size:11px}.overview-help p{margin:3px 0 0;color:#a9b9b0;font-size:9px;line-height:1.45}.overview-help button{flex:0 0 auto;border:1px solid #4d765f;border-radius:8px;padding:7px 9px;background:#1b372a;color:#c9f5dd!important;font-weight:800}.workspace{padding:0 14px 16px}.employee-page>.page-heading{padding-left:0;padding-right:0}.toolbar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:0 0 8px}.search{flex:1 1 290px;display:flex;align-items:center;gap:6px;height:38px;padding:0 10px;border:1px solid var(--border2);border-radius:9px;background:var(--panel)}.search span{color:var(--muted);font-size:18px}.search input{width:100%;border:0;outline:0;background:transparent!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar select{height:38px;padding:0 9px;border:1px solid var(--border2);border-radius:9px;background:var(--panel3)!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar .small{height:38px}.filters{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden;max-width:100%;padding:0 0 6px;margin-bottom:6px;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;touch-action:pan-x;scrollbar-width:none;scroll-snap-type:x proximity}.filters::-webkit-scrollbar{display:none}.filter{display:flex;align-items:center;gap:6px;flex:0 0 auto;padding:7px 10px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--muted);white-space:nowrap;touch-action:pan-x;scroll-snap-align:start}.filter span{min-width:20px;padding:2px 5px;border-radius:999px;background:#2c343c;font-size:9px;text-align:center}.filter.active{background:#123829;border-color:#2e8b64;color:#bdf4d6}.table-meta{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:10px;padding:7px 2px}.table-wrap{width:100%;overflow:hidden;border:1px solid var(--border);border-radius:12px;background:var(--panel);max-height:66vh}.employee-table{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;font-size:11px}.employee-table th,.employee-table td{padding:10px 8px;border-bottom:1px solid #303840;vertical-align:middle;text-align:right;background:var(--panel);color:var(--text)!important;overflow:hidden}.employee-table th{position:sticky;top:0;z-index:5;background:#0c1013!important;color:#cbd4db!important;font-size:9px;text-transform:uppercase;letter-spacing:.35px;white-space:nowrap}.employee-table tbody tr:nth-child(even) td{background:#151a1f}.employee-table .use-col{width:52px;text-align:center}.employee-table .employee-col{width:22%;text-align:left}.employee-table .position-col{width:23%;text-align:left}.employee-table .effect-col{width:10%}.employee-table .current-col{width:14%}.employee-table .suggested-col{width:15%}.employee-table .change-col{width:14%}.employee-table .action-col{width:46px;text-align:center}.employee-table .employee-col,.employee-table .position-col{white-space:nowrap;text-overflow:ellipsis}.employee-link{display:block;max-width:100%;padding:0;border:0;background:transparent;color:#9bd8ff!important;font-weight:850;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.employee-col small,.position-col small,.effect-col small,.suggested-col small,.change-col small{display:block;margin-top:3px;color:var(--muted);font-size:9px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.position-col b,.suggested-col b,.change-col b,.effect-col b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.position-col .attention{color:#ffd27d}.excluded-row td{opacity:.62}.suggested b{color:#b8f5d2}.positive{color:#8ff0bd!important}.negative{color:#ff9d9d!important}.tag{display:inline-flex;align-items:center;padding:3px 6px;border-radius:999px;font-size:8px;font-weight:800}.tag.raise{background:#123d2d;color:#9cf0c1}.tag.cut{background:#4a2226;color:#ffb1b1}.tag.keep{background:#293239;color:#ccd5dc}.tag.muted{background:#2b2e31;color:#9da6ad}.mobile-status{display:none!important}.row-action{width:28px;height:28px;padding:0;border-radius:7px;border:1px solid var(--border);background:#262e35;color:#fff!important}.subtle{color:var(--muted)}.no-results{text-align:center!important;padding:28px!important;color:var(--muted)!important}.guide-page{padding-bottom:14px}.guide-settings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:0 14px 12px}.guide-settings>div{padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel)}.guide-settings small,.guide-settings b{display:block}.guide-settings small{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.4px}.guide-settings b{margin-top:4px;font-size:12px}.guide-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:0 14px}.guide-card{min-width:0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--panel)}.guide-card-head{display:flex;align-items:center;gap:8px}.guide-card-head>span{width:24px;height:24px;display:grid;place-items:center;border-radius:8px;background:#123829;border:1px solid #2e8b64;color:#bdf4d6;font-size:10px;font-weight:900}.guide-card h4{margin:0;font-size:12px}.guide-card>p{margin:8px 0;color:var(--muted);font-size:10px;line-height:1.5}.formula{max-width:100%;overflow-x:auto;padding:9px 10px;border:1px solid #2c3942;border-radius:9px;background:#0b1114;color:#b8f5d2;font:700 10px monospace;white-space:nowrap;-webkit-overflow-scrolling:touch}.guide-sample{margin-top:9px;padding:9px;border-left:3px solid #39c989;border-radius:0 8px 8px 0;background:#102019}.guide-sample b{font-size:10px}.guide-sample p{margin:4px 0 0;color:#aab8b0;font-size:10px;line-height:1.45}.guide-note{margin:12px 14px 0;padding:10px 12px;border:1px solid #486153;border-radius:10px;background:#13221b;color:#c5ddd0;font-size:10px;line-height:1.45}.employee-position{display:none!important;color:#c3cdd4!important;font-weight:700}.employee-id{color:#77858f!important}footer{display:flex;justify-content:space-between;gap:12px;padding:10px 14px;border-top:1px solid var(--border);color:var(--muted);font-size:9px;background:#0f1316}.detail-overlay{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:14px;background:#050607cc}.detail-shell{width:min(680px,100%);max-height:90vh;overflow:auto}.detail-card{border:1px solid var(--border2);border-radius:14px;background:#14191e;box-shadow:0 20px 60px #000c;padding:14px}.detail-head{display:flex;justify-content:space-between;gap:10px}.detail-head small{color:var(--muted);font-size:10px;text-transform:uppercase}.detail-head h3{margin:3px 0 0;font-size:18px}.detail-head h3 span{color:var(--muted);font-size:11px}.detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:12px}.detail-grid>div{padding:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.detail-grid small,.detail-grid b{display:block}.detail-grid small{color:var(--muted);font-size:9px}.detail-grid b{margin-top:3px;font-size:13px}.detail-card h4{margin:14px 0 7px;font-size:11px;text-transform:uppercase;color:#c6d1d9}.breakdown{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}.breakdown>div{display:flex;justify-content:space-between;padding:7px 8px;border-radius:8px;background:var(--panel);font-size:10px}.breakdown .pos{color:#9cf0c1}.breakdown .neg{color:#ff9d9d}.position-box{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px;border:1px solid #35694f;background:#123024;border-radius:9px}.position-box b,.position-box small{display:block}.position-box small{margin-top:3px;color:#a9c7b9;font-size:9px}.position-box strong{font-size:20px;color:#baf2d2}.requirements{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:9px;color:var(--muted)}.requirements b{padding:3px 6px;border-radius:6px;background:#252e35;color:#dce4e9}.detail-note{margin:12px 0 0;color:var(--muted);font-size:9px;line-height:1.45}#keybox{display:none;position:fixed;inset:0;z-index:2147483647;background:#050607dd;align-items:center;justify-content:center;padding:14px}#keybox.show{display:flex}.key-card{width:min(460px,100%);padding:15px;border:1px solid var(--border2);border-radius:14px;background:#151a1f;color:var(--text)}.key-card h3{margin:0;font-size:16px}.key-card p{margin:5px 0 10px;color:var(--muted);font-size:10px;line-height:1.45}.key-card input[type=password]{width:100%;height:39px;padding:8px 10px;border:1px solid #43515d;border-radius:8px;background:#10171b!important;color:#eef3f6!important;-webkit-text-fill-color:#eef3f6!important;outline:none;color-scheme:dark}.key-card input[type=password]:focus{border-color:#42c889;box-shadow:0 0 0 2px #42c88922}.remember{display:flex;align-items:center;gap:7px;margin-top:9px;color:#d3dce3;font-size:10px}.key-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:12px;flex-wrap:wrap}.key-actions button{padding:8px 10px;border-radius:8px;border:1px solid var(--border2);background:var(--panel3);color:#fff!important;font-weight:800}.key-actions .save{background:var(--green2)}#toast{position:fixed;left:50%;bottom:28px;z-index:2147483647;transform:translate(-50%,18px);opacity:0;pointer-events:none;padding:9px 12px;border-radius:9px;color:#fff;font:800 11px Arial;box-shadow:0 8px 25px #000b;transition:.18s}#toast.show{opacity:1;transform:translate(-50%,0)}#toast.ok{background:#0b6947}#toast.bad{background:#7d2e34}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #82d9ff;outline-offset:2px}@media(max-width:1000px){.guide-grid{grid-template-columns:1fr}.guide-settings{grid-template-columns:repeat(2,minmax(0,1fr))}.employee-position{display:block!important}.summary{grid-template-columns:repeat(3,minmax(0,1fr))}.insight-grid{grid-template-columns:1fr 1fr}.insight-card:last-child{grid-column:1/-1}.settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.employee-table .position-col{display:none}.employee-table .employee-col{width:29%}.employee-table .effect-col{width:12%}.employee-table .current-col{width:17%}.employee-table .suggested-col{width:20%}.employee-table .change-col{width:18%}}@media(max-width:700px){.guide-settings{grid-template-columns:1fr 1fr;padding:0 10px 10px}.guide-grid{padding:0 10px}.guide-note{margin-left:10px;margin-right:10px}#panel{width:100vw;min-height:100vh;margin:0;border-radius:0;border-left:0;border-right:0}.brand p{max-width:50vw}.refresh-state{display:none}.page-tabs{position:sticky;top:67px;z-index:18}.page-tab{padding:9px 8px;text-align:center}.page-tab-main{justify-content:center;font-size:11px}.page-tab small{display:none}.actionbar{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px;gap:6px}.actionbar button{padding:8px 6px;font-size:10px}.page-heading{padding:12px 10px}.page-heading h3{font-size:16px}.page-heading p{font-size:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr));padding:0 10px 10px}.summary-card{padding:9px}.summary-card b{font-size:15px}.insight-grid{grid-template-columns:1fr;padding:0 10px 10px}.insight-card:last-child{grid-column:auto}.overview-help{margin:0 10px;align-items:flex-start;flex-direction:column}.workspace{padding:0 8px 10px}.employees-heading{padding:10px 0}.toolbar{display:grid;grid-template-columns:1fr auto}.search{grid-column:1/-1;min-width:0}.toolbar select{min-width:0;width:100%}.table-meta span:last-child{display:none}.table-wrap{max-height:68vh}.employee-table .current-col{display:none}.employee-table .employee-col{width:36%}.employee-table .effect-col{width:16%}.employee-table .suggested-col{width:26%}.employee-table .change-col{width:22%}.employee-table th,.employee-table td{padding:8px 5px;font-size:10px}.employee-table th{font-size:8px}.employee-table .tag{display:none}.employee-table .mobile-status{display:block!important}.employee-table .row-action{width:24px;height:26px;font-size:10px}.settings-group{margin:0 9px 10px;padding:10px}.settings-grid,.toggles{grid-template-columns:1fr}.detail-grid{grid-template-columns:repeat(2,1fr)}footer{flex-direction:column}}@media(max-width:430px){.page-tab-main b{display:none}.summary{grid-template-columns:1fr 1fr}.summary-card small{font-size:8px}.summary-card span{font-size:8px}.employee-table .effect-col{display:none}.employee-table .employee-col{width:42%}.employee-table .suggested-col{width:32%}.employee-table .change-col{width:26%}.employee-table .change-col small{display:none}.breakdown{grid-template-columns:1fr}.detail-grid{grid-template-columns:1fr 1fr}}' +
+':host{all:initial;--bg:#111417;--panel:#171b1f;--panel2:#1d2329;--panel3:#242b32;--border:#37414a;--border2:#4a5661;--text:#f3f6f8;--muted:#9ba8b3;--green:#22c77a;--green2:#0d6c47;--red:#ff6b6b;--amber:#f2b84b;--blue:#76c7ff;font-family:Inter,Arial,sans-serif;color:var(--text)}*{box-sizing:border-box}button,input,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}#fab{position:fixed;right:14px;bottom:100px;width:50px;height:50px;border-radius:16px;border:1px solid #5ccf94;background:linear-gradient(145deg,#0b6a45,#0a5037);color:#fff;z-index:2147483645;box-shadow:0 10px 25px #0008;font-weight:900;font-size:13px;letter-spacing:.4px;touch-action:none}#fab::after{content:"$";position:absolute;right:-5px;top:-6px;width:19px;height:19px;border-radius:50%;display:grid;place-items:center;background:#e9fff4;color:#075535;font-size:12px;border:2px solid #075535}#overlay{display:none;position:fixed;inset:0;background:#080a0ccc;z-index:2147483646;overflow:auto;color:var(--text);-webkit-text-fill-color:initial}#overlay.show{display:block}#panel{width:min(1180px,calc(100vw - 20px));min-height:calc(100vh - 20px);margin:10px auto;background:var(--bg);border:1px solid var(--border2);border-radius:16px;overflow:hidden;box-shadow:0 24px 70px #000b}header{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:#0b0e11eF;border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.brand{display:flex;align-items:center;gap:11px;min-width:0}.logo{width:42px;height:42px;display:grid;place-items:center;border-radius:14px;background:linear-gradient(180deg,#153025,#0d2219);border:1px solid #2f8f62;box-shadow:inset 0 1px 0 #5fd79a22}.brand-logo{width:30px;height:30px;display:block}.brand h2{margin:0;font-size:16px;line-height:1.2;color:var(--text)}.brand h2 span{color:var(--muted);font-size:11px;font-weight:700}.brand p{margin:3px 0 0;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70vw}.header-actions{display:flex;align-items:center;gap:9px}.refresh-state{font-size:11px;color:#a9e6c8}.refresh-state.stale{color:var(--amber)}.icon-btn{width:34px;height:34px;padding:0;border-radius:9px;border:1px solid var(--border2);background:var(--panel2);color:#fff!important;font-size:20px}.page-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;background:#101418;border-bottom:1px solid var(--border)}.page-tab{min-width:0;padding:11px 14px;border:0;border-right:1px solid var(--border);background:transparent;color:var(--muted)!important;text-align:left}.page-tab:last-child{border-right:0}.page-tab-main{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:900}.page-tab-main b{min-width:22px;padding:2px 6px;border-radius:999px;background:#2b333a;color:#cfd8df;font-size:9px;text-align:center}.page-tab small{display:block;margin-top:2px;font-size:9px;color:#74818b}.page-tab.active{background:#163226;color:#c9f5dd!important;box-shadow:inset 0 -3px 0 #39c989}.page-tab.active small{color:#9ec7b2}.actionbar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--border)}.actionbar button,.settings button,.empty button,.toolbar button,.page-heading button,.insight-head button,.overview-help button{border:1px solid var(--border2);border-radius:9px;padding:8px 11px;background:var(--panel3);color:var(--text)!important;font-weight:750}.actionbar .primary,.empty .primary{background:var(--green2);border-color:#2f9d70}.spinner{display:inline-block;width:12px;height:12px;border:2px solid #ffffff55;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:5px}@keyframes spin{to{transform:rotate(360deg)}}.settings{padding:14px;background:#14191e}.settings-page{min-height:55vh}.page-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;padding:14px}.page-heading>div{min-width:0}.page-heading>div>small{display:block;color:#69d49f;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.7px}.page-heading h3{margin:3px 0 3px;font-size:18px}.page-heading p{margin:0;max-width:720px;color:var(--muted);font-size:10px;line-height:1.45}.page-heading .compact{white-space:nowrap}.settings-group{margin:0 14px 12px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--panel)}.settings-group-title{margin-bottom:10px}.settings-group-title b,.settings-group-title small{display:block}.settings-group-title b{font-size:12px}.settings-group-title small{margin-top:2px;color:var(--muted);font-size:9px}.section-title{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:12px}.section-title h3{margin:0;font-size:15px}.section-title p{margin:3px 0 0;color:var(--muted);font-size:11px}.text-btn{padding:5px 8px!important;background:transparent!important;color:var(--blue)!important}.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(190px,1fr));gap:10px}.setting{display:block;padding:10px;border:1px solid var(--border);background:var(--panel);border-radius:10px}.setting>span{display:block;font-size:12px;font-weight:800;margin-bottom:6px}.setting input,.setting select{width:100%;height:38px;padding:7px 10px;border:1px solid #43515d;border-radius:8px;background:#10171b!important;color:#eef3f6!important;-webkit-text-fill-color:#eef3f6!important;outline:none;color-scheme:dark}.setting input:focus,.setting select:focus{border-color:#42c889;box-shadow:0 0 0 2px #42c88922}.setting select option{background:#10171b;color:#eef3f6}.setting small{display:block;color:var(--muted);font-size:10px;line-height:1.35;margin-top:6px}.toggles{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:8px;margin-top:10px}.toggle{display:flex;align-items:center;gap:9px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel);cursor:pointer}.toggle input{position:absolute;opacity:0}.switch{width:36px;height:20px;border-radius:999px;background:#4a535c;position:relative;flex:0 0 auto}.switch::after{content:"";position:absolute;width:14px;height:14px;top:3px;left:3px;border-radius:50%;background:white;transition:.15s}.toggle input:checked+.switch{background:var(--green2)}.toggle input:checked+.switch::after{left:19px}.toggle b,.toggle small{display:block}.toggle b{font-size:12px}.toggle small{margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35}.error-card{display:grid;grid-template-columns:34px 1fr 28px;gap:10px;align-items:start;margin:12px 14px;padding:11px;border:1px solid #9d4b4b;background:#3d1c1f;border-radius:11px}.error-icon{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:#7d2e34;font-weight:900}.error-card b{font-size:12px}.error-card p{margin:4px 0;font-size:11px;color:#ffd9d9}.error-card small{font-size:10px;line-height:1.4;color:#ffd9d9}.error-card>button{border:0;background:transparent;color:#fff;font-size:18px}.error-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.error-actions button,.error-actions a{display:inline-flex;align-items:center;padding:6px 8px;border-radius:7px;border:1px solid #a45d5d;background:#582a2d;color:#fff!important;text-decoration:none;font-size:10px;font-weight:800}.error-actions a{background:#272f36;border-color:#596672}.notice{margin:0 14px 10px;padding:9px 11px;background:#3b321b;border:1px solid #806b2f;border-radius:9px;color:#ffe3a0;font-size:11px}.empty{min-height:55vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:30px}.empty-icon{width:72px;height:72px;border-radius:22px;display:grid;place-items:center;background:#10261c;border:1px solid #2f8f62}.empty-logo{width:42px;height:42px;display:block}.empty h3{margin:14px 0 5px;font-size:18px}.empty p{max-width:520px;margin:0 0 14px;color:var(--muted);font-size:12px;line-height:1.55}.empty>div{display:flex;gap:8px}.overview-page{padding-bottom:14px}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;padding:0 14px 12px}.summary-card{padding:11px;border:1px solid var(--border);border-radius:11px;background:linear-gradient(180deg,var(--panel2),var(--panel));min-width:0}.summary-card small,.summary-card b,.summary-card span{display:block}.summary-card small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.45px}.summary-card b{margin-top:4px;font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.summary-card span{margin-top:4px;color:var(--muted);font-size:10px}.summary-card.good b{color:#8ff0bd}.summary-card.warn b{color:#ffd27d}.insight-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:0 14px 12px}.insight-card{min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--panel);overflow:hidden}.insight-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px;border-bottom:1px solid var(--border)}.insight-head b,.insight-head small{display:block}.insight-head b{font-size:11px}.insight-head small{margin-top:2px;color:var(--muted);font-size:9px}.insight-head button{border:0;background:transparent;color:var(--blue)!important;font-size:9px;font-weight:800}.insight-row{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border:0;border-bottom:1px solid #2b333a;background:transparent;color:var(--text)!important;text-align:left}.insight-row:last-child{border-bottom:0}.insight-row span{min-width:0}.insight-row b,.insight-row small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.insight-row b{font-size:10px}.insight-row small{margin-top:2px;color:var(--muted);font-size:8px}.insight-row strong{max-width:45%;font-size:10px;color:#bcefd3;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.insight-empty{padding:18px 10px;color:#9fcdb4;font-size:10px}.overview-help{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 14px;padding:12px;border:1px solid #365846;border-radius:11px;background:#13281f}.overview-help b{font-size:11px}.overview-help p{margin:3px 0 0;color:#a9b9b0;font-size:9px;line-height:1.45}.overview-help button{flex:0 0 auto;border:1px solid #4d765f;border-radius:8px;padding:7px 9px;background:#1b372a;color:#c9f5dd!important;font-weight:800}.workspace{padding:0 14px 16px}.employee-page>.page-heading{padding-left:0;padding-right:0}.toolbar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:0 0 8px}.search{flex:1 1 290px;display:flex;align-items:center;gap:6px;height:38px;padding:0 10px;border:1px solid var(--border2);border-radius:9px;background:var(--panel)}.search span{color:var(--muted);font-size:18px}.search input{width:100%;border:0;outline:0;background:transparent!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar select{height:38px;padding:0 9px;border:1px solid var(--border2);border-radius:9px;background:var(--panel3)!important;color:var(--text)!important;-webkit-text-fill-color:var(--text)!important}.toolbar .small{height:38px}.filters{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden;max-width:100%;padding:0 0 6px;margin-bottom:6px;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;touch-action:pan-x;scrollbar-width:none;scroll-snap-type:x proximity}.filters::-webkit-scrollbar{display:none}.filter{display:flex;align-items:center;gap:6px;flex:0 0 auto;padding:7px 10px;border-radius:999px;border:1px solid var(--border);background:var(--panel);color:var(--muted);white-space:nowrap;touch-action:pan-x;scroll-snap-align:start}.filter span{min-width:20px;padding:2px 5px;border-radius:999px;background:#2c343c;font-size:9px;text-align:center}.filter.active{background:#123829;border-color:#2e8b64;color:#bdf4d6}.table-meta{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:10px;padding:7px 2px}.table-wrap{width:100%;overflow:hidden;border:1px solid var(--border);border-radius:12px;background:var(--panel);max-height:66vh}.employee-table{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;font-size:11px}.employee-table th,.employee-table td{padding:10px 8px;border-bottom:1px solid #303840;vertical-align:middle;text-align:right;background:var(--panel);color:var(--text)!important;overflow:hidden}.employee-table th{position:sticky;top:0;z-index:5;background:#0c1013!important;color:#cbd4db!important;font-size:9px;text-transform:uppercase;letter-spacing:.35px;white-space:nowrap}.employee-table tbody tr:nth-child(even) td{background:#151a1f}.employee-table .use-col{width:52px;text-align:center}.employee-table .employee-col{width:22%;text-align:left}.employee-table .position-col{width:23%;text-align:left}.employee-table .effect-col{width:10%}.employee-table .current-col{width:14%}.employee-table .suggested-col{width:15%}.employee-table .change-col{width:14%}.employee-table .action-col{width:46px;text-align:center}.employee-table .employee-col,.employee-table .position-col{white-space:nowrap;text-overflow:ellipsis}.employee-link{display:block;max-width:100%;padding:0;border:0;background:transparent;color:#9bd8ff!important;font-weight:850;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.employee-col small,.position-col small,.effect-col small,.suggested-col small,.change-col small{display:block;margin-top:3px;color:var(--muted);font-size:9px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.position-col b,.suggested-col b,.change-col b,.effect-col b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.position-col .attention{color:#ffd27d}.excluded-row td{opacity:.62}.suggested b{color:#b8f5d2}.positive{color:#8ff0bd!important}.negative{color:#ff9d9d!important}.tag{display:inline-flex;align-items:center;padding:3px 6px;border-radius:999px;font-size:8px;font-weight:800}.tag.raise{background:#123d2d;color:#9cf0c1}.tag.cut{background:#4a2226;color:#ffb1b1}.tag.keep{background:#293239;color:#ccd5dc}.tag.muted{background:#2b2e31;color:#9da6ad}.mobile-status{display:none!important}.row-action{width:28px;height:28px;padding:0;border-radius:7px;border:1px solid var(--border);background:#262e35;color:#fff!important}.subtle{color:var(--muted)}.no-results{text-align:center!important;padding:28px!important;color:var(--muted)!important}.staffing-empty{padding:12px;color:var(--muted);font-size:10px}.staffing-summary{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:0 12px 10px;padding:10px;border:1px solid var(--border);border-radius:10px;background:#11181c}.staffing-summary b,.staffing-summary small{display:block}.staffing-summary b{font-size:11px}.staffing-summary small{margin-top:2px;color:var(--muted);font-size:9px;line-height:1.4}.staffing-summary.valid{border-color:#315d48}.staffing-summary.invalid{border-color:#8a6330;background:#2a2112}.staffing-summary button{flex:0 0 auto;padding:7px 9px!important}.staffing-table{margin:0 12px 12px;border:1px solid var(--border);border-radius:10px;overflow:hidden}.staffing-head,.staffing-row{display:grid;grid-template-columns:minmax(0,1fr) 72px 90px;align-items:center;gap:8px;padding:8px 10px}.staffing-head{background:#0d1215;color:var(--muted);font-size:8px;font-weight:900;text-transform:uppercase;letter-spacing:.4px}.staffing-row{border-top:1px solid #2c343b;background:var(--panel2)}.staffing-role{min-width:0}.staffing-role b,.staffing-role small{display:block}.staffing-role b{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.staffing-role small{margin-top:2px;color:#88bba2;font-size:8px}.staffing-current{text-align:center;font-size:11px;font-weight:800}.staffing-row input{width:100%;height:34px;padding:6px 8px;border:1px solid #43515d;border-radius:8px;background:#10171b!important;color:#eef3f6!important;-webkit-text-fill-color:#eef3f6!important;text-align:center;outline:none;color-scheme:dark}.staffing-row input:focus{border-color:#42c889;box-shadow:0 0 0 2px #42c88922}.staffing-reason{margin-top:8px;padding:9px 10px;border:1px solid #3b5548;border-radius:9px;background:#102019}.staffing-reason b{font-size:10px;color:#b8f5d2}.staffing-reason p{margin:4px 0 0;color:#a9b9b0;font-size:9px;line-height:1.45}.guide-page{padding-bottom:14px}.guide-settings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:0 14px 12px}.guide-settings>div{padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--panel)}.guide-settings small,.guide-settings b{display:block}.guide-settings small{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.4px}.guide-settings b{margin-top:4px;font-size:12px}.guide-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:0 14px}.guide-card{min-width:0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--panel)}.guide-card-head{display:flex;align-items:center;gap:8px}.guide-card-head>span{width:24px;height:24px;display:grid;place-items:center;border-radius:8px;background:#123829;border:1px solid #2e8b64;color:#bdf4d6;font-size:10px;font-weight:900}.guide-card h4{margin:0;font-size:12px}.guide-card>p{margin:8px 0;color:var(--muted);font-size:10px;line-height:1.5}.formula{max-width:100%;overflow-x:auto;padding:9px 10px;border:1px solid #2c3942;border-radius:9px;background:#0b1114;color:#b8f5d2;font:700 10px monospace;white-space:nowrap;-webkit-overflow-scrolling:touch}.guide-sample{margin-top:9px;padding:9px;border-left:3px solid #39c989;border-radius:0 8px 8px 0;background:#102019}.guide-sample b{font-size:10px}.guide-sample p{margin:4px 0 0;color:#aab8b0;font-size:10px;line-height:1.45}.guide-note{margin:12px 14px 0;padding:10px 12px;border:1px solid #486153;border-radius:10px;background:#13221b;color:#c5ddd0;font-size:10px;line-height:1.45}.employee-position{display:none!important;color:#c3cdd4!important;font-weight:700}.employee-id{color:#77858f!important}footer{display:flex;justify-content:space-between;gap:12px;padding:10px 14px;border-top:1px solid var(--border);color:var(--muted);font-size:9px;background:#0f1316}.detail-overlay{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:14px;background:#050607cc}.detail-shell{width:min(680px,100%);max-height:90vh;overflow:auto}.detail-card{border:1px solid var(--border2);border-radius:14px;background:#14191e;box-shadow:0 20px 60px #000c;padding:14px}.detail-head{display:flex;justify-content:space-between;gap:10px}.detail-head small{color:var(--muted);font-size:10px;text-transform:uppercase}.detail-head h3{margin:3px 0 0;font-size:18px}.detail-head h3 span{color:var(--muted);font-size:11px}.detail-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:12px}.detail-grid>div{padding:9px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.detail-grid small,.detail-grid b{display:block}.detail-grid small{color:var(--muted);font-size:9px}.detail-grid b{margin-top:3px;font-size:13px}.detail-card h4{margin:14px 0 7px;font-size:11px;text-transform:uppercase;color:#c6d1d9}.breakdown{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}.breakdown>div{display:flex;justify-content:space-between;padding:7px 8px;border-radius:8px;background:var(--panel);font-size:10px}.breakdown .pos{color:#9cf0c1}.breakdown .neg{color:#ff9d9d}.position-box{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px;border:1px solid #35694f;background:#123024;border-radius:9px}.position-box b,.position-box small{display:block}.position-box small{margin-top:3px;color:#a9c7b9;font-size:9px}.position-box strong{font-size:20px;color:#baf2d2}.requirements{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:9px;color:var(--muted)}.requirements b{padding:3px 6px;border-radius:6px;background:#252e35;color:#dce4e9}.detail-note{margin:12px 0 0;color:var(--muted);font-size:9px;line-height:1.45}#keybox{display:none;position:fixed;inset:0;z-index:2147483647;background:#050607dd;align-items:center;justify-content:center;padding:14px}#keybox.show{display:flex}.key-card{width:min(460px,100%);padding:15px;border:1px solid var(--border2);border-radius:14px;background:#151a1f;color:var(--text)}.key-card h3{margin:0;font-size:16px}.key-card p{margin:5px 0 10px;color:var(--muted);font-size:10px;line-height:1.45}.key-card input[type=password]{width:100%;height:39px;padding:8px 10px;border:1px solid #43515d;border-radius:8px;background:#10171b!important;color:#eef3f6!important;-webkit-text-fill-color:#eef3f6!important;outline:none;color-scheme:dark}.key-card input[type=password]:focus{border-color:#42c889;box-shadow:0 0 0 2px #42c88922}.remember{display:flex;align-items:center;gap:7px;margin-top:9px;color:#d3dce3;font-size:10px}.key-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:12px;flex-wrap:wrap}.key-actions button{padding:8px 10px;border-radius:8px;border:1px solid var(--border2);background:var(--panel3);color:#fff!important;font-weight:800}.key-actions .save{background:var(--green2)}#toast{position:fixed;left:50%;bottom:28px;z-index:2147483647;transform:translate(-50%,18px);opacity:0;pointer-events:none;padding:9px 12px;border-radius:9px;color:#fff;font:800 11px Arial;box-shadow:0 8px 25px #000b;transition:.18s}#toast.show{opacity:1;transform:translate(-50%,0)}#toast.ok{background:#0b6947}#toast.bad{background:#7d2e34}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #82d9ff;outline-offset:2px}@media(max-width:1000px){.guide-grid{grid-template-columns:1fr}.guide-settings{grid-template-columns:repeat(2,minmax(0,1fr))}.employee-position{display:block!important}.summary{grid-template-columns:repeat(3,minmax(0,1fr))}.insight-grid{grid-template-columns:1fr 1fr}.insight-card:last-child{grid-column:1/-1}.settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.employee-table .position-col{display:none}.employee-table .employee-col{width:29%}.employee-table .effect-col{width:12%}.employee-table .current-col{width:17%}.employee-table .suggested-col{width:20%}.employee-table .change-col{width:18%}}@media(max-width:700px){.staffing-head,.staffing-row{grid-template-columns:minmax(0,1fr) 58px 78px}.staffing-summary{align-items:flex-start}.guide-settings{grid-template-columns:1fr 1fr;padding:0 10px 10px}.guide-grid{padding:0 10px}.guide-note{margin-left:10px;margin-right:10px}#panel{width:100vw;min-height:100vh;margin:0;border-radius:0;border-left:0;border-right:0}.brand p{max-width:50vw}.refresh-state{display:none}.page-tabs{position:sticky;top:67px;z-index:18}.page-tab{padding:9px 8px;text-align:center}.page-tab-main{justify-content:center;font-size:11px}.page-tab small{display:none}.actionbar{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px;gap:6px}.actionbar button{padding:8px 6px;font-size:10px}.page-heading{padding:12px 10px}.page-heading h3{font-size:16px}.page-heading p{font-size:10px}.summary{grid-template-columns:repeat(2,minmax(0,1fr));padding:0 10px 10px}.summary-card{padding:9px}.summary-card b{font-size:15px}.insight-grid{grid-template-columns:1fr;padding:0 10px 10px}.insight-card:last-child{grid-column:auto}.overview-help{margin:0 10px;align-items:flex-start;flex-direction:column}.workspace{padding:0 8px 10px}.employees-heading{padding:10px 0}.toolbar{display:grid;grid-template-columns:1fr auto}.search{grid-column:1/-1;min-width:0}.toolbar select{min-width:0;width:100%}.table-meta span:last-child{display:none}.table-wrap{max-height:68vh}.employee-table .current-col{display:none}.employee-table .employee-col{width:36%}.employee-table .effect-col{width:16%}.employee-table .suggested-col{width:26%}.employee-table .change-col{width:22%}.employee-table th,.employee-table td{padding:8px 5px;font-size:10px}.employee-table th{font-size:8px}.employee-table .tag{display:none}.employee-table .mobile-status{display:block!important}.employee-table .row-action{width:24px;height:26px;font-size:10px}.settings-group{margin:0 9px 10px;padding:10px}.settings-grid,.toggles{grid-template-columns:1fr}.detail-grid{grid-template-columns:repeat(2,1fr)}footer{flex-direction:column}}@media(max-width:430px){.page-tab-main b{display:none}.summary{grid-template-columns:1fr 1fr}.summary-card small{font-size:8px}.summary-card span{font-size:8px}.employee-table .effect-col{display:none}.employee-table .employee-col{width:42%}.employee-table .suggested-col{width:32%}.employee-table .change-col{width:26%}.employee-table .change-col small{display:none}.breakdown{grid-template-columns:1fr}.detail-grid{grid-template-columns:1fr 1fr}}' +
 '</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
 '<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored in local storage on this device)</label><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="save" class="save">Save key</button></div></div></div>' +
