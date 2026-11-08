@@ -1722,6 +1722,7 @@ function settingsPage() {
             toggle('director', 'Include director', 'Include the director in wage distribution.') +
             toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
             toggle('positionAdvice', 'Staffing-aware position advice', 'Maximize combined stat fit within target role counts; this is not a profit forecast.') +
+            toggle('exploreNewRoles', 'Explore additional company roles', 'Consider currently unstaffed roles, alternative staffing mixes, and hiring capacity. Review every scenario before changing Torn positions.') +
             toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Preserve current Managers, Marketers, Trainers, Cleaners, and Secretaries when matching slots remain. Disable only to explore speculative swaps.') +
             toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
         '</div></div>' +
@@ -1809,6 +1810,46 @@ function supportImpactHtml(result) {
     return html + '</section>';
 }
 
+function additionalRolesHtml() {
+    if (!cfg.positionAdvice || cfg.exploreNewRoles === false || !positions.length) return '';
+    var candidates = suggestAdditionalRoles();
+    var content = candidates.length ? candidates.map(function (x) {
+        var details = x.plan ?
+            '<p><b>Reallocation scenario:</b> move one planned slot from ' + esc(x.plan.replaces) +
+                ' to ' + esc(x.position) + '.</p>' +
+            '<p class="' + (x.plan.fitDelta >= 0 ? 'role-positive' : 'role-caution') + '">' +
+                'Combined modeled stat-fit change: ' + (x.plan.fitDelta > 0 ? '+' : '') +
+                fmt(x.plan.fitDelta) + ' points. ' +
+                (x.kind ? 'The special-role benefit is NOT included in this score.' :
+                    'Higher fit does not guarantee higher income.') + '</p>' :
+            '<p>No safe existing non-support slot is available for reassignment.</p>';
+        var vacancy = x.openCapacity ?
+            '<p>Hiring path: ' + fmt(x.openCapacity) +
+                ' unfilled company slot(s) reported. A new hire needs their own stats and wage assessment.</p>' : '';
+        return '<article class="role-opportunity">' +
+            '<div class="role-opportunity-head"><div><small>' +
+                esc(x.kind ? 'Unstaffed ' + x.kind + ' ability' : 'Unstaffed production role') +
+                '</small><h5>' + esc(x.position) + '</h5></div>' +
+                '<span class="role-type">' + esc(x.kind ? 'Support opportunity' : 'Stat-fit opportunity') + '</span></div>' +
+            '<p>' + esc(x.reason) + '</p>' + details + vacancy +
+            (x.plan ?
+                '<button data-use-new-role="' + esc(x.key) +
+                '">Use as staffing target (helper only)</button>' :
+                '<small class="role-caution">Hiring suggestion only; no employee reassignment can be modeled.</small>') +
+            '</article>';
+    }).join('') : '<p class="role-opportunity-empty">No additional roles passed the current eligibility checks. ' +
+        'This does not establish that your existing staffing mix maximizes revenue.</p>';
+    return '<section class="role-opportunities"><div class="role-opportunities-intro">' +
+        '<div><small>Beyond your current staff mix</small><h4>Additional roles worth considering</h4>' +
+        '<p>The helper reviews the full company position catalog, including roles with no current employees. ' +
+        'It checks possible one-slot reallocations without removing existing support-role incumbents and also notes available hiring capacity.</p></div>' +
+        '<button data-page="guide">How recommendations work</button></div>' +
+        '<div class="role-opportunity-grid">' + content + '</div>' +
+        '<p class="role-opportunity-disclaimer">These are exploratory options, NOT proven income improvements. ' +
+        'The stat-fit difference excludes changes to sales, management bonuses, advertising, environment, and training. ' +
+        'Choosing a target updates this helper only. No positions or wages are changed in Torn.</p></section>';
+}
+
 function overviewPage(result) {
     var delta = result.suggestedIncluded - result.currentIncluded;
     var raises = result.rows.filter(function (x) { return !x.omit && x.change > 0; }).sort(function (a,b) { return b.change-a.change; });
@@ -1826,6 +1867,7 @@ function overviewPage(result) {
         '</section>';
 
     html += supportImpactHtml(result);
+    html += additionalRolesHtml();
     if (!positions.length) {
         html += '<div class="notice"><b>Position-fit advice unavailable.</b> Wage calculations are active, but position recommendations are temporarily hidden.</div>';
     }
@@ -1934,6 +1976,19 @@ function bind(result) {
             copyText(changeReportText(changeReport()))
                 .then(function () { toast('Company change report copied.', true); })
                 .catch(function () { toast('Unable to copy report.', false); });
+        };
+    });
+
+    panel.querySelectorAll('[data-use-new-role]').forEach(function (button) {
+        button.onclick = function () {
+            if (!useAdditionalRolePlan(button.dataset.useNewRole)) {
+                toast('The staffing scenario is no longer available. Refresh company data.', false);
+                return;
+            }
+            ui.page = 'settings';
+            detailId = '';
+            render();
+            toast('Exploratory staffing targets saved. No Torn position was changed.', true);
         };
     });
 
@@ -2408,6 +2463,7 @@ S.innerHTML = '<style>' +
 '</style>' +
 
 '<style>' +
+'.role-opportunities{margin:0 14px 16px;padding:13px;border:1px solid #456070;border-radius:12px;background:#151e25}.role-opportunities-intro{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:11px}.role-opportunities-intro small{display:block;color:#86c7f2;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.5px}.role-opportunities-intro h4{margin:3px 0 4px;font-size:14px;color:#f0f6fa}.role-opportunities-intro p{margin:0;color:#b9cbd6;font-size:10px;line-height:1.55}.role-opportunities-intro>button{flex:0 0 auto;border:1px solid #48677a;background:#243946;border-radius:8px;color:#d4edff!important;font-size:10px;font-weight:800;padding:8px}.role-opportunity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.role-opportunity{min-width:0;padding:12px;border:1px solid #3a4a54;border-radius:10px;background:#1c2730}.role-opportunity-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px}.role-opportunity-head small{display:block;color:#9cb0bc;font-size:9px}.role-opportunity-head h5{margin:2px 0;color:#edf6fc;font-size:13px}.role-type{padding:4px 6px;border:1px solid #496d74;border-radius:999px;color:#a5e6db;font-size:9px;font-weight:850}.role-opportunity p{margin:6px 0;color:#bdcdd6;line-height:1.5;font-size:10px}.role-opportunity p b{color:#e7f3ff}.role-opportunity p.role-positive{color:#9ff1c1}.role-opportunity p.role-caution,.role-opportunity .role-caution{color:#ffd39b}.role-opportunity>button{margin-top:8px;width:100%;padding:9px;border:1px solid #3f9c73;border-radius:8px;background:#174634;color:#c6f7de;font-size:10px;font-weight:800}.role-opportunity-empty{grid-column:1/-1;margin:0;padding:12px;color:#a9becb;font-size:11px}.role-opportunity-disclaimer{margin:11px 0 0;color:#a9bcc7;font-size:9px;line-height:1.55}@media(max-width:700px){.role-opportunities{margin-left:10px;margin-right:10px;padding:10px}.role-opportunities-intro{flex-direction:column;align-items:stretch}.role-opportunities-intro>button{align-self:flex-start}.role-opportunity-grid{grid-template-columns:1fr}}' +
 '.support-impact{margin:0 14px 14px;padding:12px;border-radius:11px;border:1px solid #37644d;background:#13281f}.support-impact-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}.support-impact-head small{display:block;font-size:9px;text-transform:uppercase;color:#9bd8b5;letter-spacing:.4px}.support-impact-head h4{margin:4px 0;font-size:13px}.support-impact-head>b{font-size:10px}.support-impact p{margin:6px 0 0;color:#bfd6ca;font-size:10px;line-height:1.5}.support-risk{margin-top:10px;padding:10px;border:1px solid #9e7230;border-radius:9px;background:#382b1b;color:#ffe3ac;font-size:10px}.support-risk p{color:#ffe3ac}.support-risk ul{margin:6px 0 0;padding-left:16px;line-height:1.5}.staffing-reason.caution{background:#382b1b;border-color:#9e7230}.staffing-reason.caution b{color:#ffe3ac}@media(max-width:700px){.support-impact{margin-left:10px;margin-right:10px}}' +
 '.changes-reason-editor{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 0}.changes-reason-editor input{flex:1 1 180px;min-width:0;padding:7px 9px;border:1px solid var(--border2);border-radius:7px;background:#10171b;color:var(--text);font-size:10px}.changes-reason-editor button{padding:7px 9px;border:1px solid #317c57;border-radius:7px;background:#1b4933;color:#c2f4da;font-size:10px;font-weight:850}.changes-page{padding:0 0 16px}.changes-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin:0 14px 12px}.changes-ranges{display:flex;flex-wrap:wrap;gap:5px}.changes-ranges button,.changes-copy{border:1px solid var(--border2);border-radius:8px;padding:8px 11px;background:var(--panel2);color:var(--text)!important;font-size:11px;font-weight:800}.changes-ranges button.selected{border-color:#2eaa76;background:#153e2b;color:#baf2d2!important}.changes-copy{background:var(--green2);border-color:#2eaa76}.changes-coverage{display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:0 14px 10px;padding:10px 12px;background:#13281f;border:1px solid #2e654b;border-radius:10px;font-size:11px}.changes-coverage b{color:#c2f4da}.changes-coverage span{font-size:10px;color:#afc6b9}.changes-notice{margin-top:8px}.changes-section-head{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:6px;margin:16px 14px 9px}.changes-section-head h4{margin:0;font-size:13px}.changes-section-head small{color:var(--muted);font-size:9px}.changes-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 14px}.changes-metric{min-width:0;padding:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px}.changes-metric small,.changes-metric strong,.changes-metric span{display:block}.changes-metric small{font-size:10px;color:var(--muted)}.changes-metric strong{margin-top:4px;font-size:17px;overflow-wrap:anywhere}.changes-metric span{margin-top:4px;font-size:10px;color:#b2bbc2}.changes-metric span.up{color:#8ff0bd}.changes-metric span.down{color:#ffb0b0}.changes-counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0 14px 10px}.changes-counts>div{padding:11px;background:#1c252b;border:1px solid var(--border);border-radius:9px;text-align:center}.changes-counts b,.changes-counts small{display:block}.changes-counts b{font-size:20px}.changes-counts small{color:var(--muted);font-size:10px}.changes-timeline,.changes-employee-list{margin:0 14px;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden}.changes-event{display:flex;gap:12px;padding:12px;border-bottom:1px solid var(--border);align-items:start}.changes-event:last-child,.changes-employee-row:last-child{border-bottom:none}.changes-event-tag{flex:0 0 86px;text-align:center;border:1px solid #5e6873;border-radius:5px;padding:5px 3px;color:#e0e5e9;font-size:9px;font-weight:850}.changes-event-tag.joined{color:#aaf1ce;border-color:#387b58;background:#133c2b}.changes-event-tag.fired{color:#ffc0bd;border-color:#8d4849;background:#432023}.changes-event-tag.left,.changes-event-tag.unconfirmed{color:#ffe2a0;border-color:#8d7138;background:#3e321d}.changes-event-content{min-width:0}.changes-event-content b{display:block;font-size:11px;line-height:1.5;font-weight:650;overflow-wrap:anywhere}.changes-event-content p{margin:5px 0;color:#ffccbd;font-size:10px}.changes-event-content small{display:block;margin-top:6px;color:var(--muted);font-size:9px}.changes-empty{margin:0 14px;padding:18px 12px;background:var(--panel);border:1px dashed var(--border2);border-radius:10px;color:var(--muted);font-size:11px;line-height:1.5}.changes-empty h4{margin:0 0 5px;color:var(--text);font-size:13px}.changes-empty p{margin:0}.changes-employee-row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);font-size:11px}.changes-employee-row>span{font-weight:800;min-width:0}.changes-employee-row small{display:block;margin-top:3px;color:var(--muted);font-size:9px}.changes-employee-row>b{font-size:10px;font-weight:650;text-align:right;overflow-wrap:anywhere}.changes-overflow{margin:6px 14px;font-size:10px;color:var(--amber)}.changes-footnote{margin:16px 14px 0;font-size:10px;color:var(--muted);line-height:1.6}@media(max-width:700px){.changes-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 9px}.changes-toolbar,.changes-timeline,.changes-employee-list,.changes-counts{margin-left:9px;margin-right:9px}.changes-counts{grid-template-columns:repeat(2,minmax(0,1fr))}.changes-coverage{margin-left:9px;margin-right:9px}.changes-section-head{margin-left:9px;margin-right:9px}.changes-event-tag{flex-basis:72px}.changes-event{gap:8px;padding:10px}.changes-metric strong{font-size:15px}.changes-footnote{margin:14px 9px}.page-tab{padding-left:4px;padding-right:4px}.page-tab-main{font-size:10px}.changes-employee-row{align-items:start;flex-direction:column;gap:5px}.changes-employee-row>b{text-align:left}}@media(max-width:380px){.changes-metrics{grid-template-columns:1fr}.page-tab-main{font-size:9px}}' +
 '</style>' +
