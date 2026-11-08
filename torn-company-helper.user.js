@@ -915,7 +915,7 @@ function normalizeCompanyNews(payload) {
 async function updateCompanyChanges(c, employees) {
     if (!c || !c.id) { changesError = 'Company ID is unavailable; history cannot be saved.'; return; }
     var store = readChangeHistory(c.id);
-    var now = Date.now();
+    var now = lastLoadedAt || Date.now();
     var cutoff = now - 180 * 86400000;
     store.snapshots = store.snapshots.filter(function (s) { return s && s.ts >= cutoff && Array.isArray(s.staff); });
     // At most one saved baseline every 30 minutes. The latest live refresh is always
@@ -979,6 +979,8 @@ function changeReport() {
     // observation inside the period and explicitly mark the period as partial.
     var before = sorted.filter(function (s) { return s.ts <= start; });
     var baseline = before.length ? before[before.length - 1] : sorted.find(function (s) { return s.ts >= start; });
+    // A first-time observation is not evidence that nothing has changed.
+    if (baseline && baseline.ts >= current.ts - 1000) baseline = null;
     // If an older baseline has a long missing gap, do not silently imply continuous coverage.
     var partial = !baseline || baseline.ts > start ||
         (baseline.ts < start - 86400000 && changePeriodDays() > 1);
