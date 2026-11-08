@@ -892,7 +892,9 @@ function newsEventType(text) {
 }
 
 function reportedFiringReason(text) {
-    var match = String(text).match(/\b(?:reason\s*:\s*|because\s+(?:of\s+)?|due to\s+)([^.;]{3,120})/i);
+    var value = String(text);
+    var match = value.match(/\b(?:reason\s*:\s*|because\s+(?:of\s+)?|due to\s+)([^.;]{3,120})/i) ||
+        value.match(/\b(?:fired|dismissed|terminated)\b[^.!]{0,100}\bfor\s+([^.;]{3,120})/i);
     return match ? match[1].trim() : '';
 }
 
@@ -983,7 +985,7 @@ function changeReport() {
     if (baseline && baseline.ts >= current.ts - 1000) baseline = null;
     // If an older baseline has a long missing gap, do not silently imply continuous coverage.
     var partial = !baseline || baseline.ts > start ||
-        (baseline.ts < start - 86400000 && changePeriodDays() > 1);
+        (baseline.ts < start - 86400000);
     var metrics = metricDefinitions().filter(function (m) {
         return baseline && baseline.company && current.company[m.key] != null &&
             baseline.company[m.key] != null;
