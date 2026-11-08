@@ -2630,6 +2630,8 @@ function saveKey() {
         remove('key');
         sessionPut('sessionKey', value);
     }
+    // A new key should not inherit the failed-key auto-sync backoff.
+    remove('autoSyncState');
     box.classList.remove('show');
     if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility();
     errorState = null;
