@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.5.0
+// @version      2.5.1
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.5.0';
+var VERSION = '2.5.1';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -42,6 +42,8 @@ var defaults = {
     director: true,
     fill: false,
     positionAdvice: true,
+    protectSupportRoles: true,
+    exploreNewRoles: true,
     autoRefresh: true
 };
 
@@ -343,7 +345,7 @@ function normalizePositions(payload, typeId) {
             id: String(p.id == null ? '' : p.id),
             name: String(p.name || 'Unknown position'),
             description: String(p.description || ''),
-            ability: String(p.ability || ''),
+            ability: String(p.ability || p.special_ability || p.specialAbility || ''),
             required: {
                 manual: num(req.manual_labor != null ? req.manual_labor : req.manual),
                 intelligence: num(req.intelligence != null ? req.intelligence : req.intel),
@@ -400,6 +402,56 @@ function individualBestPosition(employee) {
 }
 
 var POSITION_STABILITY_BONUS = 2;
+
+// Many Torn positions provide bonuses outside their own work-stat fit.
+// The official company catalog normally prefixes descriptions with their role
+// family (e.g. "Manager.", "Marketer.", "Trainer."). Check that BEFORE names:
+// "Marketing Manager" can be a Marketer rather than a Manager.
+function supportRoleKind(position) {
+    if (!position) return '';
+    var ability = String(position.ability || position.special_ability || position.specialAbility || '').trim().toLowerCase();
+    if (/^(manager|marketer|trainer|cleaner|secretary)$/.test(ability)) return ability;
+    // Catalog ability is authoritative; a declared non-support ability wins over a
+    // misleading job title (e.g. a generic production supervisor).
+    if (ability && ability !== 'none') return '';
+    var description = String(position.description || '').trim();
+    var prefix = description.match(/^(manager|marketer|trainer|cleaner|secretary)\s*[:.\-]/i);
+    if (prefix) return prefix[1].toLowerCase();
+    var name = String(position.name || '').trim();
+    if (/\b(?:marketer|marketing\s+manager|marketing\s+officer)\b/i.test(name)) return 'marketer';
+    if (/\b(?:trainer|hr\s+officer)\b/i.test(name)) return 'trainer';
+    if (/\b(?:manager|supervisor)\b/i.test(name)) return 'manager';
+    if (/\b(?:cleaner|janitor)\b/i.test(name)) return 'cleaner';
+    if (/\b(?:secretary|receptionist|bookkeeper)\b/i.test(name)) return 'secretary';
+    return '';
+}
+
+// This is an observed contribution read from Torn; it is NOT a forecast of
+// the bonus after moving either Manager or their colleagues.
+function supportRoleSnapshot() {
+    var counts = {};
+    var managementTotal = 0;
+    var managementRecipients = 0;
+    var managementReported = 0;
+    staff.forEach(function (employee) {
+        if (employee.director) return;
+        var kind = supportRoleKind(currentPosition(employee)) ||
+            supportRoleKind({ name: employee.position });
+        if (kind) counts[kind] = (counts[kind] || 0) + 1;
+        var value = employee.effectiveness && employee.effectiveness.management;
+        if (value == null) return;
+        managementReported++;
+        if (num(value) > 0) {
+            managementTotal += num(value);
+            managementRecipients++;
+        }
+    });
+    return {
+        counts: counts, managementTotal: managementTotal,
+        managementRecipients: managementRecipients,
+        managementReported: managementReported
+    };
+}
 
 function positionKey(position) {
     if (!position) return '';
@@ -549,10 +601,22 @@ function maxWeightAssignment(matrix) {
     return assignment;
 }
 
-function companyPositionAssignment() {
+function companyPositionAssignment(overrideTargets) {
     var employees = staff.filter(function (x) { return !x.director; });
     var plan = staffingPlanInfo();
+    if (overrideTargets) {
+        var alternative = normalizedStaffingPlan(overrideTargets);
+        var alternativeTotal = positions.reduce(function (total, p) {
+            return total + num(alternative[positionKey(p)]);
+        }, 0);
+        if (alternativeTotal !== employees.length) return {
+            byEmployee:{}, plan:plan, currentFit:0, suggestedFit:0,
+            support:supportRoleSnapshot(), protectedCount:0, supportRisks:[], invalid:true
+        };
+        plan = Object.assign({}, plan, { effective:alternative, target:alternative, valid:true, custom:true });
+    }
     var slots = [];
+    var support = supportRoleSnapshot();
 
     positions.forEach(function (p) {
         var count = Math.max(0, Math.round(num(plan.effective[positionKey(p)])));
@@ -560,26 +624,78 @@ function companyPositionAssignment() {
     });
 
     if (!employees.length || !positions.length || slots.length !== employees.length) {
-        return { byEmployee:{}, plan:plan, currentFit:0, suggestedFit:0 };
+        return { byEmployee:{}, plan:plan, currentFit:0, suggestedFit:0,
+            support:support, protectedCount:0, supportRisks:[] };
     }
 
-    var matrix = employees.map(function (employee) {
-        return slots.map(function (position) {
-            return positionFit(employee, position) + (samePosition(employee, position) ? POSITION_STABILITY_BONUS : 0);
+    // Pre-assign existing support-role incumbents to their actual role slots.
+    // This preserves *who* is Manager, Marketer, Trainer, Cleaner, etc., not
+    // merely the number of such employees. A stat-fit-only optimizer cannot
+    // estimate their company-wide effects or revenue consequences.
+    var locked = {};
+    var reserved = {};
+    var protectedCount = 0;
+    if (cfg.protectSupportRoles !== false) {
+        employees.forEach(function (employee, index) {
+            var current = currentPosition(employee);
+            if (!supportRoleKind(current)) return;
+            for (var i = 0; i < slots.length; i++) {
+                if (!reserved[i] && positionKey(slots[i]) === positionKey(current)) {
+                    locked[index] = i;
+                    reserved[i] = true;
+                    protectedCount++;
+                    return;
+                }
+            }
+        });
+    }
+
+    // Optimization runs only on remaining employees and unreserved slots,
+    // so protected support assignments can never be displaced by a better
+    // individual Cashier (or other production-role) fit.
+    var movable = [];
+    var available = [];
+    employees.forEach(function (_, index) {
+        if (!Object.prototype.hasOwnProperty.call(locked, index)) movable.push(index);
+    });
+    slots.forEach(function (_, index) { if (!reserved[index]) available.push(index); });
+    var matrix = movable.map(function (employeeIndex) {
+        var employee = employees[employeeIndex];
+        return available.map(function (slotIndex) {
+            var position = slots[slotIndex];
+            return positionFit(employee, position) +
+                (samePosition(employee, position) ? POSITION_STABILITY_BONUS : 0);
         });
     });
-
     var assignedCols = maxWeightAssignment(matrix);
+    var selected = {};
+    Object.keys(locked).forEach(function (index) { selected[index] = locked[index]; });
+    movable.forEach(function (employeeIndex, rowIndex) {
+        var col = assignedCols[rowIndex];
+        if (col >= 0 && col < available.length) selected[employeeIndex] = available[col];
+    });
+
     var byEmployee = {};
     var currentFit = 0;
     var suggestedFit = 0;
+    var supportRisks = [];
 
     employees.forEach(function (employee, index) {
         var current = currentPosition(employee);
         var pure = individualBestPosition(employee);
-        var slot = assignedCols[index] >= 0 ? slots[assignedCols[index]] : (current || (pure && pure.position));
+        var slotIndex = selected[index];
+        var slot = slotIndex == null ? (current || (pure && pure.position)) : slots[slotIndex];
         var slotFit = slot ? positionFit(employee, slot) : 0;
         var currentPredicted = current ? positionFit(employee, current) : 0;
+        var isProtected = Object.prototype.hasOwnProperty.call(locked, index);
+        var risk = '';
+        if (positionKey(slot) !== positionKey(current) &&
+            (supportRoleKind(current) || supportRoleKind(slot))) {
+            risk = 'Support-role change: the combined team-wide effect and income are unknown.';
+            supportRisks.push({ id: employee.id, name: employee.name,
+                from: current ? current.name : employee.position,
+                to: slot ? slot.name : 'Unassigned' });
+        }
 
         currentFit += currentPredicted;
         suggestedFit += slotFit;
@@ -591,7 +707,9 @@ function companyPositionAssignment() {
             statBestFit: pure ? pure.fit : 0,
             targetCount: slot ? num(plan.effective[positionKey(slot)]) : 0,
             currentCount: slot ? num(plan.current[positionKey(slot)]) : 0,
-            currentPredictedFit: currentPredicted
+            currentPredictedFit: currentPredicted,
+            supportProtected: isProtected,
+            supportRisk: risk
         };
     });
 
@@ -599,9 +717,147 @@ function companyPositionAssignment() {
         byEmployee: byEmployee,
         plan: plan,
         currentFit: currentFit,
-        suggestedFit: suggestedFit
+        suggestedFit: suggestedFit,
+        support: support,
+        protectedCount: protectedCount,
+        supportRisks: supportRisks
     };
 }
+
+
+/*
+ * Role opportunities deliberately compare NEW role types, not just incumbents.
+ * We never infer company profit from individual stat-fit or assign an unknown
+ * future hire's stats. The director reviews possible staffing mixes manually.
+ */
+function potentialRoleBenefit(position) {
+    var kind = supportRoleKind(position);
+    var belowTarget = staff.filter(function (e) {
+        return !e.director && e.effectiveness && e.effectiveness.total != null &&
+            num(e.effectiveness.total) < 100;
+    }).length;
+    if (kind === 'manager') return {
+        reason: 'Managers can reduce lost effectiveness across underperforming employees.' +
+            (belowTarget ? ' ' + fmt(belowTarget) + ' current employee(s) report total effectiveness below 100.' : ''),
+        signal: belowTarget ? 50 : 28
+    };
+    if (kind === 'marketer') return {
+        reason: 'Marketers improve the effectiveness of company advertising.' +
+            (company && num(company.advertisementBudget) > 0 ?
+                ' Current advertising budget: ' + money(company.advertisementBudget) + '.' : ''),
+        signal: company && num(company.advertisementBudget) > 0 ? 48 : 28
+    };
+    if (kind === 'cleaner') return {
+        reason: 'Cleaners can support the company environment.' +
+            (company && company.environment != null ?
+                ' Last reported environment: ' + fmt(company.environment) + '.' : ''),
+        signal: company && company.environment != null && num(company.environment) < 100 ? 46 : 26
+    };
+    if (kind === 'trainer') return {
+        reason: 'Trainers generate additional company training opportunities based on their effectiveness.',
+        signal: 36
+    };
+    if (kind === 'secretary') return {
+        reason: 'Secretaries unlock detailed per-employee earnings data; this improves visibility, not guaranteed revenue.',
+        signal: 22
+    };
+    return {
+        reason: String(position.description || '').trim() ||
+            'A possible way to redistribute production work among existing employees.',
+        signal: 0
+    };
+}
+
+function suggestAdditionalRoles() {
+    if (!cfg.positionAdvice || cfg.exploreNewRoles === false ||
+        !company || !positions.length || !staff.length) return [];
+    var plan = staffingPlanInfo();
+    if (!plan.valid || plan.employeeTotal < 1) return [];
+    var targets = normalizedStaffingPlan(plan.effective);
+    var currentSolution = companyPositionAssignment();
+    if (!currentSolution || !Object.keys(currentSolution.byEmployee || {}).length) return [];
+    var openCapacity = num(company.capacity) > 0 ?
+        Math.max(0, Math.floor(num(company.capacity) - Math.max(staff.length, num(company.employeeCount)))) : 0;
+    var roster = staff.filter(function (e) { return !e.director; });
+    var activeKinds = {};
+    roster.forEach(function (employee) {
+        var kind = supportRoleKind(currentPosition(employee));
+        if (kind) activeKinds[kind] = true;
+    });
+
+    // Never make an existing support role the source of an exploratory slot.
+    var donorPositions = positions.filter(function (p) {
+        return num(targets[positionKey(p)]) > 0 && !supportRoleKind(p);
+    });
+    var offers = [];
+
+    positions.forEach(function (candidate) {
+        var targetKey = positionKey(candidate);
+        if (!targetKey || num(targets[targetKey]) !== 0) return;
+        var kind = supportRoleKind(candidate);
+        // Avoid proposing another version of a special ability already staffed.
+        if (kind && activeKinds[kind]) return;
+        var benefit = potentialRoleBenefit(candidate);
+        var strongest = null;
+
+        donorPositions.forEach(function (donor) {
+            var donorKey = positionKey(donor);
+            var hypothetical = Object.assign({}, targets);
+            hypothetical[donorKey] = num(hypothetical[donorKey]) - 1;
+            hypothetical[targetKey] = num(hypothetical[targetKey]) + 1;
+            var evaluated = companyPositionAssignment(hypothetical);
+            if (evaluated.invalid || !Object.keys(evaluated.byEmployee || {}).length) return;
+
+            // The support incumbents must keep exactly their current position.
+            if (roster.some(function (employee) {
+                var current = currentPosition(employee);
+                return supportRoleKind(current) && (!evaluated.byEmployee[employee.id] ||
+                    positionKey(evaluated.byEmployee[employee.id].position) !== positionKey(current));
+            })) return;
+
+            var delta = evaluated.suggestedFit - currentSolution.suggestedFit;
+            if (!strongest || delta > strongest.fitDelta ||
+                (delta === strongest.fitDelta && donor.name.localeCompare(strongest.replaces) < 0)) {
+                strongest = {
+                    replaces: donor.name, replacesKey: donorKey, fitDelta: delta,
+                    targets: hypothetical, caution: !!kind || (evaluated.supportRisks || []).length > 0
+                };
+            }
+        });
+
+        // Without a special ability, only advertise an actual modeled fit
+        // improvement, except where there's spare capacity for a future hire.
+        if (!kind && (!strongest || strongest.fitDelta <= 0) && !openCapacity) return;
+        if (!strongest && !openCapacity) return;
+        offers.push({
+            position: candidate.name, key: targetKey, kind: kind,
+            reason: benefit.reason, priority: benefit.signal,
+            plan: strongest, openCapacity: openCapacity,
+            rank: benefit.signal + (!kind && strongest ? Math.max(0, strongest.fitDelta) : 0)
+        });
+    });
+
+    offers.sort(function (a, b) {
+        return b.rank - a.rank || (b.plan ? 1 : 0) - (a.plan ? 1 : 0) ||
+            a.position.localeCompare(b.position);
+    });
+    return offers.slice(0, 6);
+}
+
+// Updates helper-only staffing targets. This never changes Torn company roles.
+function useAdditionalRolePlan(roleKey) {
+    var offer = suggestAdditionalRoles().find(function (x) { return x.key === String(roleKey); });
+    if (!offer || !offer.plan || !company) return false;
+    var valid = positions.reduce(function (total, p) {
+        return total + num(offer.plan.targets[positionKey(p)]);
+    }, 0) === staff.filter(function (x) { return !x.director; }).length;
+    if (!valid) return false;
+    var saved = get('staffingPlans', {});
+    saved[staffingPlanStorageKey()] = normalizedStaffingPlan(offer.plan.targets);
+    put('staffingPlans', saved);
+    return true;
+}
+
 
 function constrainedRaw(weights, target, minimum, maximum) {
     var n = weights.length;
@@ -712,7 +968,9 @@ function calculate() {
             statBestPosition: assigned && assigned.statBestPosition || pure && pure.position || null,
             statBestFit: assigned ? assigned.statBestFit : pure ? pure.fit : 0,
             staffingTarget: assigned ? assigned.targetCount : 0,
-            staffingCurrent: assigned ? assigned.currentCount : 0
+            staffingCurrent: assigned ? assigned.currentCount : 0,
+            supportProtected: !!(assigned && assigned.supportProtected),
+            supportRisk: assigned && assigned.supportRisk || ''
         });
     });
 
@@ -757,6 +1015,8 @@ function calculate() {
             statBestFit: assigned ? assigned.statBestFit : pure ? pure.fit : 0,
             staffingTarget: assigned ? assigned.targetCount : 0,
             staffingCurrent: assigned ? assigned.currentCount : 0,
+            supportProtected: !!(assigned && assigned.supportProtected),
+            supportRisk: assigned && assigned.supportRisk || '',
             suggested: employee.wage == null ? 0 : employee.wage,
             change: 0,
             changePct: 0,
@@ -788,7 +1048,10 @@ function calculate() {
         avgFit: avg(calcRows, function (x) { return x.currentFit; }),
         positionPlan: positionAssignment.plan,
         positionCurrentFit: positionAssignment.currentFit,
-        positionSuggestedFit: positionAssignment.suggestedFit
+        positionSuggestedFit: positionAssignment.suggestedFit,
+        support: positionAssignment.support || supportRoleSnapshot(),
+        protectedCount: positionAssignment.protectedCount || 0,
+        supportRisks: positionAssignment.supportRisks || []
     };
 }
 
@@ -1160,8 +1423,14 @@ function detailHtml(x) {
     var req = best && best.required;
     var staffingNote = '';
 
+    if (x.supportProtected) {
+        staffingNote += '<div class="staffing-reason"><b>Support role protected</b><p>This employee stays in a support role because moving them could change company-wide effectiveness, training, marketing, environment, or reporting. Better individual stat fit alone is not sufficient.</p></div>';
+    } else if (x.supportRisk) {
+        staffingNote += '<div class="staffing-reason caution"><b>Manual review required</b><p>' + esc(x.supportRisk) + ' Compare observed company results before applying this move.</p></div>';
+    }
+
     if (best && pure && pure.name !== best.name) {
-        staffingNote = '<div class="staffing-reason"><b>Why not ' + esc(pure.name) + '?</b><p>' + esc(pure.name) + ' is the pure stat-fit winner for this employee (' + fmt(x.statBestFit) + '), but the staffing plan assigns ' + esc(best.name) + ' so the company keeps the required number of people in each role.</p></div>';
+        staffingNote += '<div class="staffing-reason"><b>Why not ' + esc(pure.name) + '?</b><p>' + esc(pure.name) + ' is the pure stat-fit winner for this employee (' + fmt(x.statBestFit) + '), but the staffing plan assigns ' + esc(best.name) + ' so the company keeps the required number of people in each role.</p></div>';
     }
 
     return '<div class="detail-card">' +
@@ -1188,7 +1457,7 @@ function detailHtml(x) {
         '</div>' +
         (best && !x.director ? '<h4>Staffing-aware position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>Target: ' + fmt(x.staffingTarget) + ' employee' + (num(x.staffingTarget) === 1 ? '' : 's') + ' in this role. ' + esc(best.description || best.ability || 'Assigned using the company-wide staffing plan.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
         '<div class="requirements"><span>Requires:</span>' + requirementBadge('MAN', req.manual) + requirementBadge('INT', req.intelligence) + requirementBadge('END', req.endurance) + '</div>' + staffingNote : '') +
-        '<p class="detail-note">Position recommendations optimize the whole company. Target counts decide how many slots each position must have; work stats decide which employees should fill those slots.</p>' +
+        '<p class="detail-note">Position recommendations maximize combined predicted work-stat fit within role counts; current support-role incumbents are preserved by default. The helper cannot forecast company income or changed Management bonuses. Support-role changes require director review.</p>' +
     '</div>';
 }
 
@@ -1403,17 +1672,22 @@ function staffingPlanEditor() {
         return bc - ac || a.name.localeCompare(b.name);
     });
     var stateClass = info.valid ? 'valid' : 'invalid';
+    var reducedSupport = positions.filter(function (p) {
+        return supportRoleKind(p) && num(info.effective[positionKey(p)]) < num(info.current[positionKey(p)]);
+    }).map(function (p) { return p.name; });
     var statusText = info.valid ?
         'Target slots match your ' + fmt(info.employeeTotal) + ' non-director employees.' :
         'Target slots total ' + fmt(info.targetTotal) + ', but you have ' + fmt(info.employeeTotal) + ' non-director employees. Current position counts are used until the totals match.';
 
     var html = '<div class="staffing-summary ' + stateClass + '"><div><b>' + (info.custom ? 'Custom staffing targets' : 'Current position counts preserved') + '</b><small>' + esc(statusText) + '</small></div><button data-a="reset-staffing">Use current counts</button></div>';
+    if (reducedSupport.length) html += '<div class="notice">Support-role reductions require review: ' + esc(reducedSupport.join(', ')) + '. Incumbents cannot all be protected when their slots are removed.</div>';
     html += '<div class="staffing-table"><div class="staffing-head"><span>Position</span><span>Current</span><span>Target</span></div>';
 
     positionRows.forEach(function (p) {
         var key = positionKey(p);
         var special = p.ability && p.ability !== 'None' ? p.ability : '';
-        html += '<label class="staffing-row"><span class="staffing-role"><b>' + esc(p.name) + '</b>' + (special ? '<small>Special: ' + esc(special) + '</small>' : '') + '</span>' +
+        var family = supportRoleKind(p);
+        html += '<label class="staffing-row"><span class="staffing-role"><b>' + esc(p.name) + '</b>' + (family ? '<small>Support role: ' + esc(family) + '</small>' : '') + (special ? '<small>Special: ' + esc(special) + '</small>' : '') + '</span>' +
             '<span class="staffing-current">' + fmt(info.current[key] || 0) + '</span>' +
             '<input type="number" min="0" max="' + fmt(info.employeeTotal) + '" inputmode="numeric" data-staffing-target="' + esc(key) + '" value="' + fmt(info.target[key] || 0) + '">' +
         '</label>';
@@ -1441,13 +1715,15 @@ function settingsPage() {
             settingField('max', 'Maximum wage', 'Cap applied to every included employee.') +
             settingField('round', 'Round to', 'Use 100, 1,000, 10,000, etc. The allocator tries to preserve the chosen total.') +
         '</div></div>' +
-        '<div class="settings-group staffing-group"><div class="settings-group-title"><b>Position staffing plan</b><small>Position recommendations must fill these role counts. The default is your current company composition; change Target only when you intentionally want a different staffing mix.</small></div>' +
+        '<div class="settings-group staffing-group"><div class="settings-group-title"><b>Position staffing plan</b><small>Position advice fills these role counts. Changing support-role totals can force risky moves even with protection enabled.</small></div>' +
             staffingPlanEditor() +
         '</div>' +
         '<div class="settings-group"><div class="settings-group-title"><b>Helper behavior</b><small>Optional conveniences and recommendations.</small></div><div class="toggles">' +
             toggle('director', 'Include director', 'Include the director in wage distribution.') +
             toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
-            toggle('positionAdvice', 'Staffing-aware position advice', 'Optimize the whole team while respecting the target number of employees in each role.') +
+            toggle('positionAdvice', 'Staffing-aware position advice', 'Maximize combined stat fit within target role counts; this is not a profit forecast.') +
+            toggle('exploreNewRoles', 'Explore additional company roles', 'Consider currently unstaffed roles, alternative staffing mixes, and hiring capacity. Review every scenario before changing Torn positions.') +
+            toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Preserve current Managers, Marketers, Trainers, Cleaners, and Secretaries when matching slots remain. Disable only to explore speculative swaps.') +
             toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
         '</div></div>' +
     '</section>';
@@ -1482,11 +1758,14 @@ function calculationGuidePage() {
             guideCard('7', 'Minimum and maximum wages', 'For Current and Fixed modes, the target itself is constrained to a feasible range. The allocator starts each included employee at the minimum wage, distributes the remainder by score, caps employees that reach the maximum, and redistributes what remains.', 'Feasible target = clamp(Target, Minimum × Employees, Maximum × Employees)', 'For 5 included employees with a $100,000 minimum, the target cannot be lower than $500,000. A maximum wage can similarly cap the highest possible total.') +
             guideCard('8', 'Rounding and payroll balancing', 'Each raw wage is rounded to the Round to increment. In Current and Fixed modes, the helper then moves eligible wages up or down by one increment at a time to keep the final payroll as close as possible to the target.', 'Rounded wage = round(Raw wage ÷ Step) × Step', 'With Round to $10,000, $1,067,500 becomes $1,070,000. If this pushes the total payroll too high, another eligible recommendation can be reduced by $10,000.') +
             guideCard('9', 'Raise, cut, and change percentage', 'The employee list compares the suggested wage with the current wage. A positive difference is a raise; a negative difference is a cut.', 'Change = Suggested − Current; Change % = Change ÷ Current × 100', 'Current $1,000,000 and suggested $1,250,000 gives +$250,000, or +25%.') +
-            guideCard('10', 'Staffing-aware position assignment', 'The helper does not choose a position independently for every employee anymore. It creates the exact number of slots for each role from the Position staffing plan, then finds the company-wide employee-to-slot assignment with the highest combined stat fit. Staying in the current role receives a small 2-point stability bonus to avoid unnecessary reshuffling.', 'Maximize total(PositionFit + 2 when employee stays in current role), subject to exact target slots per position', 'If the plan requires 2 Cashiers, 1 Technician, 1 Admin, and 1 Cleaner, exactly those slots must be filled. Even if three employees individually score highest as Cleaner, only one Cleaner slot exists.') +
-            guideCard('11', 'Custom staffing targets', 'Settings lets the director choose how many employees the company should have in each position. Target counts must add up to the number of non-director employees. If they do not match, the helper safely falls back to the current position counts until the plan is valid.', 'Sum of target position slots = non-director employees', 'For 10 non-director employees, a valid plan could be 3 Cashiers + 2 Technicians + 1 Admin + 1 Cleaner + 3 employees in other roles = 10 slots.') +
+            guideCard('10', 'Staffing-aware position assignment', 'The helper fills target slots using combined predicted work-stat fit and a 2-point staying bonus. With support-role protection enabled (the default), existing Managers, Marketers, Trainers, Cleaners, and Secretaries are kept in their current slots first. Stat fit alone does not measure their benefits to the rest of the company.', 'Reserve existing support-role incumbents when slots exist; then maximize remaining PositionFit + 2 when staying', 'If the plan requires 2 Cashiers, 1 Technician, 1 Admin, and 1 Cleaner, exactly those slots must be filled. Even if a Manager is individually better suited as Cashier, they remain Manager while their Manager slot is available. Removing that slot requires manual review.') +
+            guideCard('11', 'Custom staffing targets', 'Settings lets the director choose how many employees the company should have in each position. Target counts must add up to the number of non-director employees. If they do not match, the helper falls back to current counts. Reducing support-role slots can force speculative assignments and is flagged for review.', 'Sum of target position slots = non-director employees', 'For 10 non-director employees, a valid plan could be 3 Cashiers + 2 Technicians + 1 Admin + 1 Cleaner + 3 employees in other roles = 10 slots.') +
             guideCard('12', 'Summary values', 'The Overview page averages included employees only. Budget variance is the final included payroll minus the target payroll. In Benchmark mode there is no fixed company target, so budget variance is shown as not applicable.', 'Budget variance = Suggested included payroll − Target payroll', 'If the target is $10,000,000 and rounded recommendations total $10,010,000, budget variance is +$10,000.') +
+            guideCard('13', 'Discovering unstaffed roles', 'If Explore additional company roles is enabled, the Overview looks at every position in the Torn company-type catalog, including roles that currently have zero employees or zero target slots. It skips another position with an already staffed special ability and examines what the new role could provide. Manager, Marketer, Cleaner, Trainer, and Secretary benefits are described using their catalog ability; other jobs are evaluated only for modeled work-stat fit.', 'Only consider unstaffed catalog positions; never assume an unreported company-wide bonus', 'If you currently have Cashiers and a Manager but no Trainer, the helper may suggest considering a Trainer for additional company trains, even though no Trainer exists in your current staffing plan.') +
+            guideCard('14', 'Comparing an alternate staffing mix', 'For a possible new role, the helper examines reallocating one existing non-support position slot. It preserves all currently employed support-role incumbents, optimizes the remaining employee-to-position assignments, and compares combined predicted work-stat fit with the current planning scenario. A decrease can be acceptable as a trade-off to investigate for support roles; an increase does not prove extra revenue. No sales or bonus estimates are invented.', 'Modeled stat-fit difference = simulated team fit − current-plan team fit; support benefits are excluded', 'Changing a target from 3 Cashiers + 1 Manager to 2 Cashiers + 1 Manager + 1 Trainer may lower the predicted stat-fit sum, but provides a possible new training benefit that must be verified in Torn.') +
+            guideCard('15', 'Hiring, applying, and limitations', 'If company capacity exceeds occupied slots, the helper identifies a separate hiring path. It does not invent a candidate employee or predict their effectiveness, wage, or income. The Use as staffing target button saves only a valid one-slot reallocation in this helper and opens Settings for review; it does not hire, dismiss, change positions, or submit anything in Torn. Recommendations are exploratory and require the director to compare actual results.', 'Valid reallocation: total role targets = current non-director staff; hiring is not scored without candidate stats', 'If there is 1 vacant employee slot, the helper may identify a Marketer as an available hiring option. You must hire and assign that employee in Torn yourself, then refresh to recalculate.') +
         '</div>' +
-        '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. It never submits wage or position changes automatically.</div>' +
+        '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. New-role suggestions are possibilities for director review, not demonstrated profit improvements. Salary, work-stat fit, and support-role contributions must be evaluated separately. Nothing hires staff or submits role or wage changes to Torn automatically.</div>' +
     '</section>';
 }
 
@@ -1494,6 +1773,84 @@ function guideCard(step, title, textValue, formula, sample) {
     return '<article class="guide-card"><div class="guide-card-head"><span>' + esc(step) + '</span><h4>' + esc(title) + '</h4></div><p>' + esc(textValue) + '</p>' +
         (formula ? '<div class="formula">' + esc(formula) + '</div>' : '') +
         '<div class="guide-sample"><b>Example</b><p>' + esc(sample) + '</p></div></article>';
+}
+
+
+function supportImpactHtml(result) {
+    var snapshot = result.support || supportRoleSnapshot();
+    var labels = { manager:'Managers', marketer:'Marketers', trainer:'Trainers',
+        cleaner:'Cleaners', secretary:'Secretaries' };
+    var kinds = Object.keys(labels).filter(function (kind) {
+        return num(snapshot.counts[kind]) > 0;
+    }).map(function (kind) {
+        return fmt(snapshot.counts[kind]) + ' ' + labels[kind];
+    });
+    var bonusText = snapshot.managementReported ?
+        'Observed Management bonuses: +' + fmt(snapshot.managementTotal) +
+        ' effectiveness points across ' + fmt(snapshot.managementRecipients) +
+        ' employee(s), as currently reported by Torn.' :
+        'Individual Management bonus components were not returned by Torn.';
+    var risks = result.supportRisks || [];
+    var html = '<section class="support-impact">' +
+        '<div class="support-impact-head"><div><small>Position safeguards</small>' +
+        '<h4>Support-role impact</h4></div><b class="' +
+        (cfg.protectSupportRoles ? 'positive' : 'negative') + '">' +
+        (cfg.protectSupportRoles ? 'Protected' : 'Unprotected') + '</b></div>' +
+        '<p>' + esc(kinds.length ? kinds.join(' · ') : 'No recognized current support-role occupants.') + '</p>' +
+        '<p>' + esc(bonusText) + ' These are observed values, NOT a forecast of the effects of swapping roles.</p>' +
+        '<p>' + (!cfg.positionAdvice ? 'Position advice is disabled; no position moves are recommended.' :
+            (cfg.protectSupportRoles ?
+            fmt(result.protectedCount) + ' support-role incumbent(s) reserved in their current slots.' :
+            'Protection is disabled. Stat-fit advice may rearrange support roles.')) + '</p>';
+    if (risks.length) {
+        html += '<div class="support-risk"><b>' + fmt(risks.length) +
+            ' support-role change(s) require director review.</b>' +
+            '<p>These moves have unknown company-wide effectiveness and income effects. Do not assume a better stat fit means higher profit.</p>' +
+            '<ul>' + risks.slice(0, 5).map(function (x) {
+                return '<li>' + esc(x.name + ': ' + x.from + ' → ' + x.to) + '</li>';
+            }).join('') + '</ul></div>';
+    }
+    return html + '</section>';
+}
+
+function additionalRolesHtml() {
+    if (!cfg.positionAdvice || cfg.exploreNewRoles === false || !positions.length) return '';
+    var candidates = suggestAdditionalRoles();
+    var content = candidates.length ? candidates.map(function (x) {
+        var details = x.plan ?
+            '<p><b>Reallocation scenario:</b> move one planned slot from ' + esc(x.plan.replaces) +
+                ' to ' + esc(x.position) + '.</p>' +
+            '<p class="' + (x.plan.fitDelta >= 0 ? 'role-positive' : 'role-caution') + '">' +
+                'Combined modeled stat-fit change: ' + (x.plan.fitDelta > 0 ? '+' : '') +
+                fmt(x.plan.fitDelta) + ' points. ' +
+                (x.kind ? 'The special-role benefit is NOT included in this score.' :
+                    'Higher fit does not guarantee higher income.') + '</p>' :
+            '<p>No safe existing non-support slot is available for reassignment.</p>';
+        var vacancy = x.openCapacity ?
+            '<p>Hiring path: ' + fmt(x.openCapacity) +
+                ' unfilled company slot(s) reported. A new hire needs their own stats and wage assessment.</p>' : '';
+        return '<article class="role-opportunity">' +
+            '<div class="role-opportunity-head"><div><small>' +
+                esc(x.kind ? 'Unstaffed ' + x.kind + ' ability' : 'Unstaffed production role') +
+                '</small><h5>' + esc(x.position) + '</h5></div>' +
+                '<span class="role-type">' + esc(x.kind ? 'Support opportunity' : 'Stat-fit opportunity') + '</span></div>' +
+            '<p>' + esc(x.reason) + '</p>' + details + vacancy +
+            (x.plan ?
+                '<button data-use-new-role="' + esc(x.key) +
+                '">Use as staffing target (helper only)</button>' :
+                '<small class="role-caution">Hiring suggestion only; no employee reassignment can be modeled.</small>') +
+            '</article>';
+    }).join('') : '<p class="role-opportunity-empty">No additional roles passed the current eligibility checks. ' +
+        'This does not establish that your existing staffing mix maximizes revenue.</p>';
+    return '<section class="role-opportunities"><div class="role-opportunities-intro">' +
+        '<div><small>Beyond your current staff mix</small><h4>Additional roles worth considering</h4>' +
+        '<p>The helper reviews the full company position catalog, including roles with no current employees. ' +
+        'It checks possible one-slot reallocations without removing existing support-role incumbents and also notes available hiring capacity.</p></div>' +
+        '<button data-page="guide">How recommendations work</button></div>' +
+        '<div class="role-opportunity-grid">' + content + '</div>' +
+        '<p class="role-opportunity-disclaimer">These are exploratory options, NOT proven income improvements. ' +
+        'The stat-fit difference excludes changes to sales, management bonuses, advertising, environment, and training. ' +
+        'Choosing a target updates this helper only. No positions or wages are changed in Torn.</p></section>';
 }
 
 function overviewPage(result) {
@@ -1512,6 +1869,8 @@ function overviewPage(result) {
             summaryCard('Budget variance', cfg.mode === 'benchmark' ? '—' : money(result.budgetGap), cfg.mode === 'benchmark' ? 'Benchmark mode' : 'After limits and rounding', Math.abs(result.budgetGap) > num(cfg.round) ? 'warn' : 'good') +
         '</section>';
 
+    html += supportImpactHtml(result);
+    html += additionalRolesHtml();
     if (!positions.length) {
         html += '<div class="notice"><b>Position-fit advice unavailable.</b> Wage calculations are active, but position recommendations are temporarily hidden.</div>';
     }
@@ -1549,10 +1908,10 @@ function employeesPage(result, visibleRows) {
         '</tr></thead><tbody>';
 
     visibleRows.forEach(function (x) {
-        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">Suggested → ' + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
+        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">' + (x.supportRisk ? 'Review support role → ' : 'Suggested → ') + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
         html += '<tr class="' + (x.omit ? 'excluded-row' : '') + '">' +
             '<td class="use-col"><input type="checkbox" data-inc="' + esc(x.id) + '"' + (!x.omit ? ' checked' : '') + ' aria-label="Include ' + esc(x.name) + '"></td>' +
-            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? ' · Suggested → ' + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
+            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? (x.supportRisk ? ' · Review support role → ' : ' · Suggested → ') + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
             '<td class="position-col"><b>' + esc(x.position) + '</b>' + review + '</td>' +
             '<td class="effect-col"><b>' + fmt(x.effectiveness.total) + '</b><small>Fit ' + fmt(x.currentFit) + '</small></td>' +
             '<td class="current-col">' + (x.wage == null ? '<span class="subtle">—</span>' : money(x.wage)) + '</td>' +
@@ -1620,6 +1979,19 @@ function bind(result) {
             copyText(changeReportText(changeReport()))
                 .then(function () { toast('Company change report copied.', true); })
                 .catch(function () { toast('Unable to copy report.', false); });
+        };
+    });
+
+    panel.querySelectorAll('[data-use-new-role]').forEach(function (button) {
+        button.onclick = function () {
+            if (!useAdditionalRolePlan(button.dataset.useNewRole)) {
+                toast('The staffing scenario is no longer available. Refresh company data.', false);
+                return;
+            }
+            ui.page = 'settings';
+            detailId = '';
+            render();
+            toast('Exploratory staffing targets saved. No Torn position was changed.', true);
         };
     });
 
@@ -2094,6 +2466,8 @@ S.innerHTML = '<style>' +
 '</style>' +
 
 '<style>' +
+'.role-opportunities{margin:0 14px 16px;padding:13px;border:1px solid #456070;border-radius:12px;background:#151e25}.role-opportunities-intro{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:11px}.role-opportunities-intro small{display:block;color:#86c7f2;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.5px}.role-opportunities-intro h4{margin:3px 0 4px;font-size:14px;color:#f0f6fa}.role-opportunities-intro p{margin:0;color:#b9cbd6;font-size:10px;line-height:1.55}.role-opportunities-intro>button{flex:0 0 auto;border:1px solid #48677a;background:#243946;border-radius:8px;color:#d4edff!important;font-size:10px;font-weight:800;padding:8px}.role-opportunity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.role-opportunity{min-width:0;padding:12px;border:1px solid #3a4a54;border-radius:10px;background:#1c2730}.role-opportunity-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px}.role-opportunity-head small{display:block;color:#9cb0bc;font-size:9px}.role-opportunity-head h5{margin:2px 0;color:#edf6fc;font-size:13px}.role-type{padding:4px 6px;border:1px solid #496d74;border-radius:999px;color:#a5e6db;font-size:9px;font-weight:850}.role-opportunity p{margin:6px 0;color:#bdcdd6;line-height:1.5;font-size:10px}.role-opportunity p b{color:#e7f3ff}.role-opportunity p.role-positive{color:#9ff1c1}.role-opportunity p.role-caution,.role-opportunity .role-caution{color:#ffd39b}.role-opportunity>button{margin-top:8px;width:100%;padding:9px;border:1px solid #3f9c73;border-radius:8px;background:#174634;color:#c6f7de;font-size:10px;font-weight:800}.role-opportunity-empty{grid-column:1/-1;margin:0;padding:12px;color:#a9becb;font-size:11px}.role-opportunity-disclaimer{margin:11px 0 0;color:#a9bcc7;font-size:9px;line-height:1.55}@media(max-width:700px){.role-opportunities{margin-left:10px;margin-right:10px;padding:10px}.role-opportunities-intro{flex-direction:column;align-items:stretch}.role-opportunities-intro>button{align-self:flex-start}.role-opportunity-grid{grid-template-columns:1fr}}' +
+'.support-impact{margin:0 14px 14px;padding:12px;border-radius:11px;border:1px solid #37644d;background:#13281f}.support-impact-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}.support-impact-head small{display:block;font-size:9px;text-transform:uppercase;color:#9bd8b5;letter-spacing:.4px}.support-impact-head h4{margin:4px 0;font-size:13px}.support-impact-head>b{font-size:10px}.support-impact p{margin:6px 0 0;color:#bfd6ca;font-size:10px;line-height:1.5}.support-risk{margin-top:10px;padding:10px;border:1px solid #9e7230;border-radius:9px;background:#382b1b;color:#ffe3ac;font-size:10px}.support-risk p{color:#ffe3ac}.support-risk ul{margin:6px 0 0;padding-left:16px;line-height:1.5}.staffing-reason.caution{background:#382b1b;border-color:#9e7230}.staffing-reason.caution b{color:#ffe3ac}@media(max-width:700px){.support-impact{margin-left:10px;margin-right:10px}}' +
 '.changes-reason-editor{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 0}.changes-reason-editor input{flex:1 1 180px;min-width:0;padding:7px 9px;border:1px solid var(--border2);border-radius:7px;background:#10171b;color:var(--text);font-size:10px}.changes-reason-editor button{padding:7px 9px;border:1px solid #317c57;border-radius:7px;background:#1b4933;color:#c2f4da;font-size:10px;font-weight:850}.changes-page{padding:0 0 16px}.changes-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin:0 14px 12px}.changes-ranges{display:flex;flex-wrap:wrap;gap:5px}.changes-ranges button,.changes-copy{border:1px solid var(--border2);border-radius:8px;padding:8px 11px;background:var(--panel2);color:var(--text)!important;font-size:11px;font-weight:800}.changes-ranges button.selected{border-color:#2eaa76;background:#153e2b;color:#baf2d2!important}.changes-copy{background:var(--green2);border-color:#2eaa76}.changes-coverage{display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:0 14px 10px;padding:10px 12px;background:#13281f;border:1px solid #2e654b;border-radius:10px;font-size:11px}.changes-coverage b{color:#c2f4da}.changes-coverage span{font-size:10px;color:#afc6b9}.changes-notice{margin-top:8px}.changes-section-head{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:6px;margin:16px 14px 9px}.changes-section-head h4{margin:0;font-size:13px}.changes-section-head small{color:var(--muted);font-size:9px}.changes-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 14px}.changes-metric{min-width:0;padding:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px}.changes-metric small,.changes-metric strong,.changes-metric span{display:block}.changes-metric small{font-size:10px;color:var(--muted)}.changes-metric strong{margin-top:4px;font-size:17px;overflow-wrap:anywhere}.changes-metric span{margin-top:4px;font-size:10px;color:#b2bbc2}.changes-metric span.up{color:#8ff0bd}.changes-metric span.down{color:#ffb0b0}.changes-counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0 14px 10px}.changes-counts>div{padding:11px;background:#1c252b;border:1px solid var(--border);border-radius:9px;text-align:center}.changes-counts b,.changes-counts small{display:block}.changes-counts b{font-size:20px}.changes-counts small{color:var(--muted);font-size:10px}.changes-timeline,.changes-employee-list{margin:0 14px;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden}.changes-event{display:flex;gap:12px;padding:12px;border-bottom:1px solid var(--border);align-items:start}.changes-event:last-child,.changes-employee-row:last-child{border-bottom:none}.changes-event-tag{flex:0 0 86px;text-align:center;border:1px solid #5e6873;border-radius:5px;padding:5px 3px;color:#e0e5e9;font-size:9px;font-weight:850}.changes-event-tag.joined{color:#aaf1ce;border-color:#387b58;background:#133c2b}.changes-event-tag.fired{color:#ffc0bd;border-color:#8d4849;background:#432023}.changes-event-tag.left,.changes-event-tag.unconfirmed{color:#ffe2a0;border-color:#8d7138;background:#3e321d}.changes-event-content{min-width:0}.changes-event-content b{display:block;font-size:11px;line-height:1.5;font-weight:650;overflow-wrap:anywhere}.changes-event-content p{margin:5px 0;color:#ffccbd;font-size:10px}.changes-event-content small{display:block;margin-top:6px;color:var(--muted);font-size:9px}.changes-empty{margin:0 14px;padding:18px 12px;background:var(--panel);border:1px dashed var(--border2);border-radius:10px;color:var(--muted);font-size:11px;line-height:1.5}.changes-empty h4{margin:0 0 5px;color:var(--text);font-size:13px}.changes-empty p{margin:0}.changes-employee-row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);font-size:11px}.changes-employee-row>span{font-weight:800;min-width:0}.changes-employee-row small{display:block;margin-top:3px;color:var(--muted);font-size:9px}.changes-employee-row>b{font-size:10px;font-weight:650;text-align:right;overflow-wrap:anywhere}.changes-overflow{margin:6px 14px;font-size:10px;color:var(--amber)}.changes-footnote{margin:16px 14px 0;font-size:10px;color:var(--muted);line-height:1.6}@media(max-width:700px){.changes-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 9px}.changes-toolbar,.changes-timeline,.changes-employee-list,.changes-counts{margin-left:9px;margin-right:9px}.changes-counts{grid-template-columns:repeat(2,minmax(0,1fr))}.changes-coverage{margin-left:9px;margin-right:9px}.changes-section-head{margin-left:9px;margin-right:9px}.changes-event-tag{flex-basis:72px}.changes-event{gap:8px;padding:10px}.changes-metric strong{font-size:15px}.changes-footnote{margin:14px 9px}.page-tab{padding-left:4px;padding-right:4px}.page-tab-main{font-size:10px}.changes-employee-row{align-items:start;flex-direction:column;gap:5px}.changes-employee-row>b{text-align:left}}@media(max-width:380px){.changes-metrics{grid-template-columns:1fr}.page-tab-main{font-size:9px}}' +
 '</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
