@@ -1455,9 +1455,10 @@ function detailHtml(x) {
             effectLine('Addiction', e.addiction) +
             effectLine('Inactivity', e.inactivity) +
         '</div>' +
-        (best && !x.director ? '<h4>Staffing-aware position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>Target: ' + fmt(x.staffingTarget) + ' employee' + (num(x.staffingTarget) === 1 ? '' : 's') + ' in this role. ' + esc(best.description || best.ability || 'Assigned using the company-wide staffing plan.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
+        (best && !x.director && ui.page === 'positions' ? '<h4>Staffing-aware position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>Target: ' + fmt(x.staffingTarget) + ' employee' + (num(x.staffingTarget) === 1 ? '' : 's') + ' in this role. ' + esc(best.description || best.ability || 'Assigned using the company-wide staffing plan.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
         '<div class="requirements"><span>Requires:</span>' + requirementBadge('MAN', req.manual) + requirementBadge('INT', req.intelligence) + requirementBadge('END', req.endurance) + '</div>' + staffingNote : '') +
-        '<p class="detail-note">Position recommendations maximize combined predicted work-stat fit within role counts; current support-role incumbents are preserved by default. The helper cannot forecast company income or changed Management bonuses. Support-role changes require director review.</p>' +
+        (ui.page === 'positions' ? '<p class="detail-note">Position recommendations maximize combined predicted work-stat fit within role counts. Support-role incumbents are preserved by default. Income and future bonuses cannot be reliably projected.</p>' :
+        '<p class="detail-note">Wage recommendations use current employee work-stat effectiveness and total effectiveness. Open Positions to review roles, without changing wage calculations.</p>') +
     '</div>';
 }
 
@@ -1870,34 +1871,61 @@ function additionalRolesHtml() {
         'Choosing a target updates this helper only. No positions or wages are changed in Torn.</p></section>';
 }
 
-function overviewPage(result) {
-    var delta = result.suggestedIncluded - result.currentIncluded;
-    var raises = result.rows.filter(function (x) { return !x.omit && x.change > 0; }).sort(function (a,b) { return b.change-a.change; });
-    var cuts = result.rows.filter(function (x) { return !x.omit && x.change < 0; }).sort(function (a,b) { return a.change-b.change; });
-    var reviews = result.rows.filter(function (x) { return x.recommendPosition; }).sort(function (a,b) { return (b.bestFit-b.predictedCurrentFit)-(a.bestFit-a.predictedCurrentFit); });
 
-    var html = '<section class="overview-page">' +
-        '<div class="page-heading"><div><small>Company overview</small><h3>What needs your attention</h3><p>Start here, then open Employees for the full wage list or Settings to change the calculation model.</p></div><button class="primary compact" data-page="employees">View employees</button></div>' +
-        '<section class="summary">' +
-            summaryCard('Employees included', fmt(result.included), result.excluded ? fmt(result.excluded) + ' excluded' : 'Everyone is included') +
-            summaryCard('Current payroll', money(result.currentIncluded), 'Included daily total') +
-            summaryCard('Suggested payroll', money(result.suggestedIncluded), (delta > 0 ? '+' : '') + money(delta) + ' vs current', delta > 0 ? 'warn' : delta < 0 ? 'good' : '') +
-            summaryCard('Avg. effectiveness', fmt(result.avgEffectiveness), 'Work-stat efficiency ' + fmt(result.avgFit)) +
-            summaryCard('Budget variance', cfg.mode === 'benchmark' ? '—' : money(result.budgetGap), cfg.mode === 'benchmark' ? 'Benchmark mode' : 'After limits and rounding', Math.abs(result.budgetGap) > num(cfg.round) ? 'warn' : 'good') +
-        '</section>';
+function dashboardLink(key, eyebrow, title, number, subtitle, details) {
+    return '<button type="button" class="dashboard-link" data-page="' + esc(key) + '">' +
+        '<span class="dashboard-card-top"><span>' + esc(eyebrow) + '</span><span aria-hidden="true">↗</span></span>' +
+        '<strong>' + esc(title) + '</strong>' +
+        '<span class="dashboard-card-number">' + esc(number) + '</span>' +
+        '<span class="dashboard-card-description">' + esc(subtitle) + '</span>' +
+        '<span class="dashboard-card-footer">' + esc(details) + '<b>Open ' + esc(title) + ' →</b></span>' +
+    '</button>';
+}
 
-    html += supportImpactHtml(result);
-    html += additionalRolesHtml();
-    if (!positions.length) {
-        html += '<div class="notice"><b>Position-fit advice unavailable.</b> Wage calculations are active, but position recommendations are temporarily hidden.</div>';
-    }
-
-    html += '<div class="insight-grid">' +
-        insightCard('Raises', raises, function (x) { return '+' + money(x.change); }, 'No suggested raises', 'raise') +
-        insightCard('Cuts', cuts, function (x) { return money(x.change); }, 'No suggested cuts', 'cut') +
-        insightCard('Position review', reviews, function (x) { return x.bestPosition ? x.bestPosition.name : 'Review' ; }, 'No position changes flagged', 'position') +
-    '</div>' +
-    '<div class="overview-help"><div><b>How to use this helper</b><p>Review the summary, inspect employees that need attention, then copy or autofill wages only after you are satisfied with the recommendations.</p></div><button data-page="settings">Adjust calculation</button></div>' +
+function dashboardPage(result) {
+    var payChanges = result.rows.filter(function (x) { return !x.omit && x.change !== 0; }).length;
+    var changes = result.rows.filter(function (x) { return x.recommendPosition; }).length;
+    var history = changeReport();
+    var movements = history ? history.events.filter(function (e) {
+        return ['joined', 'fired', 'left', 'unconfirmed'].indexOf(e.type) >= 0;
+    }).length : 0;
+    var plans = cfg.positionAdvice && cfg.exploreNewRoles && positions.length ?
+        suggestAdditionalRoles().length : 0;
+    var days = changePeriodDays();
+    var title = company && company.name ? company.name : 'Your company';
+    var html = '<section class="dashboard-page">' +
+        '<div class="page-heading dashboard-hero"><div><small>Company control center</small>' +
+        '<h3>' + esc(title) + ' at a glance</h3>' +
+        '<p>Everything important, in one place. Choose a section below to review details and take action.</p></div>' +
+        '<button data-page="guide" class="small">How to use this helper</button></div>' +
+        '<div class="dashboard-quick-stats">' +
+            summaryCard('Employees', fmt(staff.length), 'Currently recorded in Torn') +
+            summaryCard('Daily income', company ? money(company.dailyIncome) : '—', 'Current rolling Torn figure') +
+            summaryCard('Avg. effectiveness', fmt(result.avgEffectiveness), 'Included employees') +
+            summaryCard('Company rating', company && company.rating ? fmt(company.rating) + ' ★' : '—', 'Latest reported stars') +
+        '</div>' +
+        '<div class="dashboard-section-title"><h4>Explore your company</h4><p>Each section has one purpose. Nothing is changed in Torn automatically.</p></div>' +
+        '<div class="dashboard-links">' +
+            dashboardLink('wages', '01 · Daily payroll', 'Wages',
+                money(result.currentIncluded),
+                money(result.suggestedIncluded) + ' suggested daily payroll',
+                fmt(payChanges) + ' proposed wage change(s)') +
+            dashboardLink('positions', '02 · Team structure', 'Positions',
+                fmt(changes) + ' to review',
+                fmt(result.protectedCount) + ' existing support-role assignment(s) protected',
+                fmt(plans) + ' additional role option(s)') +
+            dashboardLink('statistics', '03 · Business health', 'Statistics',
+                company ? money(company.weeklyIncome) : '—',
+                'Current rolling weekly income (not profit)',
+                'View revenue, customers and company indicators') +
+            dashboardLink('changes', '04 · Recent activity', 'Changes',
+                history ? fmt(movements) + ' events' : 'Tracking',
+                'Employee movements over the selected ' + days + '-day period',
+                history && history.partial ? 'Limited historical coverage' : 'View history and export reports') +
+        '</div>' +
+        '<div class="dashboard-next"><div><b>Not sure where to start?</b>' +
+        '<p>Review Wages for pay adjustments, Positions for staffing ideas, and Statistics for company performance. Use Changes to see what happened over time.</p></div>' +
+        '<button data-page="wages">Review wages →</button></div>' +
     '</section>';
     return html;
 }
@@ -1910,25 +1938,173 @@ function insightCard(title, list, valueFn, emptyText, filterKey) {
     return '<div class="insight-card"><div class="insight-head"><div><b>' + esc(title) + '</b><small>' + fmt(list.length) + ' employee' + (list.length === 1 ? '' : 's') + '</small></div>' + (list.length ? '<button data-filter-jump="' + filterKey + '">See all</button>' : '') + '</div>' + body + '</div>';
 }
 
+
+function wagesPage(result, visibleRows) {
+    var changed = result.rows.filter(function (x) { return !x.omit && x.change !== 0; }).length;
+    return '<section class="wages-summary">' +
+        '<div class="page-heading"><div><small>Employee payroll</small><h3>Wages</h3>' +
+        '<p>Review daily wages and suggested pay. Position planning lives in its own section.</p></div>' +
+        '<button data-page="settings" class="small">Wage settings</button></div>' +
+        '<div class="summary">' +
+            summaryCard('Current daily payroll', money(result.currentIncluded), 'Included employees') +
+            summaryCard('Suggested daily payroll', money(result.suggestedIncluded), 'Based on your wage settings') +
+            summaryCard('Proposed changes', fmt(changed), 'Raises or cuts; review before applying') +
+        '</div></section>' + employeesPage(result, visibleRows);
+}
+
+function positionStat(label, value, note) {
+    return '<div class="positions-metric"><small>' + esc(label) + '</small>' +
+        '<strong>' + esc(value) + '</strong><span>' + esc(note) + '</span></div>';
+}
+
+function positionsPage(result) {
+    var reviews = result.rows.filter(function (x) { return x.recommendPosition && !x.director; });
+    var plan = result.positionPlan;
+    var nonDirectors = staff.filter(function (x) { return !x.director; });
+    var html = '<section class="positions-page">' +
+        '<div class="page-heading"><div><small>People and job assignments</small><h3>Positions</h3>' +
+        '<p>See who works where, explore other jobs, and adjust your staffing plan without changing Torn automatically.</p></div>' +
+        '<button class="small" data-page="guide">How role advice works</button></div>' +
+        '<div class="positions-metrics">' +
+            positionStat('Employees in positions', fmt(nonDirectors.length), 'Excludes the director') +
+            positionStat('Suggested changes', cfg.positionAdvice ? fmt(reviews.length) : 'Off', 'Review before changing jobs') +
+            positionStat('Protected support roles', fmt(result.protectedCount), 'Existing support employees kept in place') +
+        '</div>';
+    if (!positions.length) {
+        return html + '<div class="notice"><b>Position information unavailable.</b> Refresh company data to load available jobs.</div></section>';
+    }
+    if (!cfg.positionAdvice) html += '<div class="notice">Position advice is disabled. Enable it below to see staffing recommendations.</div>';
+    html += '<div class="positions-section-head"><div><h4>Employee assignments</h4>' +
+        '<p>Current role compared with the recommended role. Fit differences measure working stats only, not income.</p></div></div>' +
+        '<div class="positions-employee-list">';
+    var listed = result.rows.filter(function (x) { return !x.director; }).sort(function (a,b) {
+        return Number(b.recommendPosition) - Number(a.recommendPosition) || a.name.localeCompare(b.name);
+    });
+    listed.forEach(function (x) {
+        var proposed = cfg.positionAdvice ? x.bestPosition : null;
+        var diff = proposed ? num(x.bestFit) - num(x.predictedCurrentFit) : 0;
+        var status = x.supportRisk ? 'Check support impact' :
+            x.supportProtected ? 'Support role protected' :
+            x.recommendPosition ? 'Review proposed move' : 'Keep current role';
+        html += '<div class="positions-person">' +
+            '<div class="positions-person-main"><b>' + esc(x.name) + '</b><small>[' + esc(x.id) + ']</small></div>' +
+            '<div class="positions-person-roles"><div><small>Current</small><span>' + esc(x.position) + '</span></div>' +
+            '<div><small>Suggested</small><span>' +
+            (proposed ? esc(proposed.name) : 'No advice') + '</span></div></div>' +
+            '<div class="positions-person-status ' + (x.supportRisk ? 'caution' : x.recommendPosition ? 'review' : 'keep') + '">' +
+                '<span>' + esc(status) + '</span>' +
+                '<small>' + (proposed ? 'Stat-fit difference: ' + (diff > 0 ? '+' : '') + fmt(diff) : '—') +
+                '</small></div>' +
+            '<button class="small" data-detail="' + esc(x.id) + '">Details</button>' +
+        '</div>';
+    });
+    html += '</div>';
+    html += supportImpactHtml(result);
+    html += additionalRolesHtml();
+    html += '<div class="positions-section-head"><div><h4>Staffing targets</h4>' +
+        '<p>Set how many employees should fill each job. Targets must add up to your current number of employees. Suggestions are helper-only.</p></div></div>' +
+        '<div class="positions-planner">' + staffingPlanEditor() + '</div>' +
+        '<div class="settings-group positions-preferences"><div class="settings-group-title"><b>Position preferences</b>' +
+            '<small>Customize role recommendations. Changes recalculate immediately.</small></div>' +
+        '<div class="toggles">' +
+            toggle('positionAdvice', 'Show position recommendations', 'Compare proposed roles with current assignments.') +
+            toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Keep current Managers, Trainers, Marketers, Cleaners, and Secretaries when their slots remain.') +
+            toggle('exploreNewRoles', 'Explore additional positions', 'Consider unstaffed positions, safe alternatives, and hiring capacity.') +
+        '</div></div></section>';
+    return html;
+}
+
+function statisticsTile(label, key, suffix, note, kind) {
+    var v = company && company[key];
+    var shown = v == null ? 'Not reported' : kind === 'money' ? money(v) :
+        fmt(v) + (suffix || '');
+    return '<div class="stats-tile"><small>' + esc(label) + '</small><strong>' +
+        esc(shown) + '</strong><span>' + esc(note) + '</span></div>';
+}
+
+function statisticsPage(result) {
+    var history = changeReport();
+    var html = '<section class="statistics-page">' +
+        '<div class="page-heading"><div><small>Business performance</small><h3>Company Statistics</h3>' +
+        '<p>Understand your current figures without mixing them with wage or position recommendations.</p></div>' +
+        '<button class="small" data-page="changes">View historical changes</button></div>' +
+        '<div class="stats-explain"><b>How to read these numbers</b>' +
+        '<p>Income figures are the daily or weekly rolling amounts reported by Torn. They are <b>not net profit</b>. ' +
+        'Company funds are a balance, not earnings.</p></div>' +
+        '<div class="positions-section-head"><div><h4>Income and customers</h4>' +
+        '<p>Latest values from your company profile.</p></div></div>' +
+        '<div class="stats-grid">' +
+            statisticsTile('Daily income', 'dailyIncome', '', 'Torn rolling daily figure', 'money') +
+            statisticsTile('Weekly income', 'weeklyIncome', '', 'Torn rolling weekly figure', 'money') +
+            statisticsTile('Daily customers', 'dailyCustomers', '', 'Customers reported by Torn') +
+            statisticsTile('Weekly customers', 'weeklyCustomers', '', 'Customers reported by Torn') +
+        '</div>' +
+        '<div class="positions-section-head"><div><h4>Business condition</h4>' +
+        '<p>These indicators are reported by Torn; they are not guaranteed outcomes of role changes.</p></div></div>' +
+        '<div class="stats-grid">' +
+            statisticsTile('Efficiency', 'efficiency', '', 'Company-wide indicator') +
+            statisticsTile('Popularity', 'popularity', '', 'Company-wide indicator') +
+            statisticsTile('Environment', 'environment', '', 'Company-wide indicator') +
+            statisticsTile('Company rating', 'rating', ' ★', 'Current star rating') +
+        '</div>' +
+        '<div class="positions-section-head"><div><h4>Resources and workforce</h4>' +
+        '<p>Balances, budgets, and people at the last refresh.</p></div></div>' +
+        '<div class="stats-grid">' +
+            statisticsTile('Company funds', 'funds', '', 'Current balance, not profit', 'money') +
+            statisticsTile('Company value', 'value', '', 'Reported company value', 'money') +
+            statisticsTile('Advertising budget', 'advertisementBudget', '', 'Reported advertising budget', 'money') +
+            statisticsTile('Available trains', 'trains', '', 'Training opportunities') +
+            positionStat('Employees', fmt(staff.length), 'From the loaded roster') +
+            positionStat('Average effectiveness', fmt(result.avgEffectiveness), 'Included employees') +
+            positionStat('Daily wage payroll', money(result.currentAll), 'All employees with known wages') +
+            positionStat('Employee capacity', company && company.capacity ? fmt(company.capacity) : 'Not reported', 'Reported hiring slots') +
+        '</div>';
+    html += '<div class="positions-section-head"><div><h4>Changes over time</h4>' +
+        '<p>Compare tracked values against the earliest available baseline for the selected period.</p></div>' +
+        '<button class="small" data-page="changes">Open Changes →</button></div>';
+    if (history && history.metrics && history.metrics.length) {
+        html += '<div class="stats-comparison-note">' + (history.partial ?
+            'Partial history: some of the selected period has not yet been recorded.' :
+            'Tracked comparison for the past ' + history.days + ' days.') +
+            '</div><div class="stats-deltas">';
+        history.metrics.filter(function (m) {
+            return ['dailyIncome','weeklyIncome','avgEffectiveness','employeeCount',
+                'efficiency','popularity','environment','payroll'].indexOf(m.key) >= 0;
+        }).forEach(function (m) {
+            var change = m.kind === 'money' ? money(m.delta) : fmt(m.delta);
+            html += '<div><small>' + esc(m.label) + '</small><strong>' +
+                esc((m.delta > 0 ? '+' : '') + change) + '</strong>' +
+                '<span>From ' + esc(metricText(m.previous, m.kind)) + ' to ' +
+                esc(metricText(m.latest, m.kind)) + '</span></div>';
+        });
+        html += '</div>';
+    } else {
+        html += '<div class="stats-comparison-note">No earlier snapshot is available yet. ' +
+            'Refresh on future days to build a comparison history.</div>';
+    }
+    return html + '<p class="stats-footnote">Position and wage advice is available in its own section. ' +
+        'History is device-local and may be partial. All reported numbers are for reference only.</p></section>';
+}
+
 function employeesPage(result, visibleRows) {
     var html = '<section class="workspace employee-page">' +
-        '<div class="page-heading employees-heading"><div><small>Employee recommendations</small><h3>Wages & position fit</h3><p>Tap an employee name for work stats, effectiveness breakdown, and position requirements.</p></div><button class="small" data-a="reset-inclusions">Include all</button></div>' +
+        '<div class="page-heading employees-heading"><div><small>Employee recommendations</small><h3>Employee wages</h3><p>Search, review, and copy suggested daily wages. Tap a name for an effectiveness breakdown.</p></div><button class="small" data-a="reset-inclusions">Include all</button></div>' +
         '<div class="toolbar">' +
             '<div class="search"><span>⌕</span><input data-ui="query" value="' + esc(ui.query) + '" placeholder="Search name, ID, or position" aria-label="Search employees"></div>' +
             '<select data-ui="sort" aria-label="Sort employees">' + sortOptions() + '</select>' +
             '<button class="small" data-a="sort-dir" title="Toggle sort direction">' + (ui.direction === 'desc' ? '↓' : '↑') + '</button>' +
         '</div>' +
-        '<div class="filters">' + filterButton('all', 'All', result.rows.length) + filterButton('included', 'Included', result.included) + filterButton('excluded', 'Excluded', result.excluded) + filterButton('raise', 'Raises', result.rows.filter(function(x){return !x.omit&&x.change>0;}).length) + filterButton('cut', 'Cuts', result.rows.filter(function(x){return !x.omit&&x.change<0;}).length) + filterButton('position', 'Position review', result.rows.filter(function(x){return x.recommendPosition;}).length) + '</div>' +
+        '<div class="filters">' + filterButton('all', 'All', result.rows.length) + filterButton('included', 'Included', result.included) + filterButton('excluded', 'Excluded', result.excluded) + filterButton('raise', 'Raises', result.rows.filter(function(x){return !x.omit&&x.change>0;}).length) + filterButton('cut', 'Cuts', result.rows.filter(function(x){return !x.omit&&x.change<0;}).length) + '</div>' +
         '<div class="table-meta"><span>Showing <b>' + fmt(visibleRows.length) + '</b> of ' + fmt(result.rows.length) + '</span><span>Tap a name to see full employee details.</span></div>' +
         '<div class="table-wrap"><table class="employee-table"><thead><tr>' +
             '<th class="use-col">Use</th><th class="employee-col">Employee</th><th class="position-col">Position</th><th class="effect-col">Eff.</th><th class="current-col">Current</th><th class="suggested-col">Suggested</th><th class="change-col">Change</th><th class="action-col"></th>' +
         '</tr></thead><tbody>';
 
     visibleRows.forEach(function (x) {
-        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">' + (x.supportRisk ? 'Review support role → ' : 'Suggested → ') + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
+        var review = '<small>Fit ' + fmt(x.currentFit) + '</small>';
         html += '<tr class="' + (x.omit ? 'excluded-row' : '') + '">' +
             '<td class="use-col"><input type="checkbox" data-inc="' + esc(x.id) + '"' + (!x.omit ? ' checked' : '') + ' aria-label="Include ' + esc(x.name) + '"></td>' +
-            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? (x.supportRisk ? ' · Review support role → ' : ' · Suggested → ') + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
+            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
             '<td class="position-col"><b>' + esc(x.position) + '</b>' + review + '</td>' +
             '<td class="effect-col"><b>' + fmt(x.effectiveness.total) + '</b><small>Fit ' + fmt(x.currentFit) + '</small></td>' +
             '<td class="current-col">' + (x.wage == null ? '<span class="subtle">—</span>' : money(x.wage)) + '</td>' +
