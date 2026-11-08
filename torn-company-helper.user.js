@@ -1178,18 +1178,54 @@ function normalizeCompanyNews(payload) {
     }).filter(function (e) { return e.text && e.ts > 0; });
 }
 
+// Preserve every observed material update in the recent window. Older history
+// is downsampled so daily, weekly and monthly reports remain useful without
+// exhausting localStorage. Values are never backfilled for unobserved periods.
+function snapshotFingerprint(snapshot) {
+    if (!snapshot) return '';
+    var roster = (snapshot.staff || []).map(function (e) {
+        return { id: String(e.id), name: e.name, position: e.position,
+            wage: e.wage, effectiveness: e.effectiveness };
+    }).sort(function (a, b) { return a.id.localeCompare(b.id); });
+    return JSON.stringify({ company: snapshot.company || {}, staff: roster });
+}
+
+function compactCompanySnapshots(snapshots, now) {
+    var cutoff = now - 180 * 86400000;
+    var recent = [], medium = {}, older = {};
+    (snapshots || []).filter(function (s) {
+        return s && Number.isFinite(Number(s.ts)) && s.ts >= cutoff && s.ts <= now &&
+            Array.isArray(s.staff) && s.company;
+    }).sort(function (a,b) { return a.ts - b.ts; }).forEach(function (item) {
+        var age = now - item.ts;
+        if (age <= 86400000) recent.push(item);
+        else if (age <= 14 * 86400000) medium[Math.floor(item.ts / (3 * 3600000))] = item;
+        else older[Math.floor(item.ts / 86400000)] = item;
+    });
+    // Retain up to 180 recent material events plus one observation per 3h
+    // for the previous fortnight, then daily observations for older periods.
+    return Object.keys(older).map(function(k){return older[k];})
+        .concat(Object.keys(medium).map(function(k){return medium[k];}))
+        .concat(recent.slice(-180))
+        .sort(function(a,b){return a.ts-b.ts;}).slice(-480);
+}
+
 async function updateCompanyChanges(c, employees) {
     if (!c || !c.id) { changesError = 'Company ID is unavailable; history cannot be saved.'; return; }
     var store = readChangeHistory(c.id);
     var now = lastLoadedAt || Date.now();
     var cutoff = now - 180 * 86400000;
-    store.snapshots = store.snapshots.filter(function (s) { return s && s.ts >= cutoff && Array.isArray(s.staff); });
-    // At most one saved baseline every 30 minutes. The latest live refresh is always
-    // shown separately, so a new baseline is not needed on every repeated refresh.
-    if (!store.snapshots.length || now - store.snapshots[store.snapshots.length - 1].ts >= 1800000) {
-        store.snapshots.push(reportSnapshot(c, employees, now));
+    store.snapshots = compactCompanySnapshots(store.snapshots, now);
+    var newest = store.snapshots[store.snapshots.length - 1];
+    var current = reportSnapshot(c, employees, now);
+    // Record staff/financial/effectiveness changes as soon as the next
+    // successful sync sees them. Keep a heartbeat baseline every 30 minutes
+    // when nothing changed. Repeated identical API responses are deduplicated.
+    if (!newest || snapshotFingerprint(newest) !== snapshotFingerprint(current) ||
+        now - newest.ts >= 1800000) {
+        store.snapshots.push(current);
+        store.snapshots = compactCompanySnapshots(store.snapshots, now);
     }
-    store.snapshots = store.snapshots.slice(-320);
     changesError = '';
     if (!store.lastNewsFetch || now - store.lastNewsFetch >= 15 * 60000) {
         try {
@@ -1365,7 +1401,7 @@ function changeReportText(report) {
     });
     if (!report.employeeChanges.length) lines.push('No comparison changes recorded.');
     lines.push('', 'Daily/weekly income are point-in-time Torn values, NOT summed earnings over the selected period.',
-        'Report assembled from Torn company news and browser-local snapshots.');
+        'Report assembled from Torn company news and automatically collected browser-local snapshots. Missing past observations cannot be recreated.');
     return lines.join('\n');
 }
 
@@ -1587,7 +1623,7 @@ function changesPage() {
 
     if (!report) {
         return html + '<div class="changes-empty"><h4>No company history yet</h4>' +
-            '<p>Press Refresh with an API key that can access your company. This browser will start recording your company changes from the first successful refresh.</p></div></section>';
+            '<p>Press Refresh with an API key that can access your company. Once auto-recording is enabled and your API key can access this company, the helper starts recording on your next company visit. Nothing needs to be refreshed manually.</p></div></section>';
     }
     var started = report.baseline ? changeDate(report.baseline.ts) : 'No earlier observation';
     html += '<div class="changes-coverage"><b>Last ' + report.days + ' day' + (report.days === 1 ? '' : 's') +
@@ -1664,7 +1700,7 @@ function changesPage() {
         if (report.employeeChanges.length > 80) html += '<div class="changes-overflow">Showing the first 80 employee changes. Copy report includes all.</div>';
     }
     html += '<p class="changes-footnote">Daily and weekly Torn income figures are rolling figures from each refresh; their difference is not the total profit over this period. ' +
-        'History is stored only in this browser, per company, for up to 180 days (up to 320 snapshots). ' +
+        'History is saved automatically in this browser, per company, for up to 180 days. Recent changes are recorded individually, and older samples are condensed. ' +
         'Dismissal reasons come from Torn news or private notes you enter. Copied reports include those notes, so review before sharing. Other devices do not share this history.</p></section>';
     return html;
 }
