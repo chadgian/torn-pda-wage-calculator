@@ -1524,7 +1524,7 @@ function render() {
         '<button data-page="guide"' + (page === 'guide' ? ' aria-current="page" class="selected"' : '') + '>How it works</button>' +
     '</div>';
 
-    html += '<div class="actionbar section-actionbar">' +
+    html += '<div class="actionbar section-actionbar ' + (page === 'wages' ? 'wages-actions' : '') + '">' +
         '<button class="primary" data-a="load"' + (busy ? ' disabled' : '') + '>' +
             (busy ? '<span class="spinner"></span> Refreshing' : '↻ Refresh data') + '</button>' +
         '<button data-a="key">API Key</button>' +
@@ -1717,7 +1717,7 @@ function staffingPlanEditor() {
 
 function settingsPage() {
     return '<section class="settings settings-page">' +
-        '<div class="page-heading"><div><small>Calculation setup</small><h3>Wage model & preferences</h3><p>Changes recalculate recommendations immediately. Nothing here submits changes to Torn.</p></div><button class="text-btn" data-a="reset-settings">Reset defaults</button></div>' +
+        '<div class="page-heading"><div><small>Calculation setup</small><h3>Wage settings & preferences</h3><p>Control how suggested daily pay is calculated. For staffing targets and job assignments, open Positions.</p></div><button class="text-btn" data-a="reset-settings">Reset defaults</button></div>' +
         '<div class="settings-group"><div class="settings-group-title"><b>Payment model</b><small>Choose how the suggested payroll is calculated.</small></div><div class="settings-grid">' +
             settingField('mode', 'Payment model', 'Current redistributes the included payroll. Fixed uses your chosen budget. Benchmark pays score × benchmark.', 'mode') +
             settingField('budget', 'Fixed daily payroll', 'Used only when Payment model is Fixed budget.') +
@@ -1733,17 +1733,14 @@ function settingsPage() {
             settingField('max', 'Maximum wage', 'Cap applied to every included employee.') +
             settingField('round', 'Round to', 'Use 100, 1,000, 10,000, etc. The allocator tries to preserve the chosen total.') +
         '</div></div>' +
-        '<div class="settings-group staffing-group"><div class="settings-group-title"><b>Position staffing plan</b><small>Position advice fills these role counts. Changing support-role totals can force risky moves even with protection enabled.</small></div>' +
-            staffingPlanEditor() +
-        '</div>' +
         '<div class="settings-group"><div class="settings-group-title"><b>Helper behavior</b><small>Optional conveniences and recommendations.</small></div><div class="toggles">' +
             toggle('director', 'Include director', 'Include the director in wage distribution.') +
             toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
-            toggle('positionAdvice', 'Staffing-aware position advice', 'Maximize combined stat fit within target role counts; this is not a profit forecast.') +
-            toggle('exploreNewRoles', 'Explore additional company roles', 'Consider currently unstaffed roles, alternative staffing mixes, and hiring capacity. Review every scenario before changing Torn positions.') +
-            toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Preserve current Managers, Marketers, Trainers, Cleaners, and Secretaries when matching slots remain. Disable only to explore speculative swaps.') +
             toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
         '</div></div>' +
+        '<div class="settings-group settings-route"><div><b>Looking for staffing and position settings?</b>' +
+        '<p>Role protection, additional role recommendations, and staffing targets are together in the Positions section.</p></div>' +
+        '<button data-page="positions">Open Positions →</button></div>' +
     '</section>';
 }
 
@@ -1757,7 +1754,11 @@ function calculationGuidePage() {
     var modeName = cfg.mode === 'fixed' ? 'Fixed budget' : cfg.mode === 'benchmark' ? 'Benchmark × score' : 'Keep included payroll';
 
     return '<section class="guide-page">' +
-        '<div class="page-heading"><div><small>Calculation guide</small><h3>How the recommendations are calculated</h3><p>This page follows the same calculation path as the script. Samples are illustrative and do not change your company data.</p></div></div>' +
+        '<div class="page-heading"><div><small>Help center</small><h3>How it works</h3><p>Find what each section does, then explore the calculations and limitations behind its recommendations.</p></div></div>' +
+        '<div class="guide-shortcuts" aria-label="Jump to a section">' +
+        '<button data-page="dashboard">Dashboard</button><button data-page="wages">Wages</button>' +
+        '<button data-page="positions">Positions</button><button data-page="statistics">Statistics</button>' +
+        '<button data-page="changes">Changes</button></div>' +
         '<div class="guide-settings">' +
             '<div><small>Current mode</small><b>' + esc(modeName) + '</b></div>' +
             '<div><small>Target effectiveness</small><b>' + fmt(cfg.target) + '</b></div>' +
@@ -1782,6 +1783,7 @@ function calculationGuidePage() {
             guideCard('13', 'Discovering unstaffed roles', 'If Explore additional company roles is enabled, the Overview looks at every position in the Torn company-type catalog, including roles that currently have zero employees or zero target slots. It skips another position with an already staffed special ability and examines what the new role could provide. Manager, Marketer, Cleaner, Trainer, and Secretary benefits are described using their catalog ability; other jobs are evaluated only for modeled work-stat fit.', 'Only consider unstaffed catalog positions; never assume an unreported company-wide bonus', 'If you currently have Cashiers and a Manager but no Trainer, the helper may suggest considering a Trainer for additional company trains, even though no Trainer exists in your current staffing plan.') +
             guideCard('14', 'Comparing an alternate staffing mix', 'For a possible new role, the helper examines reallocating one existing non-support position slot. It preserves all currently employed support-role incumbents, optimizes the remaining employee-to-position assignments, and compares combined predicted work-stat fit with the current planning scenario. A decrease can be acceptable as a trade-off to investigate for support roles; an increase does not prove extra revenue. No sales or bonus estimates are invented.', 'Modeled stat-fit difference = simulated team fit − current-plan team fit; support benefits are excluded', 'Changing a target from 3 Cashiers + 1 Manager to 2 Cashiers + 1 Manager + 1 Trainer may lower the predicted stat-fit sum, but provides a possible new training benefit that must be verified in Torn.') +
             guideCard('15', 'Hiring, applying, and limitations', 'If company capacity exceeds occupied slots, the helper identifies a separate hiring path. It does not invent a candidate employee or predict their effectiveness, wage, or income. The Use as staffing target button saves only a valid one-slot reallocation in this helper and opens Settings for review; it does not hire, dismiss, change positions, or submit anything in Torn. Recommendations are exploratory and require the director to compare actual results.', 'Valid reallocation: total role targets = current non-director staff; hiring is not scored without candidate stats', 'If there is 1 vacant employee slot, the helper may identify a Marketer as an available hiring option. You must hire and assign that employee in Torn yourself, then refresh to recalculate.') +
+            guideCard('16', 'Finding your way around', 'The Dashboard shows concise summaries and opens dedicated sections. Wages contains pay suggestions and exports. Positions contains role recommendations, support-role safeguards, exploratory role options, and staffing targets. Company Statistics displays current income, customers, company condition, resources, and available historical comparisons. Changes records events and performance differences. Settings controls wage calculations and general behavior.', 'Dashboard → choose a section → review details → return using the top navigation', 'To decide whether to introduce a Trainer, open Positions. To see income figures, open Statistics. To compare activity across days, open Changes. To export suggested daily pay, open Wages.') +
         '</div>' +
         '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. New-role suggestions are possibilities for director review, not demonstrated profit improvements. Salary, work-stat fit, and support-role contributions must be evaluated separately. Nothing hires staff or submits role or wage changes to Torn automatically.</div>' +
     '</section>';
