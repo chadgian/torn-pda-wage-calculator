@@ -1,10 +1,11 @@
-name: Test company change tracker
+name: Test Torn Company Helper
 
 on:
   pull_request:
     paths:
       - 'torn-company-helper.user.js'
       - 'tests/company-changes.test.js'
+      - 'tests/support-role-optimizer.test.js'
       - '.github/workflows/test-company-changes.yml'
   push:
     branches:
@@ -12,6 +13,7 @@ on:
     paths:
       - 'torn-company-helper.user.js'
       - 'tests/company-changes.test.js'
+      - 'tests/support-role-optimizer.test.js'
       - '.github/workflows/test-company-changes.yml'
 
 permissions:
@@ -28,4 +30,4 @@ jobs:
       - name: Check userscript syntax
         run: node --check torn-company-helper.user.js
       - name: Run company changes unit tests
-        run: node --test tests/company-changes.test.js
+        run: node --test tests/*.test.js
