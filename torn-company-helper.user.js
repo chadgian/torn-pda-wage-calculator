@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.5.0
+// @version      2.5.1
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.5.0';
+var VERSION = '2.5.1';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -42,6 +42,7 @@ var defaults = {
     director: true,
     fill: false,
     positionAdvice: true,
+    protectSupportRoles: true,
     autoRefresh: true
 };
 
@@ -401,6 +402,51 @@ function individualBestPosition(employee) {
 
 var POSITION_STABILITY_BONUS = 2;
 
+// Many Torn positions provide bonuses outside their own work-stat fit.
+// The official company catalog normally prefixes descriptions with their role
+// family (e.g. "Manager.", "Marketer.", "Trainer."). Check that BEFORE names:
+// "Marketing Manager" can be a Marketer rather than a Manager.
+function supportRoleKind(position) {
+    if (!position) return '';
+    var description = String(position.description || '').trim();
+    var prefix = description.match(/^(manager|marketer|trainer|cleaner|secretary)\s*[:.\-]/i);
+    if (prefix) return prefix[1].toLowerCase();
+    var name = String(position.name || '').trim();
+    if (/\b(?:marketer|marketing\s+manager|marketing\s+officer)\b/i.test(name)) return 'marketer';
+    if (/\b(?:trainer|hr\s+officer)\b/i.test(name)) return 'trainer';
+    if (/\b(?:manager|supervisor)\b/i.test(name)) return 'manager';
+    if (/\b(?:cleaner|janitor)\b/i.test(name)) return 'cleaner';
+    if (/\b(?:secretary|receptionist|bookkeeper)\b/i.test(name)) return 'secretary';
+    return '';
+}
+
+// This is an observed contribution read from Torn; it is NOT a forecast of
+// the bonus after moving either Manager or their colleagues.
+function supportRoleSnapshot() {
+    var counts = {};
+    var managementTotal = 0;
+    var managementRecipients = 0;
+    var managementReported = 0;
+    staff.forEach(function (employee) {
+        if (employee.director) return;
+        var kind = supportRoleKind(currentPosition(employee)) ||
+            supportRoleKind({ name: employee.position });
+        if (kind) counts[kind] = (counts[kind] || 0) + 1;
+        var value = employee.effectiveness && employee.effectiveness.management;
+        if (value == null) return;
+        managementReported++;
+        if (num(value) > 0) {
+            managementTotal += num(value);
+            managementRecipients++;
+        }
+    });
+    return {
+        counts: counts, managementTotal: managementTotal,
+        managementRecipients: managementRecipients,
+        managementReported: managementReported
+    };
+}
+
 function positionKey(position) {
     if (!position) return '';
     return String(position.id || position.name || '');
@@ -553,6 +599,7 @@ function companyPositionAssignment() {
     var employees = staff.filter(function (x) { return !x.director; });
     var plan = staffingPlanInfo();
     var slots = [];
+    var support = supportRoleSnapshot();
 
     positions.forEach(function (p) {
         var count = Math.max(0, Math.round(num(plan.effective[positionKey(p)])));
@@ -560,26 +607,78 @@ function companyPositionAssignment() {
     });
 
     if (!employees.length || !positions.length || slots.length !== employees.length) {
-        return { byEmployee:{}, plan:plan, currentFit:0, suggestedFit:0 };
+        return { byEmployee:{}, plan:plan, currentFit:0, suggestedFit:0,
+            support:support, protectedCount:0, supportRisks:[] };
     }
 
-    var matrix = employees.map(function (employee) {
-        return slots.map(function (position) {
-            return positionFit(employee, position) + (samePosition(employee, position) ? POSITION_STABILITY_BONUS : 0);
+    // Pre-assign existing support-role incumbents to their actual role slots.
+    // This preserves *who* is Manager, Marketer, Trainer, Cleaner, etc., not
+    // merely the number of such employees. A stat-fit-only optimizer cannot
+    // estimate their company-wide effects or revenue consequences.
+    var locked = {};
+    var reserved = {};
+    var protectedCount = 0;
+    if (cfg.protectSupportRoles !== false) {
+        employees.forEach(function (employee, index) {
+            var current = currentPosition(employee);
+            if (!supportRoleKind(current)) return;
+            for (var i = 0; i < slots.length; i++) {
+                if (!reserved[i] && positionKey(slots[i]) === positionKey(current)) {
+                    locked[index] = i;
+                    reserved[i] = true;
+                    protectedCount++;
+                    return;
+                }
+            }
+        });
+    }
+
+    // Optimization runs only on remaining employees and unreserved slots,
+    // so protected support assignments can never be displaced by a better
+    // individual Cashier (or other production-role) fit.
+    var movable = [];
+    var available = [];
+    employees.forEach(function (_, index) {
+        if (!Object.prototype.hasOwnProperty.call(locked, index)) movable.push(index);
+    });
+    slots.forEach(function (_, index) { if (!reserved[index]) available.push(index); });
+    var matrix = movable.map(function (employeeIndex) {
+        var employee = employees[employeeIndex];
+        return available.map(function (slotIndex) {
+            var position = slots[slotIndex];
+            return positionFit(employee, position) +
+                (samePosition(employee, position) ? POSITION_STABILITY_BONUS : 0);
         });
     });
-
     var assignedCols = maxWeightAssignment(matrix);
+    var selected = {};
+    Object.keys(locked).forEach(function (index) { selected[index] = locked[index]; });
+    movable.forEach(function (employeeIndex, rowIndex) {
+        var col = assignedCols[rowIndex];
+        if (col >= 0 && col < available.length) selected[employeeIndex] = available[col];
+    });
+
     var byEmployee = {};
     var currentFit = 0;
     var suggestedFit = 0;
+    var supportRisks = [];
 
     employees.forEach(function (employee, index) {
         var current = currentPosition(employee);
         var pure = individualBestPosition(employee);
-        var slot = assignedCols[index] >= 0 ? slots[assignedCols[index]] : (current || (pure && pure.position));
+        var slotIndex = selected[index];
+        var slot = slotIndex == null ? (current || (pure && pure.position)) : slots[slotIndex];
         var slotFit = slot ? positionFit(employee, slot) : 0;
         var currentPredicted = current ? positionFit(employee, current) : 0;
+        var isProtected = Object.prototype.hasOwnProperty.call(locked, index);
+        var risk = '';
+        if (positionKey(slot) !== positionKey(current) &&
+            (supportRoleKind(current) || supportRoleKind(slot))) {
+            risk = 'Support-role change: the combined team-wide effect and income are unknown.';
+            supportRisks.push({ id: employee.id, name: employee.name,
+                from: current ? current.name : employee.position,
+                to: slot ? slot.name : 'Unassigned' });
+        }
 
         currentFit += currentPredicted;
         suggestedFit += slotFit;
@@ -591,7 +690,9 @@ function companyPositionAssignment() {
             statBestFit: pure ? pure.fit : 0,
             targetCount: slot ? num(plan.effective[positionKey(slot)]) : 0,
             currentCount: slot ? num(plan.current[positionKey(slot)]) : 0,
-            currentPredictedFit: currentPredicted
+            currentPredictedFit: currentPredicted,
+            supportProtected: isProtected,
+            supportRisk: risk
         };
     });
 
@@ -599,7 +700,10 @@ function companyPositionAssignment() {
         byEmployee: byEmployee,
         plan: plan,
         currentFit: currentFit,
-        suggestedFit: suggestedFit
+        suggestedFit: suggestedFit,
+        support: support,
+        protectedCount: protectedCount,
+        supportRisks: supportRisks
     };
 }
 
