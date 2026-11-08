@@ -41,7 +41,9 @@ function makeHarness(newsProvider = async () => ({ news: [] })) {
         'var company=null, staff=[], lastLoadedAt=0, changeRange="7", changesError="";',
         moduleCode,
         'return { newsEventType, reportedFiringReason, updateCompanyChanges, changeReport,',
-        ' changeReportText, readChangeHistory, setState(c,s,t,r) { company=c; staff=s;',
+        ' changeReportText, readChangeHistory, setReason(companyId, eventId, reason) {',
+        ' var h = readChangeHistory(companyId); h.reasons[eventId] = reason;',
+        ' put(changeStorageKey(companyId), h); }, setState(c,s,t,r) { company=c; staff=s;',
         ' lastLoadedAt=t; changeRange=r || "7"; } };'
     ].join('\n'));
     return factory(utils);
@@ -100,6 +102,10 @@ test('tracks income and effectiveness and does not duplicate official joins', as
     assert.ok(report.employeeChanges.some((e) => e.name === 'Ada' && e.type === 'Effectiveness'));
     assert.equal(report.events.filter((e) => e.type === 'joined').length, 1);
     assert.ok(report.events.some((e) => e.type === 'fired' && e.reason === 'repeated inactivity'));
+    h.setReason(100, 'fire:3', 'Director-confirmed inactivity');
+    const updated = h.changeReport();
+    assert.ok(updated.events.some((e) => e.type === 'fired' && e.reason === 'Director-confirmed inactivity'));
+    assert.match(h.changeReportText(updated), /Director-confirmed inactivity \[Director note\]/);
     assert.match(h.changeReportText(report), /NOT summed earnings/);
 });
 
