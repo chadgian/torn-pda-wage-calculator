@@ -67,6 +67,15 @@ var pendingId = '';
 var pendingUntil = 0;
 var changeRange = String(get('changeRange', '7'));
 var changesError = '';
+// Auto-recording only runs on a visible "Your company" view with a valid key.
+var AUTO_SYNC_INTERVAL = 5 * 60000;
+var AUTO_SYNC_VISIT_GAP = 90000;
+var AUTO_SYNC_CHANGE_GAP = 45000;
+var AUTO_SYNC_FAILURE_BACKOFF = 5 * 60000;
+var AUTO_SYNC_LEASE_MS = 90000;
+var autoSyncTimer = 0;
+var autoSyncOwner = String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+var autoSyncRoute = '';
 
 function isOwnCompanyView() {
     try { return new URLSearchParams(location.search).get('step') === 'your'; }
@@ -2375,6 +2384,161 @@ function bind(result) {
     if (csv && result) csv.onclick = function () { exportCsv(result.rows); };
 }
 
+
+function autoSyncIsAllowed() {
+    return cfg.autoRefresh !== false && !!apiKey() && isOwnCompanyView() &&
+        document.visibilityState !== 'hidden';
+}
+
+function autoSyncLog() {
+    var state = get('autoSyncState', {});
+    return state && typeof state === 'object' && !Array.isArray(state) ? state : {};
+}
+
+function autoSyncStatusText() {
+    if (cfg.autoRefresh === false) return 'Auto-recording is off. Enable it in Settings.';
+    if (!apiKey()) return 'Auto-recording needs a Torn API key.';
+    var log = autoSyncLog();
+    if (log.lastError && log.lastAttempt &&
+        Date.now() - log.lastAttempt < AUTO_SYNC_FAILURE_BACKOFF) {
+        return 'Automatic recording could not refresh; retrying later. Manual Refresh is available.';
+    }
+    return 'Auto-recording is on' +
+        (lastLoadedAt ? ' · Last saved ' + nowText(lastLoadedAt) : ' · Waiting for your first company visit') +
+        '. It works while this company page is open and visible.';
+}
+
+function renderAutoSyncIfVisible() {
+    if (!S || !S.querySelector) return;
+    var overlay = S.querySelector('#overlay');
+    if (!overlay || !overlay.classList.contains('show')) return;
+    // Do not discard edits in progress during an automatic refresh.
+    var focused = S.activeElement;
+    if (focused && /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName || '')) return;
+    render();
+}
+
+function scheduleAutoCompanySync(reason, delayMs) {
+    clearTimeout(autoSyncTimer);
+    autoSyncTimer = setTimeout(function () {
+        autoSyncTimer = 0;
+        runAutoCompanySync(reason || 'periodic');
+    }, Math.max(0, Number(delayMs) || 0));
+}
+
+async function runAutoCompanySync(reason) {
+    if (!autoSyncIsAllowed() || busy) return false;
+    var now = Date.now();
+    var log = autoSyncLog();
+    var gap = reason === 'company-action' ? AUTO_SYNC_CHANGE_GAP :
+        reason === 'periodic' ? AUTO_SYNC_INTERVAL : AUTO_SYNC_VISIT_GAP;
+    var companyId = company && company.id || '';
+    var sameCompany = !log.companyId || !companyId || String(log.companyId) === String(companyId);
+    if (sameCompany && now - Number(log.lastAttempt || 0) < gap) return false;
+    if (sameCompany && log.lastError &&
+        now - Number(log.lastAttempt || 0) < AUTO_SYNC_FAILURE_BACKOFF) return false;
+
+    // Soft cross-tab lease to avoid duplicate API requests.
+    var lease = get('autoSyncLease', {});
+    if (lease && lease.owner !== autoSyncOwner && num(lease.expires) > now) return false;
+    put('autoSyncLease', { owner:autoSyncOwner, expires:now + AUTO_SYNC_LEASE_MS });
+    var verified = get('autoSyncLease', {});
+    if (!verified || verified.owner !== autoSyncOwner) return false;
+
+    put('autoSyncState', {
+        lastAttempt:now, lastSuccess:num(log.lastSuccess), companyId:companyId,
+        reason:reason, lastError:''
+    });
+    busy = true;
+    renderAutoSyncIfVisible();
+    try {
+        await fetchAll();
+        put('autoSyncState', {
+            lastAttempt:now, lastSuccess:Date.now(),
+            companyId:company && company.id || companyId,
+            reason:reason, lastError:''
+        });
+        return true;
+    } catch (err) {
+        put('autoSyncState', {
+            lastAttempt:now, lastSuccess:num(log.lastSuccess),
+            companyId:companyId, reason:reason,
+            lastError:String(err && err.message || 'Unable to refresh').slice(0, 140)
+        });
+        return false;
+    } finally {
+        busy = false;
+        var ownedLease = get('autoSyncLease', {});
+        if (ownedLease && ownedLease.owner === autoSyncOwner) remove('autoSyncLease');
+        renderAutoSyncIfVisible();
+    }
+}
+
+function observeAutoCompanyRoute() {
+    var route = location.pathname + location.search;
+    if (autoSyncRoute === route) return;
+    autoSyncRoute = route;
+    if (!isOwnCompanyView()) {
+        clearTimeout(autoSyncTimer);
+        autoSyncTimer = 0;
+        return;
+    }
+    scheduleAutoCompanySync('company-visit', 700);
+}
+
+function companyActionElement(target) {
+    if (!target || target.nodeType !== 1 || !isOwnCompanyView()) return null;
+    if ((host && host.contains(target)) || (launcher && launcher.contains(target))) return null;
+    var action = target.closest && target.closest('button,input[type="submit"],[role="button"],a');
+    if (!action || action.disabled) return null;
+    var label = String(action.textContent || action.value || action.getAttribute('aria-label') || '')
+        .replace(/\s+/g, ' ').trim().slice(0, 120);
+    return /\b(save|update|apply|hire|fire|dismiss|assign|promote|demote|train|advertis(?:e|ing|ement)?|upgrade|change|confirm|submit|purchase|buy)\b/i.test(label) ?
+        action : null;
+}
+
+function installAutoCompanyRecording() {
+    observeAutoCompanyRoute();
+
+    // Wait briefly after Torn interactions, then read the actual API state;
+    // a click is never treated as proof that a change succeeded.
+    document.addEventListener('click', function (event) {
+        if (autoSyncIsAllowed() && companyActionElement(event.target))
+            scheduleAutoCompanySync('company-action', 4500);
+    }, true);
+    document.addEventListener('submit', function (event) {
+        var form = event.target;
+        if (autoSyncIsAllowed() && form && !(host && host.contains(form)))
+            scheduleAutoCompanySync('company-action', 4500);
+    }, true);
+    document.addEventListener('change', function (event) {
+        var element = event.target;
+        if (!autoSyncIsAllowed() || !element || (host && host.contains(element))) return;
+        if (element.matches && element.matches('select,input[type="number"],input[type="checkbox"]'))
+            scheduleAutoCompanySync('company-action', 6000);
+    }, true);
+
+    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible' && isOwnCompanyView())
+            scheduleAutoCompanySync('return-to-company', 800);
+    });
+    window.addEventListener('focus', function () {
+        if (isOwnCompanyView()) scheduleAutoCompanySync('return-to-company', 1200);
+    });
+    window.addEventListener('popstate', observeAutoCompanyRoute);
+    window.addEventListener('hashchange', observeAutoCompanyRoute);
+    setInterval(function () {
+        observeAutoCompanyRoute();
+        if (autoSyncIsAllowed()) scheduleAutoCompanySync('periodic', 100);
+    }, AUTO_SYNC_INTERVAL);
+
+    // Share refreshed cached company data across tabs without another request.
+    window.addEventListener('storage', function (event) {
+        if (event.key === PFX + 'cache' && !busy && restoreCache())
+            renderAutoSyncIfVisible();
+    });
+}
+
 async function load() {
     if (busy) return;
     busy = true;
@@ -2396,7 +2560,7 @@ function openPanel() {
     if (typeof refreshLauncherVisibility === 'function') refreshLauncherVisibility();
     if (!ui.page) ui.page = 'dashboard';
     render();
-    if (cfg.autoRefresh && apiKey() && (!lastLoadedAt || Date.now() - lastLoadedAt > FRESH_AGE) && !busy) load();
+    if (autoSyncIsAllowed()) scheduleAutoCompanySync('panel-open', 300);
 }
 
 function closePanel() {
@@ -2436,6 +2600,7 @@ function saveKey() {
     errorState = null;
     toast('API key saved for ' + (remember.checked ? 'this device.' : 'this session.'), true);
     render();
+    if (isOwnCompanyView() && cfg.autoRefresh) scheduleAutoCompanySync('company-visit', 300);
 }
 
 function clearKey() {
@@ -2900,6 +3065,7 @@ setInterval(refreshLauncherVisibility, 1200);
 
 dragButton(launcher);
 restoreCache();
+installAutoCompanyRecording();
 
 // Torn can replace large portions of the company page without a full reload.
 // Keep both the panel host and the launcher mounted at the document root.
@@ -2907,6 +3073,7 @@ var launcherSurvivalObserver = new MutationObserver(function () {
     if (!host.isConnected) document.documentElement.appendChild(host);
     if (!launcher.isConnected) document.documentElement.appendChild(launcher);
     scheduleLauncherVisibility();
+    observeAutoCompanyRoute();
 });
 launcherSurvivalObserver.observe(document.documentElement, { childList:true, subtree:true, attributes:true, attributeFilter:['class','style','aria-hidden'] });
 window.addEventListener('resize', scheduleLauncherVisibility);
