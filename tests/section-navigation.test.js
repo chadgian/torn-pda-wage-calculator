@@ -32,6 +32,7 @@ function rendered(page) {
         'var nowText=function(){return "recently";},esc=function(x){return String(x);};',
         'var fmt=function(x){return String(x);},logoMark=function(){return "";};',
         'var calculate=function(){return ctx.result;},displayRows=function(x){return x.rows;};',
+        'var apiKey=function(){return "demo";},autoSyncStatusText=function(){return "Auto-recording on";};',
         'var pageTab=function(key,label){return \'<button data-page="\'+key+\'">\'+label+\'</button>\';};',
         'var changesPage=function(){return \'<section id="changes-content"></section>\';};',
         'var settingsPage=function(){return \'<section id="settings-content"></section>\';};',
