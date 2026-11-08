@@ -9,7 +9,8 @@ on:
       - '.github/workflows/test-company-changes.yml'
   push:
     branches:
-      - 'feature/company-change-history'
+      - 'feature/**'
+      - 'fix/**'
     paths:
       - 'torn-company-helper.user.js'
       - 'tests/company-changes.test.js'
@@ -29,5 +30,5 @@ jobs:
           node-version: '22'
       - name: Check userscript syntax
         run: node --check torn-company-helper.user.js
-      - name: Run company changes unit tests
+      - name: Run Torn Company Helper unit tests
         run: node --test tests/*.test.js
