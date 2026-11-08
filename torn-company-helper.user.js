@@ -1131,6 +1131,13 @@ function readChangeHistory(id) {
 }
 
 function reportSnapshot(c, employees, timestamp) {
+    var employeesOnly = employees.filter(function (e) { return !e.director; });
+    var withStats = employeesOnly.filter(function (e) {
+        return e.effectiveness && e.effectiveness.working_stats != null;
+    });
+    var withManagement = employeesOnly.filter(function (e) {
+        return e.effectiveness && e.effectiveness.management != null;
+    });
     return {
         ts: timestamp || Date.now(),
         company: {
@@ -1139,9 +1146,17 @@ function reportSnapshot(c, employees, timestamp) {
             efficiency: c.efficiency, popularity: c.popularity, environment: c.environment,
             funds: c.funds, trains: c.trains, advertisementBudget: c.advertisementBudget,
             value: c.value, rating: c.rating, employeeCount: c.employeeCount,
+            employeeCapacity: c.capacity,
             payroll: sum(employees, function (e) { return e.wage; }),
-            avgEffectiveness: avg(employees.filter(function (e) { return !e.director; }),
-                function (e) { return e.effectiveness && e.effectiveness.total; })
+            avgEffectiveness: employeesOnly.length ? avg(employeesOnly, function (e) {
+                return e.effectiveness && e.effectiveness.total;
+            }) : null,
+            avgWorkingStatEffectiveness: withStats.length ? avg(withStats, function (e) {
+                return e.effectiveness.working_stats;
+            }) : null,
+            managementBonusPoints: withManagement.length ? sum(withManagement, function (e) {
+                return e.effectiveness.management;
+            }) : null
         },
         staff: employees.map(function (e) {
             return { id: String(e.id), name: e.name, position: e.position,
@@ -1266,6 +1281,9 @@ function metricDefinitions() {
         { key: 'environment', label: 'Environment', kind: 'points' },
         { key: 'payroll', label: 'Daily wage payroll', kind: 'money' },
         { key: 'employeeCount', label: 'Employee count', kind: 'number' },
+        { key: 'employeeCapacity', label: 'Employee capacity', kind: 'number' },
+        { key: 'avgWorkingStatEffectiveness', label: 'Avg. work-stat effectiveness', kind: 'points' },
+        { key: 'managementBonusPoints', label: 'Reported Management bonus total', kind: 'number' },
         { key: 'funds', label: 'Company funds', kind: 'money' },
         { key: 'rating', label: 'Star rating', kind: 'number' },
         { key: 'advertisementBudget', label: 'Advertising budget', kind: 'money' },
@@ -1595,7 +1613,7 @@ function render() {
             (busy ? 'Loading company information' : 'Welcome to your company dashboard') +
             '</h3><p>' + (busy ?
                 'Fetching the latest company data. Your sections will appear here when the refresh is complete.' :
-                'Refresh to view wages, positions, company statistics, and important changes in separate, easy-to-read sections.') +
+                'The helper records performance automatically when you visit your own company with an API key. Open Wages, Positions, Statistics, or Changes to review the information.') +
             '</p><div><button class="primary" data-a="load"' + (busy ? ' disabled' : '') +
             '>Refresh company data</button><button data-a="key">Set API Key</button></div></section>';
     } else if (page === 'wages') {
@@ -1781,7 +1799,7 @@ function settingsPage() {
         '<div class="settings-group"><div class="settings-group-title"><b>Helper behavior</b><small>Optional conveniences and recommendations.</small></div><div class="toggles">' +
             toggle('director', 'Include director', 'Include the director in wage distribution.') +
             toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
-            toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
+            toggle('autoRefresh', 'Auto-refresh and record company visits (recommended)', 'Automatically save performance when visiting your company, making management changes, or returning to the tab. Checks every 5 minutes while visible; API key required.') +
         '</div></div>' +
         '<div class="settings-group settings-route"><div><b>Looking for staffing and position settings?</b>' +
         '<p>Role protection, additional role recommendations, and staffing targets are together in the Positions section.</p></div>' +
@@ -1829,6 +1847,7 @@ function calculationGuidePage() {
             guideCard('14', 'Comparing an alternate staffing mix', 'For a possible new role, the helper examines reallocating one existing non-support position slot. It preserves all currently employed support-role incumbents, optimizes the remaining employee-to-position assignments, and compares combined predicted work-stat fit with the current planning scenario. A decrease can be acceptable as a trade-off to investigate for support roles; an increase does not prove extra revenue. No sales or bonus estimates are invented.', 'Modeled stat-fit difference = simulated team fit − current-plan team fit; support benefits are excluded', 'Changing a target from 3 Cashiers + 1 Manager to 2 Cashiers + 1 Manager + 1 Trainer may lower the predicted stat-fit sum, but provides a possible new training benefit that must be verified in Torn.') +
             guideCard('15', 'Hiring, applying, and limitations', 'If company capacity exceeds occupied slots, the helper identifies a separate hiring path. It does not invent a candidate employee or predict their effectiveness, wage, or income. The Use as staffing target button saves only a valid one-slot reallocation in this helper and opens Settings for review; it does not hire, dismiss, change positions, or submit anything in Torn. Recommendations are exploratory and require the director to compare actual results.', 'Valid reallocation: total role targets = current non-director staff; hiring is not scored without candidate stats', 'If there is 1 vacant employee slot, the helper may identify a Marketer as an available hiring option. You must hire and assign that employee in Torn yourself, then refresh to recalculate.') +
             guideCard('16', 'Finding your way around', 'The Dashboard shows concise summaries and opens dedicated sections. Wages contains pay suggestions and exports. Positions contains role recommendations, support-role safeguards, exploratory role options, and staffing targets. Company Statistics displays current income, customers, company condition, resources, and available historical comparisons. Changes records events and performance differences. Settings controls wage calculations and general behavior.', 'Dashboard → choose a section → review details → return using the top navigation', 'To decide whether to introduce a Trainer, open Positions. To see income figures, open Statistics. To compare activity across days, open Changes. To export suggested daily pay, open Wages.') +
+            guideCard('17', 'Automatic company refresh and data recording', 'With Auto-refresh and record enabled, the helper checks your company as soon as you visit your own company page, after relevant management interactions, when you return to the tab, and periodically while the company page is open. It works even when the helper panel is closed. It uses a 45-second minimum gap for recent actions, 90 seconds for visits, a 5-minute regular interval, temporary cross-tab coordination, and a 5-minute retry delay after failures. Hidden tabs, missing API keys, or disabled settings pause automatic requests. Repeated identical company data is not saved again; changed figures and employees are recorded on the next successful API sync, with older samples compacted into longer-term history.', 'Auto-refresh observes and records available data; it does not change Torn company settings', 'If you change a Cashier to another role, the helper checks again after a short delay. If Torn confirms a different roster or new metrics through its API, that information is saved without pressing Refresh. It cannot recover snapshots from earlier days when you did not visit the company.') +
         '</div>' +
         '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. New-role suggestions are possibilities for director review, not demonstrated profit improvements. Salary, work-stat fit, and support-role contributions must be evaluated separately. Nothing hires staff or submits role or wage changes to Torn automatically.</div>' +
     '</section>';
@@ -2116,7 +2135,8 @@ function statisticsPage(result) {
             '</div><div class="stats-deltas">';
         history.metrics.filter(function (m) {
             return ['dailyIncome','weeklyIncome','avgEffectiveness','employeeCount',
-                'efficiency','popularity','environment','payroll'].indexOf(m.key) >= 0;
+                'efficiency','popularity','environment','payroll',
+                'employeeCapacity','avgWorkingStatEffectiveness','managementBonusPoints'].indexOf(m.key) >= 0;
         }).forEach(function (m) {
             var change = m.kind === 'money' ? money(m.delta) : fmt(m.delta);
             html += '<div><small>' + esc(m.label) + '</small><strong>' +
@@ -2546,7 +2566,13 @@ async function load() {
     render();
     try {
         await fetchAll();
-        toast('Company data refreshed.', true);
+        var existingSync = autoSyncLog();
+        put('autoSyncState', {
+            lastAttempt:Date.now(), lastSuccess:Date.now(),
+            companyId:company && company.id || existingSync.companyId || '',
+            reason:'manual', lastError:''
+        });
+        toast('Company data refreshed and recorded.', true);
     } catch (e) {
         errorState = e;
     } finally {
