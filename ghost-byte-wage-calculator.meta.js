@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ghost Byte Wage Calculator
 // @namespace    wyn.torn.company.tools
-// @version      2.4.0
-// @description  Generic Torn company helper for wage planning, position-fit analysis, payroll balancing, export, and safe wage autofill.
+// @version      2.5.0
+// @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
 // @match        https://torn.com/companies.php*
