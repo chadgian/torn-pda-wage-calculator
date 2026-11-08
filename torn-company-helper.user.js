@@ -1605,8 +1605,8 @@ function calculationGuidePage() {
             guideCard('7', 'Minimum and maximum wages', 'For Current and Fixed modes, the target itself is constrained to a feasible range. The allocator starts each included employee at the minimum wage, distributes the remainder by score, caps employees that reach the maximum, and redistributes what remains.', 'Feasible target = clamp(Target, Minimum × Employees, Maximum × Employees)', 'For 5 included employees with a $100,000 minimum, the target cannot be lower than $500,000. A maximum wage can similarly cap the highest possible total.') +
             guideCard('8', 'Rounding and payroll balancing', 'Each raw wage is rounded to the Round to increment. In Current and Fixed modes, the helper then moves eligible wages up or down by one increment at a time to keep the final payroll as close as possible to the target.', 'Rounded wage = round(Raw wage ÷ Step) × Step', 'With Round to $10,000, $1,067,500 becomes $1,070,000. If this pushes the total payroll too high, another eligible recommendation can be reduced by $10,000.') +
             guideCard('9', 'Raise, cut, and change percentage', 'The employee list compares the suggested wage with the current wage. A positive difference is a raise; a negative difference is a cut.', 'Change = Suggested − Current; Change % = Change ÷ Current × 100', 'Current $1,000,000 and suggested $1,250,000 gives +$250,000, or +25%.') +
-            guideCard('10', 'Staffing-aware position assignment', 'The helper does not choose a position independently for every employee anymore. It creates the exact number of slots for each role from the Position staffing plan, then finds the company-wide employee-to-slot assignment with the highest combined stat fit. Staying in the current role receives a small 2-point stability bonus to avoid unnecessary reshuffling.', 'Maximize total(PositionFit + 2 when employee stays in current role), subject to exact target slots per position', 'If the plan requires 2 Cashiers, 1 Technician, 1 Admin, and 1 Cleaner, exactly those slots must be filled. Even if three employees individually score highest as Cleaner, only one Cleaner slot exists.') +
-            guideCard('11', 'Custom staffing targets', 'Settings lets the director choose how many employees the company should have in each position. Target counts must add up to the number of non-director employees. If they do not match, the helper safely falls back to the current position counts until the plan is valid.', 'Sum of target position slots = non-director employees', 'For 10 non-director employees, a valid plan could be 3 Cashiers + 2 Technicians + 1 Admin + 1 Cleaner + 3 employees in other roles = 10 slots.') +
+            guideCard('10', 'Staffing-aware position assignment', 'The helper fills target slots using combined predicted work-stat fit and a 2-point staying bonus. With support-role protection enabled (the default), existing Managers, Marketers, Trainers, Cleaners, and Secretaries are kept in their current slots first. Stat fit alone does not measure their benefits to the rest of the company.', 'Reserve existing support-role incumbents when slots exist; then maximize remaining PositionFit + 2 when staying', 'If the plan requires 2 Cashiers, 1 Technician, 1 Admin, and 1 Cleaner, exactly those slots must be filled. Even if a Manager is individually better suited as Cashier, they remain Manager while their Manager slot is available. Removing that slot requires manual review.') +
+            guideCard('11', 'Custom staffing targets', 'Settings lets the director choose how many employees the company should have in each position. Target counts must add up to the number of non-director employees. If they do not match, the helper falls back to current counts. Reducing support-role slots can force speculative assignments and is flagged for review.', 'Sum of target position slots = non-director employees', 'For 10 non-director employees, a valid plan could be 3 Cashiers + 2 Technicians + 1 Admin + 1 Cleaner + 3 employees in other roles = 10 slots.') +
             guideCard('12', 'Summary values', 'The Overview page averages included employees only. Budget variance is the final included payroll minus the target payroll. In Benchmark mode there is no fixed company target, so budget variance is shown as not applicable.', 'Budget variance = Suggested included payroll − Target payroll', 'If the target is $10,000,000 and rounded recommendations total $10,010,000, budget variance is +$10,000.') +
         '</div>' +
         '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. It never submits wage or position changes automatically.</div>' +
@@ -1617,6 +1617,43 @@ function guideCard(step, title, textValue, formula, sample) {
     return '<article class="guide-card"><div class="guide-card-head"><span>' + esc(step) + '</span><h4>' + esc(title) + '</h4></div><p>' + esc(textValue) + '</p>' +
         (formula ? '<div class="formula">' + esc(formula) + '</div>' : '') +
         '<div class="guide-sample"><b>Example</b><p>' + esc(sample) + '</p></div></article>';
+}
+
+
+function supportImpactHtml(result) {
+    var snapshot = result.support || supportRoleSnapshot();
+    var labels = { manager:'Managers', marketer:'Marketers', trainer:'Trainers',
+        cleaner:'Cleaners', secretary:'Secretaries' };
+    var kinds = Object.keys(labels).filter(function (kind) {
+        return num(snapshot.counts[kind]) > 0;
+    }).map(function (kind) {
+        return fmt(snapshot.counts[kind]) + ' ' + labels[kind];
+    });
+    var bonusText = snapshot.managementReported ?
+        'Observed Management bonuses: +' + fmt(snapshot.managementTotal) +
+        ' effectiveness points across ' + fmt(snapshot.managementRecipients) +
+        ' employee(s), as currently reported by Torn.' :
+        'Individual Management bonus components were not returned by Torn.';
+    var risks = result.supportRisks || [];
+    var html = '<section class="support-impact">' +
+        '<div class="support-impact-head"><div><small>Position safeguards</small>' +
+        '<h4>Support-role impact</h4></div><b class="' +
+        (cfg.protectSupportRoles ? 'positive' : 'negative') + '">' +
+        (cfg.protectSupportRoles ? 'Protected' : 'Unprotected') + '</b></div>' +
+        '<p>' + esc(kinds.length ? kinds.join(' · ') : 'No recognized current support-role occupants.') + '</p>' +
+        '<p>' + esc(bonusText) + ' These are observed values, NOT a forecast of the effects of swapping roles.</p>' +
+        '<p>' + (cfg.protectSupportRoles ?
+            fmt(result.protectedCount) + ' support-role incumbent(s) reserved in their current slots.' :
+            'Protection is disabled. Stat-fit advice may rearrange support roles.') + '</p>';
+    if (risks.length) {
+        html += '<div class="support-risk"><b>' + fmt(risks.length) +
+            ' support-role change(s) require director review.</b>' +
+            '<p>These moves have unknown company-wide effectiveness and income effects. Do not assume a better stat fit means higher profit.</p>' +
+            '<ul>' + risks.slice(0, 5).map(function (x) {
+                return '<li>' + esc(x.name + ': ' + x.from + ' → ' + x.to) + '</li>';
+            }).join('') + '</ul></div>';
+    }
+    return html + '</section>';
 }
 
 function overviewPage(result) {
@@ -1635,6 +1672,7 @@ function overviewPage(result) {
             summaryCard('Budget variance', cfg.mode === 'benchmark' ? '—' : money(result.budgetGap), cfg.mode === 'benchmark' ? 'Benchmark mode' : 'After limits and rounding', Math.abs(result.budgetGap) > num(cfg.round) ? 'warn' : 'good') +
         '</section>';
 
+    html += supportImpactHtml(result);
     if (!positions.length) {
         html += '<div class="notice"><b>Position-fit advice unavailable.</b> Wage calculations are active, but position recommendations are temporarily hidden.</div>';
     }
@@ -2217,6 +2255,7 @@ S.innerHTML = '<style>' +
 '</style>' +
 
 '<style>' +
+'.support-impact{margin:0 14px 14px;padding:12px;border-radius:11px;border:1px solid #37644d;background:#13281f}.support-impact-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}.support-impact-head small{display:block;font-size:9px;text-transform:uppercase;color:#9bd8b5;letter-spacing:.4px}.support-impact-head h4{margin:4px 0;font-size:13px}.support-impact-head>b{font-size:10px}.support-impact p{margin:6px 0 0;color:#bfd6ca;font-size:10px;line-height:1.5}.support-risk{margin-top:10px;padding:10px;border:1px solid #9e7230;border-radius:9px;background:#382b1b;color:#ffe3ac;font-size:10px}.support-risk p{color:#ffe3ac}.support-risk ul{margin:6px 0 0;padding-left:16px;line-height:1.5}.staffing-reason.caution{background:#382b1b;border-color:#9e7230}.staffing-reason.caution b{color:#ffe3ac}@media(max-width:700px){.support-impact{margin-left:10px;margin-right:10px}}' +
 '.changes-reason-editor{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 0}.changes-reason-editor input{flex:1 1 180px;min-width:0;padding:7px 9px;border:1px solid var(--border2);border-radius:7px;background:#10171b;color:var(--text);font-size:10px}.changes-reason-editor button{padding:7px 9px;border:1px solid #317c57;border-radius:7px;background:#1b4933;color:#c2f4da;font-size:10px;font-weight:850}.changes-page{padding:0 0 16px}.changes-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin:0 14px 12px}.changes-ranges{display:flex;flex-wrap:wrap;gap:5px}.changes-ranges button,.changes-copy{border:1px solid var(--border2);border-radius:8px;padding:8px 11px;background:var(--panel2);color:var(--text)!important;font-size:11px;font-weight:800}.changes-ranges button.selected{border-color:#2eaa76;background:#153e2b;color:#baf2d2!important}.changes-copy{background:var(--green2);border-color:#2eaa76}.changes-coverage{display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:0 14px 10px;padding:10px 12px;background:#13281f;border:1px solid #2e654b;border-radius:10px;font-size:11px}.changes-coverage b{color:#c2f4da}.changes-coverage span{font-size:10px;color:#afc6b9}.changes-notice{margin-top:8px}.changes-section-head{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:6px;margin:16px 14px 9px}.changes-section-head h4{margin:0;font-size:13px}.changes-section-head small{color:var(--muted);font-size:9px}.changes-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 14px}.changes-metric{min-width:0;padding:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px}.changes-metric small,.changes-metric strong,.changes-metric span{display:block}.changes-metric small{font-size:10px;color:var(--muted)}.changes-metric strong{margin-top:4px;font-size:17px;overflow-wrap:anywhere}.changes-metric span{margin-top:4px;font-size:10px;color:#b2bbc2}.changes-metric span.up{color:#8ff0bd}.changes-metric span.down{color:#ffb0b0}.changes-counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0 14px 10px}.changes-counts>div{padding:11px;background:#1c252b;border:1px solid var(--border);border-radius:9px;text-align:center}.changes-counts b,.changes-counts small{display:block}.changes-counts b{font-size:20px}.changes-counts small{color:var(--muted);font-size:10px}.changes-timeline,.changes-employee-list{margin:0 14px;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden}.changes-event{display:flex;gap:12px;padding:12px;border-bottom:1px solid var(--border);align-items:start}.changes-event:last-child,.changes-employee-row:last-child{border-bottom:none}.changes-event-tag{flex:0 0 86px;text-align:center;border:1px solid #5e6873;border-radius:5px;padding:5px 3px;color:#e0e5e9;font-size:9px;font-weight:850}.changes-event-tag.joined{color:#aaf1ce;border-color:#387b58;background:#133c2b}.changes-event-tag.fired{color:#ffc0bd;border-color:#8d4849;background:#432023}.changes-event-tag.left,.changes-event-tag.unconfirmed{color:#ffe2a0;border-color:#8d7138;background:#3e321d}.changes-event-content{min-width:0}.changes-event-content b{display:block;font-size:11px;line-height:1.5;font-weight:650;overflow-wrap:anywhere}.changes-event-content p{margin:5px 0;color:#ffccbd;font-size:10px}.changes-event-content small{display:block;margin-top:6px;color:var(--muted);font-size:9px}.changes-empty{margin:0 14px;padding:18px 12px;background:var(--panel);border:1px dashed var(--border2);border-radius:10px;color:var(--muted);font-size:11px;line-height:1.5}.changes-empty h4{margin:0 0 5px;color:var(--text);font-size:13px}.changes-empty p{margin:0}.changes-employee-row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);font-size:11px}.changes-employee-row>span{font-weight:800;min-width:0}.changes-employee-row small{display:block;margin-top:3px;color:var(--muted);font-size:9px}.changes-employee-row>b{font-size:10px;font-weight:650;text-align:right;overflow-wrap:anywhere}.changes-overflow{margin:6px 14px;font-size:10px;color:var(--amber)}.changes-footnote{margin:16px 14px 0;font-size:10px;color:var(--muted);line-height:1.6}@media(max-width:700px){.changes-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 9px}.changes-toolbar,.changes-timeline,.changes-employee-list,.changes-counts{margin-left:9px;margin-right:9px}.changes-counts{grid-template-columns:repeat(2,minmax(0,1fr))}.changes-coverage{margin-left:9px;margin-right:9px}.changes-section-head{margin-left:9px;margin-right:9px}.changes-event-tag{flex-basis:72px}.changes-event{gap:8px;padding:10px}.changes-metric strong{font-size:15px}.changes-footnote{margin:14px 9px}.page-tab{padding-left:4px;padding-right:4px}.page-tab-main{font-size:10px}.changes-employee-row{align-items:start;flex-direction:column;gap:5px}.changes-employee-row>b{text-align:left}}@media(max-width:380px){.changes-metrics{grid-template-columns:1fr}.page-tab-main{font-size:9px}}' +
 '</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
