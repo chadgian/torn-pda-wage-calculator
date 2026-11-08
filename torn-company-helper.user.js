@@ -724,6 +724,141 @@ function companyPositionAssignment(overrideTargets) {
     };
 }
 
+
+/*
+ * Role opportunities deliberately compare NEW role types, not just incumbents.
+ * We never infer company profit from individual stat-fit or assign an unknown
+ * future hire's stats. The director reviews possible staffing mixes manually.
+ */
+function potentialRoleBenefit(position) {
+    var kind = supportRoleKind(position);
+    var belowTarget = staff.filter(function (e) {
+        return !e.director && e.effectiveness && e.effectiveness.total != null &&
+            num(e.effectiveness.total) < 100;
+    }).length;
+    if (kind === 'manager') return {
+        reason: 'Managers can reduce lost effectiveness across underperforming employees.' +
+            (belowTarget ? ' ' + fmt(belowTarget) + ' current employee(s) report total effectiveness below 100.' : ''),
+        signal: belowTarget ? 50 : 28
+    };
+    if (kind === 'marketer') return {
+        reason: 'Marketers improve the effectiveness of company advertising.' +
+            (company && num(company.advertisementBudget) > 0 ?
+                ' Current advertising budget: ' + money(company.advertisementBudget) + '.' : ''),
+        signal: company && num(company.advertisementBudget) > 0 ? 48 : 28
+    };
+    if (kind === 'cleaner') return {
+        reason: 'Cleaners can support the company environment.' +
+            (company && company.environment != null ?
+                ' Last reported environment: ' + fmt(company.environment) + '.' : ''),
+        signal: company && company.environment != null && num(company.environment) < 100 ? 46 : 26
+    };
+    if (kind === 'trainer') return {
+        reason: 'Trainers generate additional company training opportunities based on their effectiveness.',
+        signal: 36
+    };
+    if (kind === 'secretary') return {
+        reason: 'Secretaries unlock detailed per-employee earnings data; this improves visibility, not guaranteed revenue.',
+        signal: 22
+    };
+    return {
+        reason: String(position.description || '').trim() ||
+            'A possible way to redistribute production work among existing employees.',
+        signal: 0
+    };
+}
+
+function suggestAdditionalRoles() {
+    if (!cfg.positionAdvice || cfg.exploreNewRoles === false ||
+        !company || !positions.length || !staff.length) return [];
+    var plan = staffingPlanInfo();
+    if (!plan.valid || plan.employeeTotal < 1) return [];
+    var targets = normalizedStaffingPlan(plan.effective);
+    var currentSolution = companyPositionAssignment();
+    if (!currentSolution || !Object.keys(currentSolution.byEmployee || {}).length) return [];
+    var openCapacity = num(company.capacity) > 0 ?
+        Math.max(0, Math.floor(num(company.capacity) - Math.max(staff.length, num(company.employeeCount)))) : 0;
+    var roster = staff.filter(function (e) { return !e.director; });
+    var activeKinds = {};
+    roster.forEach(function (employee) {
+        var kind = supportRoleKind(currentPosition(employee));
+        if (kind) activeKinds[kind] = true;
+    });
+
+    // Never make an existing support role the source of an exploratory slot.
+    var donorPositions = positions.filter(function (p) {
+        return num(targets[positionKey(p)]) > 0 && !supportRoleKind(p);
+    });
+    var offers = [];
+
+    positions.forEach(function (candidate) {
+        var targetKey = positionKey(candidate);
+        if (!targetKey || num(targets[targetKey]) !== 0) return;
+        var kind = supportRoleKind(candidate);
+        // Avoid proposing another version of a special ability already staffed.
+        if (kind && activeKinds[kind]) return;
+        var benefit = potentialRoleBenefit(candidate);
+        var strongest = null;
+
+        donorPositions.forEach(function (donor) {
+            var donorKey = positionKey(donor);
+            var hypothetical = Object.assign({}, targets);
+            hypothetical[donorKey] = num(hypothetical[donorKey]) - 1;
+            hypothetical[targetKey] = num(hypothetical[targetKey]) + 1;
+            var evaluated = companyPositionAssignment(hypothetical);
+            if (evaluated.invalid || !Object.keys(evaluated.byEmployee || {}).length) return;
+
+            // The support incumbents must keep exactly their current position.
+            if (roster.some(function (employee) {
+                var current = currentPosition(employee);
+                return supportRoleKind(current) && (!evaluated.byEmployee[employee.id] ||
+                    positionKey(evaluated.byEmployee[employee.id].position) !== positionKey(current));
+            })) return;
+
+            var delta = evaluated.suggestedFit - currentSolution.suggestedFit;
+            if (!strongest || delta > strongest.fitDelta ||
+                (delta === strongest.fitDelta && donor.name.localeCompare(strongest.replaces) < 0)) {
+                strongest = {
+                    replaces: donor.name, replacesKey: donorKey, fitDelta: delta,
+                    targets: hypothetical, caution: !!kind || (evaluated.supportRisks || []).length > 0
+                };
+            }
+        });
+
+        // Without a special ability, only advertise an actual modeled fit
+        // improvement, except where there's spare capacity for a future hire.
+        if (!kind && (!strongest || strongest.fitDelta <= 0) && !openCapacity) return;
+        if (!strongest && !openCapacity) return;
+        offers.push({
+            position: candidate.name, key: targetKey, kind: kind,
+            reason: benefit.reason, priority: benefit.signal,
+            plan: strongest, openCapacity: openCapacity,
+            rank: benefit.signal + (!kind && strongest ? Math.max(0, strongest.fitDelta) : 0)
+        });
+    });
+
+    offers.sort(function (a, b) {
+        return b.rank - a.rank || (b.plan ? 1 : 0) - (a.plan ? 1 : 0) ||
+            a.position.localeCompare(b.position);
+    });
+    return offers.slice(0, 6);
+}
+
+// Updates helper-only staffing targets. This never changes Torn company roles.
+function useAdditionalRolePlan(roleKey) {
+    var offer = suggestAdditionalRoles().find(function (x) { return x.key === String(roleKey); });
+    if (!offer || !offer.plan || !company) return false;
+    var valid = positions.reduce(function (total, p) {
+        return total + num(offer.plan.targets[positionKey(p)]);
+    }, 0) === staff.filter(function (x) { return !x.director; }).length;
+    if (!valid) return false;
+    var saved = get('staffingPlans', {});
+    saved[staffingPlanStorageKey()] = normalizedStaffingPlan(offer.plan.targets);
+    put('staffingPlans', saved);
+    return true;
+}
+
+
 function constrainedRaw(weights, target, minimum, maximum) {
     var n = weights.length;
     if (!n) return [];
