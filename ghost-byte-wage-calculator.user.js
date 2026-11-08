@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.5.1
+// @version      2.6.0
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.5.1';
+var VERSION = '2.6.0';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -62,11 +62,20 @@ var errorState = null;
 var settingsOpen = false;
 var detailId = '';
 var lastLoadedAt = 0;
-var ui = { page: 'overview', query: '', filter: 'all', sort: 'score', direction: 'desc' };
+var ui = { page: 'dashboard', query: '', filter: 'all', sort: 'score', direction: 'desc' };
 var pendingId = '';
 var pendingUntil = 0;
 var changeRange = String(get('changeRange', '7'));
 var changesError = '';
+// Auto-recording only runs on a visible "Your company" view with a valid key.
+var AUTO_SYNC_INTERVAL = 5 * 60000;
+var AUTO_SYNC_VISIT_GAP = 90000;
+var AUTO_SYNC_CHANGE_GAP = 45000;
+var AUTO_SYNC_FAILURE_BACKOFF = 5 * 60000;
+var AUTO_SYNC_LEASE_MS = 90000;
+var autoSyncTimer = 0;
+var autoSyncOwner = String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+var autoSyncRoute = '';
 
 function isOwnCompanyView() {
     try { return new URLSearchParams(location.search).get('step') === 'your'; }
@@ -1122,6 +1131,13 @@ function readChangeHistory(id) {
 }
 
 function reportSnapshot(c, employees, timestamp) {
+    var employeesOnly = employees.filter(function (e) { return !e.director; });
+    var withStats = employeesOnly.filter(function (e) {
+        return e.effectiveness && e.effectiveness.working_stats != null;
+    });
+    var withManagement = employeesOnly.filter(function (e) {
+        return e.effectiveness && e.effectiveness.management != null;
+    });
     return {
         ts: timestamp || Date.now(),
         company: {
@@ -1130,9 +1146,17 @@ function reportSnapshot(c, employees, timestamp) {
             efficiency: c.efficiency, popularity: c.popularity, environment: c.environment,
             funds: c.funds, trains: c.trains, advertisementBudget: c.advertisementBudget,
             value: c.value, rating: c.rating, employeeCount: c.employeeCount,
+            employeeCapacity: c.capacity,
             payroll: sum(employees, function (e) { return e.wage; }),
-            avgEffectiveness: avg(employees.filter(function (e) { return !e.director; }),
-                function (e) { return e.effectiveness && e.effectiveness.total; })
+            avgEffectiveness: employeesOnly.length ? avg(employeesOnly, function (e) {
+                return e.effectiveness && e.effectiveness.total;
+            }) : null,
+            avgWorkingStatEffectiveness: withStats.length ? avg(withStats, function (e) {
+                return e.effectiveness.working_stats;
+            }) : null,
+            managementBonusPoints: withManagement.length ? sum(withManagement, function (e) {
+                return e.effectiveness.management;
+            }) : null
         },
         staff: employees.map(function (e) {
             return { id: String(e.id), name: e.name, position: e.position,
@@ -1178,18 +1202,54 @@ function normalizeCompanyNews(payload) {
     }).filter(function (e) { return e.text && e.ts > 0; });
 }
 
+// Preserve every observed material update in the recent window. Older history
+// is downsampled so daily, weekly and monthly reports remain useful without
+// exhausting localStorage. Values are never backfilled for unobserved periods.
+function snapshotFingerprint(snapshot) {
+    if (!snapshot) return '';
+    var roster = (snapshot.staff || []).map(function (e) {
+        return { id: String(e.id), name: e.name, position: e.position,
+            wage: e.wage, effectiveness: e.effectiveness };
+    }).sort(function (a, b) { return a.id.localeCompare(b.id); });
+    return JSON.stringify({ company: snapshot.company || {}, staff: roster });
+}
+
+function compactCompanySnapshots(snapshots, now) {
+    var cutoff = now - 180 * 86400000;
+    var recent = [], medium = {}, older = {};
+    (snapshots || []).filter(function (s) {
+        return s && Number.isFinite(Number(s.ts)) && s.ts >= cutoff && s.ts <= now &&
+            Array.isArray(s.staff) && s.company;
+    }).sort(function (a,b) { return a.ts - b.ts; }).forEach(function (item) {
+        var age = now - item.ts;
+        if (age <= 86400000) recent.push(item);
+        else if (age <= 14 * 86400000) medium[Math.floor(item.ts / (3 * 3600000))] = item;
+        else older[Math.floor(item.ts / 86400000)] = item;
+    });
+    // Retain up to 180 recent material events plus one observation per 3h
+    // for the previous fortnight, then daily observations for older periods.
+    return Object.keys(older).map(function(k){return older[k];})
+        .concat(Object.keys(medium).map(function(k){return medium[k];}))
+        .concat(recent.slice(-180))
+        .sort(function(a,b){return a.ts-b.ts;}).slice(-480);
+}
+
 async function updateCompanyChanges(c, employees) {
     if (!c || !c.id) { changesError = 'Company ID is unavailable; history cannot be saved.'; return; }
     var store = readChangeHistory(c.id);
     var now = lastLoadedAt || Date.now();
     var cutoff = now - 180 * 86400000;
-    store.snapshots = store.snapshots.filter(function (s) { return s && s.ts >= cutoff && Array.isArray(s.staff); });
-    // At most one saved baseline every 30 minutes. The latest live refresh is always
-    // shown separately, so a new baseline is not needed on every repeated refresh.
-    if (!store.snapshots.length || now - store.snapshots[store.snapshots.length - 1].ts >= 1800000) {
-        store.snapshots.push(reportSnapshot(c, employees, now));
+    store.snapshots = compactCompanySnapshots(store.snapshots, now);
+    var newest = store.snapshots[store.snapshots.length - 1];
+    var current = reportSnapshot(c, employees, now);
+    // Record staff/financial/effectiveness changes as soon as the next
+    // successful sync sees them. Keep a heartbeat baseline every 30 minutes
+    // when nothing changed. Repeated identical API responses are deduplicated.
+    if (!newest || snapshotFingerprint(newest) !== snapshotFingerprint(current) ||
+        now - newest.ts >= 1800000) {
+        store.snapshots.push(current);
+        store.snapshots = compactCompanySnapshots(store.snapshots, now);
     }
-    store.snapshots = store.snapshots.slice(-320);
     changesError = '';
     if (!store.lastNewsFetch || now - store.lastNewsFetch >= 15 * 60000) {
         try {
@@ -1221,6 +1281,9 @@ function metricDefinitions() {
         { key: 'environment', label: 'Environment', kind: 'points' },
         { key: 'payroll', label: 'Daily wage payroll', kind: 'money' },
         { key: 'employeeCount', label: 'Employee count', kind: 'number' },
+        { key: 'employeeCapacity', label: 'Employee capacity', kind: 'number' },
+        { key: 'avgWorkingStatEffectiveness', label: 'Avg. work-stat effectiveness', kind: 'points' },
+        { key: 'managementBonusPoints', label: 'Reported Management bonus total', kind: 'number' },
         { key: 'funds', label: 'Company funds', kind: 'money' },
         { key: 'rating', label: 'Star rating', kind: 'number' },
         { key: 'advertisementBudget', label: 'Advertising budget', kind: 'money' },
@@ -1365,7 +1428,7 @@ function changeReportText(report) {
     });
     if (!report.employeeChanges.length) lines.push('No comparison changes recorded.');
     lines.push('', 'Daily/weekly income are point-in-time Torn values, NOT summed earnings over the selected period.',
-        'Report assembled from Torn company news and browser-local snapshots.');
+        'Report assembled from Torn company news and automatically collected browser-local snapshots. Missing past observations cannot be recreated.');
     return lines.join('\n');
 }
 
@@ -1455,9 +1518,10 @@ function detailHtml(x) {
             effectLine('Addiction', e.addiction) +
             effectLine('Inactivity', e.inactivity) +
         '</div>' +
-        (best && !x.director ? '<h4>Staffing-aware position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>Target: ' + fmt(x.staffingTarget) + ' employee' + (num(x.staffingTarget) === 1 ? '' : 's') + ' in this role. ' + esc(best.description || best.ability || 'Assigned using the company-wide staffing plan.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
+        (best && !x.director && ui.page === 'positions' ? '<h4>Staffing-aware position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>Target: ' + fmt(x.staffingTarget) + ' employee' + (num(x.staffingTarget) === 1 ? '' : 's') + ' in this role. ' + esc(best.description || best.ability || 'Assigned using the company-wide staffing plan.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
         '<div class="requirements"><span>Requires:</span>' + requirementBadge('MAN', req.manual) + requirementBadge('INT', req.intelligence) + requirementBadge('END', req.endurance) + '</div>' + staffingNote : '') +
-        '<p class="detail-note">Position recommendations maximize combined predicted work-stat fit within role counts; current support-role incumbents are preserved by default. The helper cannot forecast company income or changed Management bonuses. Support-role changes require director review.</p>' +
+        (ui.page === 'positions' ? '<p class="detail-note">Position recommendations maximize combined predicted work-stat fit within role counts. Support-role incumbents are preserved by default. Income and future bonuses cannot be reliably projected.</p>' :
+        '<p class="detail-note">Wage recommendations use current employee work-stat effectiveness and total effectiveness. Open Positions to review roles, without changing wage calculations.</p>') +
     '</div>';
 }
 
@@ -1510,19 +1574,32 @@ function render() {
         '<div class="header-actions"><span class="refresh-state ' + (stale ? 'stale' : '') + '">' + (lastLoadedAt ? 'Updated ' + nowText(lastLoadedAt) : 'Not loaded') + '</span><button class="icon-btn" data-a="close" aria-label="Close">×</button></div>' +
     '</header>';
 
-    html += '<nav class="page-tabs" aria-label="Helper sections">' +
-        pageTab('overview', 'Overview', 'Start here') +
-        pageTab('employees', 'Employees', 'Review wages', result ? result.rows.length : 0) +
-        pageTab('changes', 'Changes', 'History & news') +
-        pageTab('settings', 'Settings', 'Adjust model') +
-        pageTab('guide', 'How it works', 'Calculations') +
+    html += '<nav class="page-tabs" aria-label="Main company sections">' +
+        pageTab('dashboard', 'Dashboard', 'At a glance') +
+        pageTab('wages', 'Wages', 'Pay and employees', result ? result.rows.length : 0) +
+        pageTab('positions', 'Positions', 'Roles and staffing') +
+        pageTab('statistics', 'Statistics', 'Company performance') +
+        pageTab('changes', 'Changes', 'History and news') +
     '</nav>';
 
-    html += '<div class="actionbar">' +
-        '<button class="primary" data-a="load"' + (busy ? ' disabled' : '') + '>' + (busy ? '<span class="spinner"></span> Refreshing' : '↻ Refresh') + '</button>' +
+    html += '<div class="workspace-tools"><span>More tools</span>' +
+        '<button data-page="settings"' + (page === 'settings' ? ' aria-current="page" class="selected"' : '') + '>Settings</button>' +
+        '<button data-page="guide"' + (page === 'guide' ? ' aria-current="page" class="selected"' : '') + '>How it works</button>' +
+    '</div>';
+
+    html += '<div class="actionbar section-actionbar ' + (page === 'wages' ? 'wages-actions' : '') + '">' +
+        '<button class="primary" data-a="load"' + (busy ? ' disabled' : '') + '>' +
+            (busy ? '<span class="spinner"></span> Refreshing' : '↻ Refresh data') + '</button>' +
         '<button data-a="key">API Key</button>' +
-        '<button data-a="copy"' + (!result ? ' disabled' : '') + '>Copy wages</button>' +
-        '<button data-a="csv"' + (!result ? ' disabled' : '') + '>Export CSV</button>' +
+        (page === 'wages' ? '<button data-a="copy"' + (!result ? ' disabled' : '') +
+            '>Copy wages</button><button data-a="csv"' + (!result ? ' disabled' : '') +
+            '>Export CSV</button>' : '') +
+    '</div>';
+
+    html += '<div class="auto-recording-indicator" role="status" aria-live="polite">' +
+        '<span class="auto-dot ' + (cfg.autoRefresh && apiKey() ? 'enabled' : 'paused') + '" aria-hidden="true"></span>' +
+        '<span>' + esc(autoSyncStatusText()) + '</span>' +
+        '<button type="button" data-page="settings" aria-label="Configure automatic company recording">Manage</button>' +
     '</div>';
 
     if (errorState) {
@@ -1536,15 +1613,23 @@ function render() {
         html += settingsPage();
     } else if (page === 'guide') {
         html += calculationGuidePage();
-    } else if (!result && !busy) {
+    } else if (!result) {
         html += '<section class="empty">' +
-            '<div class="empty-icon">' + logoMark('empty-logo') + '</div><h3>Connect your company data</h3><p>Load employee wages, effectiveness, and company positions from the Torn API. The helper is advisory and never submits wage changes by itself.</p>' +
-            '<div><button class="primary" data-a="load">Refresh API</button><button data-a="key">Set API Key</button></div>' +
-        '</section>';
-    } else if (result && page === 'employees') {
-        html += employeesPage(result, visibleRows);
-    } else if (result) {
-        html += overviewPage(result);
+            '<div class="empty-icon">' + logoMark('empty-logo') + '</div><h3>' +
+            (busy ? 'Loading company information' : 'Welcome to your company dashboard') +
+            '</h3><p>' + (busy ?
+                'Fetching the latest company data. Your sections will appear here when the refresh is complete.' :
+                'The helper records performance automatically when you visit your own company with an API key. Open Wages, Positions, Statistics, or Changes to review the information.') +
+            '</p><div><button class="primary" data-a="load"' + (busy ? ' disabled' : '') +
+            '>Refresh company data</button><button data-a="key">Set API Key</button></div></section>';
+    } else if (page === 'wages') {
+        html += wagesPage(result, visibleRows);
+    } else if (page === 'positions') {
+        html += positionsPage(result);
+    } else if (page === 'statistics') {
+        html += statisticsPage(result);
+    } else {
+        html += dashboardPage(result);
     }
 
     html += '<footer><span>API: ' + esc(keySource()) + '</span><span>Advisory only — wage changes are never submitted automatically.</span></footer>';
@@ -1571,7 +1656,7 @@ function changesPage() {
 
     if (!report) {
         return html + '<div class="changes-empty"><h4>No company history yet</h4>' +
-            '<p>Press Refresh with an API key that can access your company. This browser will start recording your company changes from the first successful refresh.</p></div></section>';
+            '<p>Press Refresh with an API key that can access your company. Once auto-recording is enabled and your API key can access this company, the helper starts recording on your next company visit. Nothing needs to be refreshed manually.</p></div></section>';
     }
     var started = report.baseline ? changeDate(report.baseline.ts) : 'No earlier observation';
     html += '<div class="changes-coverage"><b>Last ' + report.days + ' day' + (report.days === 1 ? '' : 's') +
@@ -1648,13 +1733,15 @@ function changesPage() {
         if (report.employeeChanges.length > 80) html += '<div class="changes-overflow">Showing the first 80 employee changes. Copy report includes all.</div>';
     }
     html += '<p class="changes-footnote">Daily and weekly Torn income figures are rolling figures from each refresh; their difference is not the total profit over this period. ' +
-        'History is stored only in this browser, per company, for up to 180 days (up to 320 snapshots). ' +
+        'History is saved automatically in this browser, per company, for up to 180 days. Recent changes are recorded individually, and older samples are condensed. ' +
         'Dismissal reasons come from Torn news or private notes you enter. Copied reports include those notes, so review before sharing. Other devices do not share this history.</p></section>';
     return html;
 }
 
 function pageTab(key, label, note, count) {
-    return '<button class="page-tab ' + ((ui.page || 'overview') === key ? 'active' : '') + '" data-page="' + key + '">' +
+    var selected = (ui.page || 'dashboard') === key;
+    return '<button class="page-tab ' + (selected ? 'active' : '') + '" type="button" data-page="' + key + '"' +
+        (selected ? ' aria-current="page"' : '') + '>' +
         '<span class="page-tab-main">' + esc(label) + (count != null ? '<b>' + fmt(count) + '</b>' : '') + '</span>' +
         '<small>' + esc(note) + '</small>' +
     '</button>';
@@ -1699,7 +1786,7 @@ function staffingPlanEditor() {
 
 function settingsPage() {
     return '<section class="settings settings-page">' +
-        '<div class="page-heading"><div><small>Calculation setup</small><h3>Wage model & preferences</h3><p>Changes recalculate recommendations immediately. Nothing here submits changes to Torn.</p></div><button class="text-btn" data-a="reset-settings">Reset defaults</button></div>' +
+        '<div class="page-heading"><div><small>Calculation setup</small><h3>Wage settings & preferences</h3><p>Control how suggested daily pay is calculated. For staffing targets and job assignments, open Positions.</p></div><button class="text-btn" data-a="reset-settings">Reset defaults</button></div>' +
         '<div class="settings-group"><div class="settings-group-title"><b>Payment model</b><small>Choose how the suggested payroll is calculated.</small></div><div class="settings-grid">' +
             settingField('mode', 'Payment model', 'Current redistributes the included payroll. Fixed uses your chosen budget. Benchmark pays score × benchmark.', 'mode') +
             settingField('budget', 'Fixed daily payroll', 'Used only when Payment model is Fixed budget.') +
@@ -1715,17 +1802,14 @@ function settingsPage() {
             settingField('max', 'Maximum wage', 'Cap applied to every included employee.') +
             settingField('round', 'Round to', 'Use 100, 1,000, 10,000, etc. The allocator tries to preserve the chosen total.') +
         '</div></div>' +
-        '<div class="settings-group staffing-group"><div class="settings-group-title"><b>Position staffing plan</b><small>Position advice fills these role counts. Changing support-role totals can force risky moves even with protection enabled.</small></div>' +
-            staffingPlanEditor() +
-        '</div>' +
         '<div class="settings-group"><div class="settings-group-title"><b>Helper behavior</b><small>Optional conveniences and recommendations.</small></div><div class="toggles">' +
             toggle('director', 'Include director', 'Include the director in wage distribution.') +
             toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
-            toggle('positionAdvice', 'Staffing-aware position advice', 'Maximize combined stat fit within target role counts; this is not a profit forecast.') +
-            toggle('exploreNewRoles', 'Explore additional company roles', 'Consider currently unstaffed roles, alternative staffing mixes, and hiring capacity. Review every scenario before changing Torn positions.') +
-            toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Preserve current Managers, Marketers, Trainers, Cleaners, and Secretaries when matching slots remain. Disable only to explore speculative swaps.') +
-            toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
+            toggle('autoRefresh', 'Auto-refresh and record company visits (recommended)', 'Automatically save performance when visiting your company, making management changes, or returning to the tab. Checks every 5 minutes while visible; API key required.') +
         '</div></div>' +
+        '<div class="settings-group settings-route"><div><b>Looking for staffing and position settings?</b>' +
+        '<p>Role protection, additional role recommendations, and staffing targets are together in the Positions section.</p></div>' +
+        '<button data-page="positions">Open Positions →</button></div>' +
     '</section>';
 }
 
@@ -1739,7 +1823,11 @@ function calculationGuidePage() {
     var modeName = cfg.mode === 'fixed' ? 'Fixed budget' : cfg.mode === 'benchmark' ? 'Benchmark × score' : 'Keep included payroll';
 
     return '<section class="guide-page">' +
-        '<div class="page-heading"><div><small>Calculation guide</small><h3>How the recommendations are calculated</h3><p>This page follows the same calculation path as the script. Samples are illustrative and do not change your company data.</p></div></div>' +
+        '<div class="page-heading"><div><small>Help center</small><h3>How it works</h3><p>Find what each section does, then explore the calculations and limitations behind its recommendations.</p></div></div>' +
+        '<div class="guide-shortcuts" aria-label="Jump to a section">' +
+        '<button data-page="dashboard">Dashboard</button><button data-page="wages">Wages</button>' +
+        '<button data-page="positions">Positions</button><button data-page="statistics">Statistics</button>' +
+        '<button data-page="changes">Changes</button></div>' +
         '<div class="guide-settings">' +
             '<div><small>Current mode</small><b>' + esc(modeName) + '</b></div>' +
             '<div><small>Target effectiveness</small><b>' + fmt(cfg.target) + '</b></div>' +
@@ -1760,10 +1848,12 @@ function calculationGuidePage() {
             guideCard('9', 'Raise, cut, and change percentage', 'The employee list compares the suggested wage with the current wage. A positive difference is a raise; a negative difference is a cut.', 'Change = Suggested − Current; Change % = Change ÷ Current × 100', 'Current $1,000,000 and suggested $1,250,000 gives +$250,000, or +25%.') +
             guideCard('10', 'Staffing-aware position assignment', 'The helper fills target slots using combined predicted work-stat fit and a 2-point staying bonus. With support-role protection enabled (the default), existing Managers, Marketers, Trainers, Cleaners, and Secretaries are kept in their current slots first. Stat fit alone does not measure their benefits to the rest of the company.', 'Reserve existing support-role incumbents when slots exist; then maximize remaining PositionFit + 2 when staying', 'If the plan requires 2 Cashiers, 1 Technician, 1 Admin, and 1 Cleaner, exactly those slots must be filled. Even if a Manager is individually better suited as Cashier, they remain Manager while their Manager slot is available. Removing that slot requires manual review.') +
             guideCard('11', 'Custom staffing targets', 'Settings lets the director choose how many employees the company should have in each position. Target counts must add up to the number of non-director employees. If they do not match, the helper falls back to current counts. Reducing support-role slots can force speculative assignments and is flagged for review.', 'Sum of target position slots = non-director employees', 'For 10 non-director employees, a valid plan could be 3 Cashiers + 2 Technicians + 1 Admin + 1 Cleaner + 3 employees in other roles = 10 slots.') +
-            guideCard('12', 'Summary values', 'The Overview page averages included employees only. Budget variance is the final included payroll minus the target payroll. In Benchmark mode there is no fixed company target, so budget variance is shown as not applicable.', 'Budget variance = Suggested included payroll − Target payroll', 'If the target is $10,000,000 and rounded recommendations total $10,010,000, budget variance is +$10,000.') +
-            guideCard('13', 'Discovering unstaffed roles', 'If Explore additional company roles is enabled, the Overview looks at every position in the Torn company-type catalog, including roles that currently have zero employees or zero target slots. It skips another position with an already staffed special ability and examines what the new role could provide. Manager, Marketer, Cleaner, Trainer, and Secretary benefits are described using their catalog ability; other jobs are evaluated only for modeled work-stat fit.', 'Only consider unstaffed catalog positions; never assume an unreported company-wide bonus', 'If you currently have Cashiers and a Manager but no Trainer, the helper may suggest considering a Trainer for additional company trains, even though no Trainer exists in your current staffing plan.') +
+            guideCard('12', 'Summary values', 'The Dashboard and Wages pages average included employees only. Budget variance is the final included payroll minus the target payroll. In Benchmark mode there is no fixed company target, so budget variance is shown as not applicable.', 'Budget variance = Suggested included payroll − Target payroll', 'If the target is $10,000,000 and rounded recommendations total $10,010,000, budget variance is +$10,000.') +
+            guideCard('13', 'Discovering unstaffed roles', 'If Explore additional company roles is enabled, the Positions section looks at every position in the Torn company-type catalog, including roles that currently have zero employees or zero target slots. It skips another position with an already staffed special ability and examines what the new role could provide. Manager, Marketer, Cleaner, Trainer, and Secretary benefits are described using their catalog ability; other jobs are evaluated only for modeled work-stat fit.', 'Only consider unstaffed catalog positions; never assume an unreported company-wide bonus', 'If you currently have Cashiers and a Manager but no Trainer, the helper may suggest considering a Trainer for additional company trains, even though no Trainer exists in your current staffing plan.') +
             guideCard('14', 'Comparing an alternate staffing mix', 'For a possible new role, the helper examines reallocating one existing non-support position slot. It preserves all currently employed support-role incumbents, optimizes the remaining employee-to-position assignments, and compares combined predicted work-stat fit with the current planning scenario. A decrease can be acceptable as a trade-off to investigate for support roles; an increase does not prove extra revenue. No sales or bonus estimates are invented.', 'Modeled stat-fit difference = simulated team fit − current-plan team fit; support benefits are excluded', 'Changing a target from 3 Cashiers + 1 Manager to 2 Cashiers + 1 Manager + 1 Trainer may lower the predicted stat-fit sum, but provides a possible new training benefit that must be verified in Torn.') +
-            guideCard('15', 'Hiring, applying, and limitations', 'If company capacity exceeds occupied slots, the helper identifies a separate hiring path. It does not invent a candidate employee or predict their effectiveness, wage, or income. The Use as staffing target button saves only a valid one-slot reallocation in this helper and opens Settings for review; it does not hire, dismiss, change positions, or submit anything in Torn. Recommendations are exploratory and require the director to compare actual results.', 'Valid reallocation: total role targets = current non-director staff; hiring is not scored without candidate stats', 'If there is 1 vacant employee slot, the helper may identify a Marketer as an available hiring option. You must hire and assign that employee in Torn yourself, then refresh to recalculate.') +
+            guideCard('15', 'Hiring, applying, and limitations', 'If company capacity exceeds occupied slots, the helper identifies a separate hiring path. It does not invent a candidate employee or predict their effectiveness, wage, or income. The Use as staffing target button saves only a valid one-slot reallocation in this helper and opens Positions for review; it does not hire, dismiss, change positions, or submit anything in Torn. Recommendations are exploratory and require the director to compare actual results.', 'Valid reallocation: total role targets = current non-director staff; hiring is not scored without candidate stats', 'If there is 1 vacant employee slot, the helper may identify a Marketer as an available hiring option. You must hire and assign that employee in Torn yourself. Automatic recording then recalculates on your next successful company sync.') +
+            guideCard('16', 'Finding your way around', 'The Dashboard shows concise summaries and opens dedicated sections. Wages contains pay suggestions and exports. Positions contains role recommendations, support-role safeguards, exploratory role options, and staffing targets. Company Statistics displays current income, customers, company condition, resources, and available historical comparisons. Changes records events and performance differences. Settings controls wage calculations and general behavior.', 'Dashboard → choose a section → review details → return using the top navigation', 'To decide whether to introduce a Trainer, open Positions. To see income figures, open Statistics. To compare activity across days, open Changes. To export suggested daily pay, open Wages.') +
+            guideCard('17', 'Automatic company refresh and data recording', 'With Auto-refresh and record enabled, the helper checks your company as soon as you visit your own company page, after relevant management interactions, when you return to the tab, and periodically while the company page is open. It works even when the helper panel is closed. It uses a 45-second minimum gap for recent actions, 90 seconds for visits, a 5-minute regular interval, temporary cross-tab coordination, and a 5-minute retry delay after failures. Hidden tabs, missing API keys, or disabled settings pause automatic requests. Repeated identical company data is not saved again; changed figures and employees are recorded on the next successful API sync, with older samples compacted into longer-term history.', 'Auto-refresh observes and records available data; it does not change Torn company settings', 'If you change a Cashier to another role, the helper checks again after a short delay. If Torn confirms a different roster or new metrics through its API, that information is saved without pressing Refresh. It cannot recover snapshots from earlier days when you did not visit the company.') +
         '</div>' +
         '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. New-role suggestions are possibilities for director review, not demonstrated profit improvements. Salary, work-stat fit, and support-role contributions must be evaluated separately. Nothing hires staff or submits role or wage changes to Torn automatically.</div>' +
     '</section>';
@@ -1853,34 +1943,61 @@ function additionalRolesHtml() {
         'Choosing a target updates this helper only. No positions or wages are changed in Torn.</p></section>';
 }
 
-function overviewPage(result) {
-    var delta = result.suggestedIncluded - result.currentIncluded;
-    var raises = result.rows.filter(function (x) { return !x.omit && x.change > 0; }).sort(function (a,b) { return b.change-a.change; });
-    var cuts = result.rows.filter(function (x) { return !x.omit && x.change < 0; }).sort(function (a,b) { return a.change-b.change; });
-    var reviews = result.rows.filter(function (x) { return x.recommendPosition; }).sort(function (a,b) { return (b.bestFit-b.predictedCurrentFit)-(a.bestFit-a.predictedCurrentFit); });
 
-    var html = '<section class="overview-page">' +
-        '<div class="page-heading"><div><small>Company overview</small><h3>What needs your attention</h3><p>Start here, then open Employees for the full wage list or Settings to change the calculation model.</p></div><button class="primary compact" data-page="employees">View employees</button></div>' +
-        '<section class="summary">' +
-            summaryCard('Employees included', fmt(result.included), result.excluded ? fmt(result.excluded) + ' excluded' : 'Everyone is included') +
-            summaryCard('Current payroll', money(result.currentIncluded), 'Included daily total') +
-            summaryCard('Suggested payroll', money(result.suggestedIncluded), (delta > 0 ? '+' : '') + money(delta) + ' vs current', delta > 0 ? 'warn' : delta < 0 ? 'good' : '') +
-            summaryCard('Avg. effectiveness', fmt(result.avgEffectiveness), 'Work-stat efficiency ' + fmt(result.avgFit)) +
-            summaryCard('Budget variance', cfg.mode === 'benchmark' ? '—' : money(result.budgetGap), cfg.mode === 'benchmark' ? 'Benchmark mode' : 'After limits and rounding', Math.abs(result.budgetGap) > num(cfg.round) ? 'warn' : 'good') +
-        '</section>';
+function dashboardLink(key, eyebrow, title, number, subtitle, details) {
+    return '<button type="button" class="dashboard-link" data-page="' + esc(key) + '">' +
+        '<span class="dashboard-card-top"><span>' + esc(eyebrow) + '</span><span aria-hidden="true">↗</span></span>' +
+        '<strong>' + esc(title) + '</strong>' +
+        '<span class="dashboard-card-number">' + esc(number) + '</span>' +
+        '<span class="dashboard-card-description">' + esc(subtitle) + '</span>' +
+        '<span class="dashboard-card-footer">' + esc(details) + '<b>Open ' + esc(title) + ' →</b></span>' +
+    '</button>';
+}
 
-    html += supportImpactHtml(result);
-    html += additionalRolesHtml();
-    if (!positions.length) {
-        html += '<div class="notice"><b>Position-fit advice unavailable.</b> Wage calculations are active, but position recommendations are temporarily hidden.</div>';
-    }
-
-    html += '<div class="insight-grid">' +
-        insightCard('Raises', raises, function (x) { return '+' + money(x.change); }, 'No suggested raises', 'raise') +
-        insightCard('Cuts', cuts, function (x) { return money(x.change); }, 'No suggested cuts', 'cut') +
-        insightCard('Position review', reviews, function (x) { return x.bestPosition ? x.bestPosition.name : 'Review' ; }, 'No position changes flagged', 'position') +
-    '</div>' +
-    '<div class="overview-help"><div><b>How to use this helper</b><p>Review the summary, inspect employees that need attention, then copy or autofill wages only after you are satisfied with the recommendations.</p></div><button data-page="settings">Adjust calculation</button></div>' +
+function dashboardPage(result) {
+    var payChanges = result.rows.filter(function (x) { return !x.omit && x.change !== 0; }).length;
+    var changes = result.rows.filter(function (x) { return x.recommendPosition; }).length;
+    var history = changeReport();
+    var movements = history ? history.events.filter(function (e) {
+        return ['joined', 'fired', 'left', 'unconfirmed'].indexOf(e.type) >= 0;
+    }).length : 0;
+    var plans = cfg.positionAdvice && cfg.exploreNewRoles && positions.length ?
+        suggestAdditionalRoles().length : 0;
+    var days = changePeriodDays();
+    var title = company && company.name ? company.name : 'Your company';
+    var html = '<section class="dashboard-page">' +
+        '<div class="page-heading dashboard-hero"><div><small>Company control center</small>' +
+        '<h3>' + esc(title) + ' at a glance</h3>' +
+        '<p>Everything important, in one place. Choose a section below to review details and take action.</p></div>' +
+        '<button data-page="guide" class="small">How to use this helper</button></div>' +
+        '<div class="dashboard-quick-stats">' +
+            summaryCard('Employees', fmt(staff.length), 'Currently recorded in Torn') +
+            summaryCard('Daily income', company ? money(company.dailyIncome) : '—', 'Current rolling Torn figure') +
+            summaryCard('Avg. effectiveness', fmt(result.avgEffectiveness), 'Included employees') +
+            summaryCard('Company rating', company && company.rating ? fmt(company.rating) + ' ★' : '—', 'Latest reported stars') +
+        '</div>' +
+        '<div class="dashboard-section-title"><h4>Explore your company</h4><p>Each section has one purpose. Nothing is changed in Torn automatically.</p></div>' +
+        '<div class="dashboard-links">' +
+            dashboardLink('wages', '01 · Daily payroll', 'Wages',
+                money(result.currentIncluded),
+                money(result.suggestedIncluded) + ' suggested daily payroll',
+                fmt(payChanges) + ' proposed wage change(s)') +
+            dashboardLink('positions', '02 · Team structure', 'Positions',
+                fmt(changes) + ' to review',
+                fmt(result.protectedCount) + ' existing support-role assignment(s) protected',
+                fmt(plans) + ' additional role option(s)') +
+            dashboardLink('statistics', '03 · Business health', 'Statistics',
+                company ? money(company.weeklyIncome) : '—',
+                'Current rolling weekly income (not profit)',
+                'View revenue, customers and company indicators') +
+            dashboardLink('changes', '04 · Recent activity', 'Changes',
+                history ? fmt(movements) + ' events' : 'Tracking',
+                'Employee movements over the selected ' + days + '-day period',
+                history && history.partial ? 'Limited historical coverage' : 'View history and export reports') +
+        '</div>' +
+        '<div class="dashboard-next"><div><b>Not sure where to start?</b>' +
+        '<p>Review Wages for pay adjustments, Positions for staffing ideas, and Statistics for company performance. Use Changes to see what happened over time.</p></div>' +
+        '<button data-page="wages">Review wages →</button></div>' +
     '</section>';
     return html;
 }
@@ -1893,25 +2010,174 @@ function insightCard(title, list, valueFn, emptyText, filterKey) {
     return '<div class="insight-card"><div class="insight-head"><div><b>' + esc(title) + '</b><small>' + fmt(list.length) + ' employee' + (list.length === 1 ? '' : 's') + '</small></div>' + (list.length ? '<button data-filter-jump="' + filterKey + '">See all</button>' : '') + '</div>' + body + '</div>';
 }
 
+
+function wagesPage(result, visibleRows) {
+    var changed = result.rows.filter(function (x) { return !x.omit && x.change !== 0; }).length;
+    return '<section class="wages-summary">' +
+        '<div class="page-heading"><div><small>Employee payroll</small><h3>Wages</h3>' +
+        '<p>Review daily wages and suggested pay. Position planning lives in its own section.</p></div>' +
+        '<button data-page="settings" class="small">Wage settings</button></div>' +
+        '<div class="summary">' +
+            summaryCard('Current daily payroll', money(result.currentIncluded), 'Included employees') +
+            summaryCard('Suggested daily payroll', money(result.suggestedIncluded), 'Based on your wage settings') +
+            summaryCard('Proposed changes', fmt(changed), 'Raises or cuts; review before applying') +
+        '</div></section>' + employeesPage(result, visibleRows);
+}
+
+function positionStat(label, value, note) {
+    return '<div class="positions-metric"><small>' + esc(label) + '</small>' +
+        '<strong>' + esc(value) + '</strong><span>' + esc(note) + '</span></div>';
+}
+
+function positionsPage(result) {
+    var reviews = result.rows.filter(function (x) { return x.recommendPosition && !x.director; });
+    var plan = result.positionPlan;
+    var nonDirectors = staff.filter(function (x) { return !x.director; });
+    var html = '<section class="positions-page">' +
+        '<div class="page-heading"><div><small>People and job assignments</small><h3>Positions</h3>' +
+        '<p>See who works where, explore other jobs, and adjust your staffing plan without changing Torn automatically.</p></div>' +
+        '<button class="small" data-page="guide">How role advice works</button></div>' +
+        '<div class="positions-metrics">' +
+            positionStat('Employees in positions', fmt(nonDirectors.length), 'Excludes the director') +
+            positionStat('Suggested changes', cfg.positionAdvice ? fmt(reviews.length) : 'Off', 'Review before changing jobs') +
+            positionStat('Protected support roles', fmt(result.protectedCount), 'Existing support employees kept in place') +
+        '</div>';
+    if (!positions.length) {
+        return html + '<div class="notice"><b>Position information unavailable.</b> Refresh company data to load available jobs.</div></section>';
+    }
+    if (!cfg.positionAdvice) html += '<div class="notice">Position advice is disabled. Enable it below to see staffing recommendations.</div>';
+    html += '<div class="positions-section-head"><div><h4>Employee assignments</h4>' +
+        '<p>Current role compared with the recommended role. Fit differences measure working stats only, not income.</p></div></div>' +
+        '<div class="positions-employee-list">';
+    var listed = result.rows.filter(function (x) { return !x.director; }).sort(function (a,b) {
+        return Number(b.recommendPosition) - Number(a.recommendPosition) || a.name.localeCompare(b.name);
+    });
+    listed.forEach(function (x) {
+        var proposed = cfg.positionAdvice ? x.bestPosition : null;
+        var diff = proposed ? num(x.bestFit) - num(x.predictedCurrentFit) : 0;
+        var status = x.supportRisk ? 'Check support impact' :
+            x.supportProtected ? 'Support role protected' :
+            x.recommendPosition ? 'Review proposed move' : 'Keep current role';
+        html += '<div class="positions-person">' +
+            '<div class="positions-person-main"><b>' + esc(x.name) + '</b><small>[' + esc(x.id) + ']</small></div>' +
+            '<div class="positions-person-roles"><div><small>Current</small><span>' + esc(x.position) + '</span></div>' +
+            '<div><small>Suggested</small><span>' +
+            (proposed ? esc(proposed.name) : 'No advice') + '</span></div></div>' +
+            '<div class="positions-person-status ' + (x.supportRisk ? 'caution' : x.recommendPosition ? 'review' : 'keep') + '">' +
+                '<span>' + esc(status) + '</span>' +
+                '<small>' + (proposed ? 'Stat-fit difference: ' + (diff > 0 ? '+' : '') + fmt(diff) : '—') +
+                '</small></div>' +
+            '<button class="small" data-detail="' + esc(x.id) + '">Details</button>' +
+        '</div>';
+    });
+    html += '</div>';
+    html += supportImpactHtml(result);
+    html += additionalRolesHtml();
+    html += '<div class="positions-section-head"><div><h4>Staffing targets</h4>' +
+        '<p>Set how many employees should fill each job. Targets must add up to your current number of employees. Suggestions are helper-only.</p></div></div>' +
+        '<div class="positions-planner">' + staffingPlanEditor() + '</div>' +
+        '<div class="settings-group positions-preferences"><div class="settings-group-title"><b>Position preferences</b>' +
+            '<small>Customize role recommendations. Changes recalculate immediately.</small></div>' +
+        '<div class="toggles">' +
+            toggle('positionAdvice', 'Show position recommendations', 'Compare proposed roles with current assignments.') +
+            toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Keep current Managers, Trainers, Marketers, Cleaners, and Secretaries when their slots remain.') +
+            toggle('exploreNewRoles', 'Explore additional positions', 'Consider unstaffed positions, safe alternatives, and hiring capacity.') +
+        '</div></div></section>';
+    return html;
+}
+
+function statisticsTile(label, key, suffix, note, kind) {
+    var v = company && company[key];
+    var shown = v == null ? 'Not reported' : kind === 'money' ? money(v) :
+        fmt(v) + (suffix || '');
+    return '<div class="stats-tile"><small>' + esc(label) + '</small><strong>' +
+        esc(shown) + '</strong><span>' + esc(note) + '</span></div>';
+}
+
+function statisticsPage(result) {
+    var history = changeReport();
+    var html = '<section class="statistics-page">' +
+        '<div class="page-heading"><div><small>Business performance</small><h3>Company Statistics</h3>' +
+        '<p>Understand your current figures without mixing them with wage or position recommendations.</p></div>' +
+        '<button class="small" data-page="changes">View historical changes</button></div>' +
+        '<div class="stats-explain"><b>How to read these numbers</b>' +
+        '<p>Income figures are the daily or weekly rolling amounts reported by Torn. They are <b>not net profit</b>. ' +
+        'Company funds are a balance, not earnings.</p></div>' +
+        '<div class="positions-section-head"><div><h4>Income and customers</h4>' +
+        '<p>Latest values from your company profile.</p></div></div>' +
+        '<div class="stats-grid">' +
+            statisticsTile('Daily income', 'dailyIncome', '', 'Torn rolling daily figure', 'money') +
+            statisticsTile('Weekly income', 'weeklyIncome', '', 'Torn rolling weekly figure', 'money') +
+            statisticsTile('Daily customers', 'dailyCustomers', '', 'Customers reported by Torn') +
+            statisticsTile('Weekly customers', 'weeklyCustomers', '', 'Customers reported by Torn') +
+        '</div>' +
+        '<div class="positions-section-head"><div><h4>Business condition</h4>' +
+        '<p>These indicators are reported by Torn; they are not guaranteed outcomes of role changes.</p></div></div>' +
+        '<div class="stats-grid">' +
+            statisticsTile('Efficiency', 'efficiency', '', 'Company-wide indicator') +
+            statisticsTile('Popularity', 'popularity', '', 'Company-wide indicator') +
+            statisticsTile('Environment', 'environment', '', 'Company-wide indicator') +
+            statisticsTile('Company rating', 'rating', ' ★', 'Current star rating') +
+        '</div>' +
+        '<div class="positions-section-head"><div><h4>Resources and workforce</h4>' +
+        '<p>Balances, budgets, and people at the last refresh.</p></div></div>' +
+        '<div class="stats-grid">' +
+            statisticsTile('Company funds', 'funds', '', 'Current balance, not profit', 'money') +
+            statisticsTile('Company value', 'value', '', 'Reported company value', 'money') +
+            statisticsTile('Advertising budget', 'advertisementBudget', '', 'Reported advertising budget', 'money') +
+            statisticsTile('Available trains', 'trains', '', 'Training opportunities') +
+            positionStat('Employees', fmt(staff.length), 'From the loaded roster') +
+            positionStat('Average effectiveness', fmt(result.avgEffectiveness), 'Included employees') +
+            positionStat('Daily wage payroll', money(result.currentAll), 'All employees with known wages') +
+            positionStat('Employee capacity', company && company.capacity ? fmt(company.capacity) : 'Not reported', 'Reported hiring slots') +
+        '</div>';
+    html += '<div class="positions-section-head"><div><h4>Changes over time</h4>' +
+        '<p>Compare tracked values against the earliest available baseline for the selected period.</p></div>' +
+        '<button class="small" data-page="changes">Open Changes →</button></div>';
+    if (history && history.metrics && history.metrics.length) {
+        html += '<div class="stats-comparison-note">' + (history.partial ?
+            'Partial history: some of the selected period has not yet been recorded.' :
+            'Tracked comparison for the past ' + history.days + ' days.') +
+            '</div><div class="stats-deltas">';
+        history.metrics.filter(function (m) {
+            return ['dailyIncome','weeklyIncome','avgEffectiveness','employeeCount',
+                'efficiency','popularity','environment','payroll',
+                'employeeCapacity','avgWorkingStatEffectiveness','managementBonusPoints'].indexOf(m.key) >= 0;
+        }).forEach(function (m) {
+            var change = m.kind === 'money' ? money(m.delta) : fmt(m.delta);
+            html += '<div><small>' + esc(m.label) + '</small><strong>' +
+                esc((m.delta > 0 ? '+' : '') + change) + '</strong>' +
+                '<span>From ' + esc(metricText(m.previous, m.kind)) + ' to ' +
+                esc(metricText(m.latest, m.kind)) + '</span></div>';
+        });
+        html += '</div>';
+    } else {
+        html += '<div class="stats-comparison-note">No earlier snapshot is available yet. ' +
+            'Refresh on future days to build a comparison history.</div>';
+    }
+    return html + '<p class="stats-footnote">Position and wage advice is available in its own section. ' +
+        'History is device-local and may be partial. All reported numbers are for reference only.</p></section>';
+}
+
 function employeesPage(result, visibleRows) {
     var html = '<section class="workspace employee-page">' +
-        '<div class="page-heading employees-heading"><div><small>Employee recommendations</small><h3>Wages & position fit</h3><p>Tap an employee name for work stats, effectiveness breakdown, and position requirements.</p></div><button class="small" data-a="reset-inclusions">Include all</button></div>' +
+        '<div class="page-heading employees-heading"><div><small>Employee recommendations</small><h3>Employee pay details</h3><p>Search employees, review pay changes, and copy individual wage recommendations.</p></div><button class="small" data-a="reset-inclusions">Include all</button></div>' +
         '<div class="toolbar">' +
             '<div class="search"><span>⌕</span><input data-ui="query" value="' + esc(ui.query) + '" placeholder="Search name, ID, or position" aria-label="Search employees"></div>' +
             '<select data-ui="sort" aria-label="Sort employees">' + sortOptions() + '</select>' +
             '<button class="small" data-a="sort-dir" title="Toggle sort direction">' + (ui.direction === 'desc' ? '↓' : '↑') + '</button>' +
         '</div>' +
-        '<div class="filters">' + filterButton('all', 'All', result.rows.length) + filterButton('included', 'Included', result.included) + filterButton('excluded', 'Excluded', result.excluded) + filterButton('raise', 'Raises', result.rows.filter(function(x){return !x.omit&&x.change>0;}).length) + filterButton('cut', 'Cuts', result.rows.filter(function(x){return !x.omit&&x.change<0;}).length) + filterButton('position', 'Position review', result.rows.filter(function(x){return x.recommendPosition;}).length) + '</div>' +
+        '<div class="filters">' + filterButton('all', 'All', result.rows.length) + filterButton('included', 'Included', result.included) + filterButton('excluded', 'Excluded', result.excluded) + filterButton('raise', 'Raises', result.rows.filter(function(x){return !x.omit&&x.change>0;}).length) + filterButton('cut', 'Cuts', result.rows.filter(function(x){return !x.omit&&x.change<0;}).length) + '</div>' +
         '<div class="table-meta"><span>Showing <b>' + fmt(visibleRows.length) + '</b> of ' + fmt(result.rows.length) + '</span><span>Tap a name to see full employee details.</span></div>' +
         '<div class="table-wrap"><table class="employee-table"><thead><tr>' +
             '<th class="use-col">Use</th><th class="employee-col">Employee</th><th class="position-col">Position</th><th class="effect-col">Eff.</th><th class="current-col">Current</th><th class="suggested-col">Suggested</th><th class="change-col">Change</th><th class="action-col"></th>' +
         '</tr></thead><tbody>';
 
     visibleRows.forEach(function (x) {
-        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">' + (x.supportRisk ? 'Review support role → ' : 'Suggested → ') + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
+        var review = '<small>Fit ' + fmt(x.currentFit) + '</small>';
         html += '<tr class="' + (x.omit ? 'excluded-row' : '') + '">' +
             '<td class="use-col"><input type="checkbox" data-inc="' + esc(x.id) + '"' + (!x.omit ? ' checked' : '') + ' aria-label="Include ' + esc(x.name) + '"></td>' +
-            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? (x.supportRisk ? ' · Review support role → ' : ' · Suggested → ') + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
+            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
             '<td class="position-col"><b>' + esc(x.position) + '</b>' + review + '</td>' +
             '<td class="effect-col"><b>' + fmt(x.effectiveness.total) + '</b><small>Fit ' + fmt(x.currentFit) + '</small></td>' +
             '<td class="current-col">' + (x.wage == null ? '<span class="subtle">—</span>' : money(x.wage)) + '</td>' +
@@ -1988,7 +2254,7 @@ function bind(result) {
                 toast('The staffing scenario is no longer available. Refresh company data.', false);
                 return;
             }
-            ui.page = 'settings';
+            ui.page = 'positions';
             detailId = '';
             render();
             toast('Exploratory staffing targets saved. No Torn position was changed.', true);
@@ -1997,7 +2263,8 @@ function bind(result) {
 
     panel.querySelectorAll('[data-page]').forEach(function (b) {
         b.onclick = function () {
-            ui.page = b.dataset.page || 'overview';
+            ui.page = b.dataset.page || 'dashboard';
+            ui.filter = ui.page === 'wages' ? ui.filter : 'all';
             detailId = '';
             render();
         };
@@ -2006,7 +2273,7 @@ function bind(result) {
     panel.querySelectorAll('[data-filter-jump]').forEach(function (b) {
         b.onclick = function () {
             ui.filter = b.dataset.filterJump || 'all';
-            ui.page = 'employees';
+            ui.page = 'wages';
             render();
         };
     });
@@ -2143,6 +2410,164 @@ function bind(result) {
     if (csv && result) csv.onclick = function () { exportCsv(result.rows); };
 }
 
+
+function autoSyncIsAllowed() {
+    return cfg.autoRefresh !== false && !!apiKey() && isOwnCompanyView() &&
+        document.visibilityState !== 'hidden';
+}
+
+function autoSyncLog() {
+    var state = get('autoSyncState', {});
+    return state && typeof state === 'object' && !Array.isArray(state) ? state : {};
+}
+
+function autoSyncStatusText() {
+    if (cfg.autoRefresh === false) return 'Auto-recording is off. Enable it in Settings.';
+    if (!apiKey()) return 'Auto-recording needs a Torn API key.';
+    if (!isOwnCompanyView()) return 'Auto-recording is available when you visit your own company page.';
+    var log = autoSyncLog();
+    if (log.lastError && log.lastAttempt &&
+        Date.now() - log.lastAttempt < AUTO_SYNC_FAILURE_BACKOFF) {
+        return 'Automatic recording could not refresh; retrying later. Manual Refresh is available.';
+    }
+    return 'Auto-recording is on' +
+        (lastLoadedAt ? ' · Last saved ' + nowText(lastLoadedAt) : ' · Waiting for your first company visit') +
+        '. It works while this company page is open and visible.';
+}
+
+function renderAutoSyncIfVisible() {
+    if (!S || !S.querySelector) return;
+    var overlay = S.querySelector('#overlay');
+    if (!overlay || !overlay.classList.contains('show')) return;
+    // Do not discard edits in progress during an automatic refresh.
+    var focused = S.activeElement;
+    if (focused && /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName || '')) return;
+    render();
+}
+
+function scheduleAutoCompanySync(reason, delayMs) {
+    clearTimeout(autoSyncTimer);
+    autoSyncTimer = setTimeout(function () {
+        autoSyncTimer = 0;
+        runAutoCompanySync(reason || 'periodic');
+    }, Math.max(0, Number(delayMs) || 0));
+}
+
+async function runAutoCompanySync(reason) {
+    if (!autoSyncIsAllowed() || busy) return false;
+    var now = Date.now();
+    var log = autoSyncLog();
+    var gap = reason === 'company-action' ? AUTO_SYNC_CHANGE_GAP :
+        reason === 'periodic' ? AUTO_SYNC_INTERVAL : AUTO_SYNC_VISIT_GAP;
+    var companyId = company && company.id || '';
+    var sameCompany = !log.companyId || !companyId || String(log.companyId) === String(companyId);
+    if (sameCompany && now - Number(log.lastAttempt || 0) < gap) return false;
+    if (sameCompany && log.lastError &&
+        now - Number(log.lastAttempt || 0) < AUTO_SYNC_FAILURE_BACKOFF) return false;
+
+    // Soft cross-tab lease to avoid duplicate API requests.
+    var lease = get('autoSyncLease', {});
+    if (lease && lease.owner !== autoSyncOwner && num(lease.expires) > now) return false;
+    put('autoSyncLease', { owner:autoSyncOwner, expires:now + AUTO_SYNC_LEASE_MS });
+    var verified = get('autoSyncLease', {});
+    if (!verified || verified.owner !== autoSyncOwner) return false;
+
+    put('autoSyncState', {
+        lastAttempt:now, lastSuccess:num(log.lastSuccess), companyId:companyId,
+        reason:reason, lastError:''
+    });
+    busy = true;
+    renderAutoSyncIfVisible();
+    try {
+        await fetchAll();
+        put('autoSyncState', {
+            lastAttempt:now, lastSuccess:Date.now(),
+            companyId:company && company.id || companyId,
+            reason:reason, lastError:''
+        });
+        return true;
+    } catch (err) {
+        put('autoSyncState', {
+            lastAttempt:now, lastSuccess:num(log.lastSuccess),
+            companyId:companyId, reason:reason,
+            lastError:String(err && err.message || 'Unable to refresh').slice(0, 140)
+        });
+        return false;
+    } finally {
+        busy = false;
+        var ownedLease = get('autoSyncLease', {});
+        if (ownedLease && ownedLease.owner === autoSyncOwner) remove('autoSyncLease');
+        renderAutoSyncIfVisible();
+    }
+}
+
+function observeAutoCompanyRoute() {
+    var route = location.pathname + location.search;
+    if (autoSyncRoute === route) return;
+    autoSyncRoute = route;
+    if (!isOwnCompanyView()) {
+        clearTimeout(autoSyncTimer);
+        autoSyncTimer = 0;
+        return;
+    }
+    scheduleAutoCompanySync('company-visit', 700);
+}
+
+function companyActionElement(target) {
+    if (!target || target.nodeType !== 1 || !isOwnCompanyView()) return null;
+    if ((host && host.contains(target)) || (launcher && launcher.contains(target))) return null;
+    var action = target.closest && target.closest('button,input[type="submit"],[role="button"],a');
+    if (!action || action.disabled) return null;
+    var label = String(action.textContent || action.value || action.getAttribute('aria-label') || '')
+        .replace(/\s+/g, ' ').trim().slice(0, 120);
+    return /\b(save|update|apply|hire|fire|dismiss|remove|assign|promote|demote|train|advertis(?:e|ing|ement)?|upgrade|change|confirm|submit|purchase|buy|sell|transfer|deposit|withdraw|increase|decrease|start|stop|set)\b/i.test(label) ?
+        action : null;
+}
+
+function installAutoCompanyRecording() {
+    observeAutoCompanyRoute();
+
+    // Wait briefly after Torn interactions, then read the actual API state;
+    // a click is never treated as proof that a change succeeded.
+    document.addEventListener('click', function (event) {
+        if (autoSyncIsAllowed() && companyActionElement(event.target))
+            scheduleAutoCompanySync('company-action', 4500);
+    }, true);
+    document.addEventListener('submit', function (event) {
+        var form = event.target;
+        if (autoSyncIsAllowed() && form && !(host && host.contains(form)))
+            scheduleAutoCompanySync('company-action', 4500);
+    }, true);
+    document.addEventListener('change', function (event) {
+        var element = event.target;
+        if (!autoSyncIsAllowed() || !element || (host && host.contains(element))) return;
+        if (element.matches && element.matches('select,input[type="number"],input[type="checkbox"]'))
+            scheduleAutoCompanySync('company-action', 6000);
+    }, true);
+
+    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible' && isOwnCompanyView())
+            scheduleAutoCompanySync('return-to-company', 800);
+    });
+    window.addEventListener('focus', function () {
+        if (isOwnCompanyView()) scheduleAutoCompanySync('return-to-company', 1200);
+    });
+    window.addEventListener('popstate', observeAutoCompanyRoute);
+    window.addEventListener('hashchange', observeAutoCompanyRoute);
+    setInterval(function () {
+        observeAutoCompanyRoute();
+        if (autoSyncIsAllowed()) scheduleAutoCompanySync('periodic', 100);
+    }, AUTO_SYNC_INTERVAL);
+
+    // Share refreshed cached company data across tabs without another request.
+    window.addEventListener('storage', function (event) {
+        if (event.key === PFX + 'cache' && !busy && restoreCache())
+            renderAutoSyncIfVisible();
+        else if (event.key && event.key.indexOf(PFX + 'changeHistory:') === 0 && !busy)
+            renderAutoSyncIfVisible();
+    });
+}
+
 async function load() {
     if (busy) return;
     busy = true;
@@ -2150,7 +2575,13 @@ async function load() {
     render();
     try {
         await fetchAll();
-        toast('Company data refreshed.', true);
+        var existingSync = autoSyncLog();
+        put('autoSyncState', {
+            lastAttempt:Date.now(), lastSuccess:Date.now(),
+            companyId:company && company.id || existingSync.companyId || '',
+            reason:'manual', lastError:''
+        });
+        toast('Company data refreshed and recorded.', true);
     } catch (e) {
         errorState = e;
     } finally {
@@ -2162,9 +2593,9 @@ async function load() {
 function openPanel() {
     S.querySelector('#overlay').classList.add('show');
     if (typeof refreshLauncherVisibility === 'function') refreshLauncherVisibility();
-    if (!ui.page) ui.page = 'overview';
+    if (!ui.page) ui.page = 'dashboard';
     render();
-    if (cfg.autoRefresh && apiKey() && (!lastLoadedAt || Date.now() - lastLoadedAt > FRESH_AGE) && !busy) load();
+    if (autoSyncIsAllowed()) scheduleAutoCompanySync('panel-open', 300);
 }
 
 function closePanel() {
@@ -2199,11 +2630,14 @@ function saveKey() {
         remove('key');
         sessionPut('sessionKey', value);
     }
+    // A new key should not inherit the failed-key auto-sync backoff.
+    remove('autoSyncState');
     box.classList.remove('show');
     if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility();
     errorState = null;
     toast('API key saved for ' + (remember.checked ? 'this device.' : 'this session.'), true);
     render();
+    if (isOwnCompanyView() && cfg.autoRefresh) scheduleAutoCompanySync('company-visit', 300);
 }
 
 function clearKey() {
@@ -2470,6 +2904,102 @@ S.innerHTML = '<style>' +
 '.support-impact{margin:0 14px 14px;padding:12px;border-radius:11px;border:1px solid #37644d;background:#13281f}.support-impact-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}.support-impact-head small{display:block;font-size:9px;text-transform:uppercase;color:#9bd8b5;letter-spacing:.4px}.support-impact-head h4{margin:4px 0;font-size:13px}.support-impact-head>b{font-size:10px}.support-impact p{margin:6px 0 0;color:#bfd6ca;font-size:10px;line-height:1.5}.support-risk{margin-top:10px;padding:10px;border:1px solid #9e7230;border-radius:9px;background:#382b1b;color:#ffe3ac;font-size:10px}.support-risk p{color:#ffe3ac}.support-risk ul{margin:6px 0 0;padding-left:16px;line-height:1.5}.staffing-reason.caution{background:#382b1b;border-color:#9e7230}.staffing-reason.caution b{color:#ffe3ac}@media(max-width:700px){.support-impact{margin-left:10px;margin-right:10px}}' +
 '.changes-reason-editor{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 0}.changes-reason-editor input{flex:1 1 180px;min-width:0;padding:7px 9px;border:1px solid var(--border2);border-radius:7px;background:#10171b;color:var(--text);font-size:10px}.changes-reason-editor button{padding:7px 9px;border:1px solid #317c57;border-radius:7px;background:#1b4933;color:#c2f4da;font-size:10px;font-weight:850}.changes-page{padding:0 0 16px}.changes-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin:0 14px 12px}.changes-ranges{display:flex;flex-wrap:wrap;gap:5px}.changes-ranges button,.changes-copy{border:1px solid var(--border2);border-radius:8px;padding:8px 11px;background:var(--panel2);color:var(--text)!important;font-size:11px;font-weight:800}.changes-ranges button.selected{border-color:#2eaa76;background:#153e2b;color:#baf2d2!important}.changes-copy{background:var(--green2);border-color:#2eaa76}.changes-coverage{display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:0 14px 10px;padding:10px 12px;background:#13281f;border:1px solid #2e654b;border-radius:10px;font-size:11px}.changes-coverage b{color:#c2f4da}.changes-coverage span{font-size:10px;color:#afc6b9}.changes-notice{margin-top:8px}.changes-section-head{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:6px;margin:16px 14px 9px}.changes-section-head h4{margin:0;font-size:13px}.changes-section-head small{color:var(--muted);font-size:9px}.changes-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 14px}.changes-metric{min-width:0;padding:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px}.changes-metric small,.changes-metric strong,.changes-metric span{display:block}.changes-metric small{font-size:10px;color:var(--muted)}.changes-metric strong{margin-top:4px;font-size:17px;overflow-wrap:anywhere}.changes-metric span{margin-top:4px;font-size:10px;color:#b2bbc2}.changes-metric span.up{color:#8ff0bd}.changes-metric span.down{color:#ffb0b0}.changes-counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0 14px 10px}.changes-counts>div{padding:11px;background:#1c252b;border:1px solid var(--border);border-radius:9px;text-align:center}.changes-counts b,.changes-counts small{display:block}.changes-counts b{font-size:20px}.changes-counts small{color:var(--muted);font-size:10px}.changes-timeline,.changes-employee-list{margin:0 14px;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden}.changes-event{display:flex;gap:12px;padding:12px;border-bottom:1px solid var(--border);align-items:start}.changes-event:last-child,.changes-employee-row:last-child{border-bottom:none}.changes-event-tag{flex:0 0 86px;text-align:center;border:1px solid #5e6873;border-radius:5px;padding:5px 3px;color:#e0e5e9;font-size:9px;font-weight:850}.changes-event-tag.joined{color:#aaf1ce;border-color:#387b58;background:#133c2b}.changes-event-tag.fired{color:#ffc0bd;border-color:#8d4849;background:#432023}.changes-event-tag.left,.changes-event-tag.unconfirmed{color:#ffe2a0;border-color:#8d7138;background:#3e321d}.changes-event-content{min-width:0}.changes-event-content b{display:block;font-size:11px;line-height:1.5;font-weight:650;overflow-wrap:anywhere}.changes-event-content p{margin:5px 0;color:#ffccbd;font-size:10px}.changes-event-content small{display:block;margin-top:6px;color:var(--muted);font-size:9px}.changes-empty{margin:0 14px;padding:18px 12px;background:var(--panel);border:1px dashed var(--border2);border-radius:10px;color:var(--muted);font-size:11px;line-height:1.5}.changes-empty h4{margin:0 0 5px;color:var(--text);font-size:13px}.changes-empty p{margin:0}.changes-employee-row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);font-size:11px}.changes-employee-row>span{font-weight:800;min-width:0}.changes-employee-row small{display:block;margin-top:3px;color:var(--muted);font-size:9px}.changes-employee-row>b{font-size:10px;font-weight:650;text-align:right;overflow-wrap:anywhere}.changes-overflow{margin:6px 14px;font-size:10px;color:var(--amber)}.changes-footnote{margin:16px 14px 0;font-size:10px;color:var(--muted);line-height:1.6}@media(max-width:700px){.changes-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 9px}.changes-toolbar,.changes-timeline,.changes-employee-list,.changes-counts{margin-left:9px;margin-right:9px}.changes-counts{grid-template-columns:repeat(2,minmax(0,1fr))}.changes-coverage{margin-left:9px;margin-right:9px}.changes-section-head{margin-left:9px;margin-right:9px}.changes-event-tag{flex-basis:72px}.changes-event{gap:8px;padding:10px}.changes-metric strong{font-size:15px}.changes-footnote{margin:14px 9px}.page-tab{padding-left:4px;padding-right:4px}.page-tab-main{font-size:10px}.changes-employee-row{align-items:start;flex-direction:column;gap:5px}.changes-employee-row>b{text-align:left}}@media(max-width:380px){.changes-metrics{grid-template-columns:1fr}.page-tab-main{font-size:9px}}' +
 '</style>' +
+'<style>' +
+'/* v2.6 dashboard and section navigation — dark green visual system */' +
+'.workspace-tools{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:6px 14px;background:#111a1b;border-bottom:1px solid var(--border)}' +
+'.workspace-tools>span{margin-right:4px;color:#9baca4;font-size:11px;font-weight:700}' +
+'.workspace-tools button{min-height:34px;padding:7px 12px;border:1px solid #3b514a;border-radius:9px;background:#182823;color:#d8ede3!important;font:750 11px Arial,sans-serif;cursor:pointer}' +
+'.workspace-tools button.selected{background:#18432f;border-color:#3eb17e;color:#d6ffe7!important}' +
+'.workspace-tools button:hover{background:#254737}' +
+'.section-actionbar:not(.wages-actions){grid-template-columns:repeat(2,minmax(0,190px))}' +
+'.page-tabs .page-tab{cursor:pointer;min-height:53px}' +
+'.page-tab:focus-visible,.workspace-tools button:focus-visible,.dashboard-link:focus-visible,.guide-shortcuts button:focus-visible,.position-person button:focus-visible,.role-opportunity button:focus-visible{outline:3px solid #8debc0;outline-offset:-3px}' +
+'.page-tab.active{background:#163c2c;box-shadow:inset 0 -3px 0 #51d99e}' +
+'.dashboard-page,.positions-page,.statistics-page{padding-bottom:18px}' +
+'.dashboard-hero{align-items:center;padding-top:19px;padding-bottom:10px}' +
+'.dashboard-hero h3{font-size:22px;letter-spacing:-.4px}' +
+'.dashboard-hero p{font-size:12px;max-width:650px}' +
+'.dashboard-quick-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:0 14px 22px}' +
+'.dashboard-quick-stats .summary-card{padding:13px;border-color:#344a44;background:#16231e}' +
+'.dashboard-quick-stats .summary-card small{font-size:10px;color:#a4c6b3}' +
+'.dashboard-quick-stats .summary-card b{font-size:19px;white-space:normal;overflow-wrap:anywhere;line-height:1.3}' +
+'.dashboard-quick-stats .summary-card span{font-size:10px;line-height:1.4}' +
+'.dashboard-section-title{padding:0 14px 10px}' +
+'.dashboard-section-title h4{margin:0 0 4px;font-size:16px;color:#e6f5ed}' +
+'.dashboard-section-title p{margin:0;color:#a7b9ae;font-size:11px;line-height:1.5}' +
+'.dashboard-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;padding:0 14px}' +
+'.dashboard-link{display:flex;flex-direction:column;align-items:stretch;min-width:0;text-align:left;min-height:206px;padding:16px;cursor:pointer;border-radius:14px;border:1px solid #37584a;background:linear-gradient(165deg,#1c3026,#121b18);color:#e9f5ec!important;transition:border-color .14s,background .14s,transform .14s}' +
+'.dashboard-link:nth-child(2){background:linear-gradient(165deg,#1c3032,#141d20);border-color:#365960}' +
+'.dashboard-link:nth-child(3){background:linear-gradient(165deg,#243026,#171e1a);border-color:#526044}' +
+'.dashboard-link:nth-child(4){background:linear-gradient(165deg,#2a2730,#1c1920);border-color:#594c5e}' +
+'.dashboard-link:hover{border-color:#85ddab;transform:translateY(-2px)}' +
+'.dashboard-card-top{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#a2c5b2;font-size:11px;font-weight:750;letter-spacing:.25px}' +
+'.dashboard-card-top>span:last-child{font-size:17px;color:#c3edda}' +
+'.dashboard-link>strong{display:block;margin-top:14px;font-size:17px;font-weight:900}' +
+'.dashboard-card-number{display:block;margin-top:8px;color:#f4fff7;font-size:23px;line-height:1.25;font-weight:900;overflow-wrap:anywhere;min-height:28px}' +
+'.dashboard-card-description{display:block;margin-top:6px;color:#b6c9bc;font-size:12px;line-height:1.5}' +
+'.dashboard-card-footer{display:flex;align-items:center;justify-content:space-between;gap:9px;flex-wrap:wrap;margin-top:auto;padding-top:14px;color:#b2cabb;font-size:10px;line-height:1.4}' +
+'.dashboard-card-footer b{color:#a8f2cd;white-space:nowrap;font-size:11px}' +
+'.dashboard-next{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:14px;padding:14px 16px;border:1px solid #385445;border-radius:12px;background:#14231b}' +
+'.dashboard-next b{font-size:13px;color:#ebfaed}' +
+'.dashboard-next p{margin:5px 0 0;font-size:11px;line-height:1.5;color:#adc9b8}' +
+'.dashboard-next button,.guide-shortcuts button,.settings-route button,.positions-person>button,.positions-section-head button{padding:9px 12px;min-height:36px;flex-shrink:0;border:1px solid #3d9b6a;border-radius:9px;background:#205139;color:#d9f9e6!important;font-weight:800;font-size:11px;cursor:pointer}' +
+'.wages-summary .summary{grid-template-columns:repeat(3,minmax(0,1fr))}' +
+'.wages-summary .summary-card b{overflow-wrap:anywhere;white-space:normal;font-size:18px}' +
+'.positions-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 14px 18px}' +
+'.positions-metric,.stats-tile{padding:13px;border:1px solid #38504a;border-radius:11px;background:#1a2622;min-width:0}' +
+'.positions-metric>* ,.stats-tile>*{display:block}' +
+'.positions-metric small,.stats-tile small{font-size:10px;color:#a7c9b6;font-weight:750;line-height:1.5}' +
+'.positions-metric strong,.stats-tile strong{display:block;margin-top:6px;color:#effbf3;font-size:19px;line-height:1.35;overflow-wrap:anywhere}' +
+'.positions-metric span,.stats-tile span{display:block;margin-top:5px;color:#adbbb2;font-size:10px;line-height:1.45}' +
+'.positions-section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:18px 14px 10px}' +
+'.positions-section-head h4{font-size:15px;margin:0 0 4px;color:#e6f6eb}' +
+'.positions-section-head p{margin:0;font-size:11px;line-height:1.45;color:#adc0b4}' +
+'.positions-employee-list{margin:0 14px 14px;border:1px solid #384d47;border-radius:12px;overflow:hidden;background:#161f1b}' +
+'.positions-person{display:grid;grid-template-columns:minmax(110px,1.1fr) minmax(190px,2.2fr) minmax(130px,1fr) auto;gap:10px;align-items:center;padding:12px 14px;border-bottom:1px solid #304139}' +
+'.positions-person:last-child{border-bottom:0}' +
+'.positions-person-main{min-width:0}' +
+'.positions-person-main b{display:block;color:#f0faf3;font-size:12px;overflow-wrap:anywhere}' +
+'.positions-person-main small{display:block;color:#98a99e;margin-top:3px;font-size:10px}' +
+'.positions-person-roles{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;min-width:0}' +
+'.positions-person-roles>div{min-width:0}' +
+'.positions-person-roles small{display:block;font-size:9px;color:#9cac9e;text-transform:uppercase;letter-spacing:.45px}' +
+'.positions-person-roles span{display:block;margin-top:3px;font-size:11px;color:#e0f1e4;font-weight:750;overflow-wrap:anywhere}' +
+'.positions-person-status{min-width:0}' +
+'.positions-person-status>span{font-size:10px;color:#b9dfc4;font-weight:800;display:block}' +
+'.positions-person-status small{display:block;color:#9eada5;font-size:9px;margin-top:4px}' +
+'.positions-person-status.review>span{color:#f2d7a2}' +
+'.positions-person-status.caution>span{color:#ffb9a0}' +
+'.positions-planner{margin:0 14px}' +
+'.positions-planner .staffing-summary{margin-top:0}' +
+'.positions-planner .staffing-table{margin-bottom:10px}' +
+'.positions-preferences{margin-top:16px}' +
+'.stats-explain{margin:0 14px 12px;padding:12px 14px;border:1px solid #406252;border-radius:11px;background:#14291e}' +
+'.stats-explain b{color:#c7f3d8;font-size:12px}' +
+'.stats-explain p{color:#bbd2c2;font-size:11px;line-height:1.55;margin:4px 0 0}' +
+'.stats-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:0 14px 8px}' +
+'.stats-tile strong{font-size:17px}' +
+'.stats-comparison-note{margin:0 14px 10px;padding:10px 13px;border:1px solid #456154;border-radius:9px;background:#17281f;color:#c5dacd;font-size:11px;line-height:1.5}' +
+'.stats-deltas{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:0 14px}' +
+'.stats-deltas>div{padding:11px;border:1px solid #3c5449;border-radius:10px;background:#18241f;min-width:0}' +
+'.stats-deltas small,.stats-deltas strong,.stats-deltas span{display:block;line-height:1.4}' +
+'.stats-deltas small{font-size:10px;color:#abc3b5}' +
+'.stats-deltas strong{font-size:17px;color:#d6f3df;overflow-wrap:anywhere;margin:5px 0}' +
+'.stats-deltas span{font-size:10px;color:#9eafa6}' +
+'.stats-footnote{margin:14px;padding:11px 13px;color:#b9c9be;font-size:11px;line-height:1.5}' +
+'.settings-route{display:flex;justify-content:space-between;align-items:center;gap:16px}' +
+'.settings-route b{font-size:12px;color:#e1f7e9}' +
+'.settings-route p{font-size:11px;color:#b9cabe;line-height:1.5;margin:5px 0 0}' +
+'.guide-shortcuts{display:flex;flex-wrap:wrap;gap:7px;margin:0 14px 12px}' +
+'.guide-shortcuts button{background:#19352a;min-height:36px}' +
+'@media(max-width:1000px){.dashboard-quick-stats,.stats-grid,.stats-deltas{grid-template-columns:repeat(2,minmax(0,1fr))}.positions-person{grid-template-columns:minmax(90px,1fr) minmax(160px,2fr) minmax(100px,1fr)}.positions-person>button{grid-column:3;justify-self:start}}' +
+'@media(max-width:700px){.workspace-tools{padding:6px 10px;gap:5px}.workspace-tools>span{margin-right:auto;font-size:10px}.workspace-tools button{font-size:10px;padding:6px 10px}.section-actionbar:not(.wages-actions){grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-hero{align-items:flex-start;flex-direction:column;gap:10px}.dashboard-hero h3{font-size:19px}.dashboard-hero p{font-size:11px}.dashboard-quick-stats{margin:0 10px 16px;gap:7px}.dashboard-quick-stats .summary-card b{font-size:16px}.dashboard-section-title{padding:0 10px 9px}.dashboard-links{padding:0 10px;gap:8px}.dashboard-link{padding:12px;min-height:198px}.dashboard-link>strong{font-size:14px;margin-top:12px}.dashboard-card-number{font-size:18px}.dashboard-card-description{font-size:11px}.dashboard-card-footer{flex-direction:column;align-items:flex-start;gap:4px}.dashboard-next{margin:10px;align-items:flex-start;flex-direction:column}.positions-metrics,.stats-grid,.stats-deltas{margin-left:10px;margin-right:10px;gap:7px}.positions-metric,.stats-tile{padding:10px}.positions-metric strong,.stats-tile strong{font-size:15px}.positions-section-head{margin:16px 10px 9px;align-items:flex-start}.positions-section-head h4{font-size:14px}.positions-employee-list{margin-left:10px;margin-right:10px}.positions-person{grid-template-columns:minmax(0,1fr) auto;padding:10px;gap:9px}.positions-person-main{grid-column:1;grid-row:1}.positions-person>button{grid-column:2;grid-row:1;justify-self:end}.positions-person-roles{grid-column:1/-1;grid-row:2}.positions-person-status{grid-column:1/-1;grid-row:3}.positions-planner{margin:0 10px}.stats-explain{margin:0 10px 10px}.stats-comparison-note{margin:0 10px 10px}.stats-footnote{margin:12px 10px}.wages-summary .summary{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-route{align-items:flex-start;flex-direction:column}.guide-shortcuts{margin-left:10px;margin-right:10px}.page-tab{min-height:49px}.page-tab-main{overflow-wrap:anywhere}}' +
+'@media(max-width:430px){.dashboard-quick-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-links{grid-template-columns:1fr}.dashboard-link{min-height:158px}.dashboard-card-footer{flex-direction:row;align-items:center}.stats-grid,.stats-deltas{grid-template-columns:repeat(2,minmax(0,1fr))}.positions-metrics{grid-template-columns:1fr 1fr}.positions-metrics .positions-metric:last-child{grid-column:1/-1}.wages-summary .summary{grid-template-columns:1fr 1fr}.wages-summary .summary-card:last-child{grid-column:1/-1}.positions-section-head button{max-width:140px}.page-tabs .page-tab{min-height:48px}.page-tab-main{font-size:10px}}' +
+'@media(prefers-reduced-motion:reduce){.dashboard-link{transition:none}.dashboard-link:hover{transform:none}}' +
+'</style>' +
+'<style>' +
+".auto-recording-indicator{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid #293d35;background:#10221a;color:#bdd5c5;font-size:10px;line-height:1.4}.auto-recording-indicator .auto-dot{flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#8b8973}.auto-recording-indicator .auto-dot.enabled{background:#48d695;box-shadow:0 0 0 3px #48d69522}.auto-recording-indicator .auto-dot.paused{background:#c89e65}.auto-recording-indicator>span:nth-child(2){min-width:0;flex:1}.auto-recording-indicator button{border:1px solid #335b45;background:#143c29;color:#c9f4d8!important;border-radius:6px;font-weight:800;font-size:10px;padding:5px 9px;min-height:29px;cursor:pointer}@media(max-width:700px){.auto-recording-indicator{padding:8px 10px}.auto-recording-indicator button{min-height:30px}}" +
+'</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
 '<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored in local storage on this device)</label><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="save" class="save">Save key</button></div></div></div>' +
 '<div id="toast" role="status" aria-live="polite"></div>';
@@ -2575,6 +3105,7 @@ setInterval(refreshLauncherVisibility, 1200);
 
 dragButton(launcher);
 restoreCache();
+installAutoCompanyRecording();
 
 // Torn can replace large portions of the company page without a full reload.
 // Keep both the panel host and the launcher mounted at the document root.
@@ -2582,6 +3113,7 @@ var launcherSurvivalObserver = new MutationObserver(function () {
     if (!host.isConnected) document.documentElement.appendChild(host);
     if (!launcher.isConnected) document.documentElement.appendChild(launcher);
     scheduleLauncherVisibility();
+    observeAutoCompanyRoute();
 });
 launcherSurvivalObserver.observe(document.documentElement, { childList:true, subtree:true, attributes:true, attributeFilter:['class','style','aria-hidden'] });
 window.addEventListener('resize', scheduleLauncherVisibility);
