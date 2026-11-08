@@ -7,6 +7,7 @@ on:
       - 'tests/company-changes.test.js'
       - 'tests/support-role-optimizer.test.js'
       - 'tests/section-navigation.test.js'
+      - 'tests/auto-company-recording.test.js'
       - '.github/workflows/test-company-changes.yml'
   push:
     branches:
@@ -17,6 +18,7 @@ on:
       - 'tests/company-changes.test.js'
       - 'tests/support-role-optimizer.test.js'
       - 'tests/section-navigation.test.js'
+      - 'tests/auto-company-recording.test.js'
       - '.github/workflows/test-company-changes.yml'
 
 permissions:
