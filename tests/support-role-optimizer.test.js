@@ -261,3 +261,28 @@ test('modeled fit benefits alone gate nonsupport recommendations', () => {
     assert.equal(proposal[0].key,'other');
     assert.equal(proposal[0].plan.fitDelta,70);
 });
+
+
+test('normalizes catalog special_ability so unseen role types are classified correctly', () => {
+    const catalogStart=script.indexOf('function normalizePositions(');
+    const catalogEnd=script.indexOf('function statEfficiency(', catalogStart);
+    assert.ok(catalogStart >= 0 && catalogEnd > catalogStart);
+    const parser=new Function('payload',
+        'var num=function(v){return Number(v)||0;};\n' +
+        script.slice(catalogStart,catalogEnd) +
+        '\nreturn normalizePositions(payload,7);');
+    const parsed=parser({ companies: [
+        {id:7,positions:[
+            {id:'t',name:'Consultant',description:'Employee training.',special_ability:'Trainer',
+                working_stats:{required:{intelligence:1000,endurance:500}} },
+            {id:'m',name:'Team Lead',description:'Oversees others.',ability:'Manager',
+                working_stats:{required:{intelligence:900,endurance:1200}} }
+        ]}
+    ]});
+    assert.equal(parsed.length,2);
+    assert.equal(parsed[0].ability,'Trainer');
+    assert.equal(parsed[1].ability,'Manager');
+    assert.equal(harness(parsed,[]).supportRoleKind(parsed[0]),'trainer');
+    assert.equal(harness(parsed,[]).supportRoleKind(parsed[1]),'manager');
+    assert.equal(parsed[0].required.intelligence,1000);
+});
