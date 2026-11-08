@@ -49,7 +49,8 @@ function harness(positions, staff, options = {}) {
             environment: options.environment ?? null
         },
         fmt: (value) => String(Math.round(Number(value))),
-        money: (value) => '
+        money: (value) => String(Math.round(Number(value)))
+    });
 }
 
 test('complete userscript parses', () => {
