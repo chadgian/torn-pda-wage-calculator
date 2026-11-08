@@ -816,7 +816,9 @@ function calculate() {
             statBestPosition: assigned && assigned.statBestPosition || pure && pure.position || null,
             statBestFit: assigned ? assigned.statBestFit : pure ? pure.fit : 0,
             staffingTarget: assigned ? assigned.targetCount : 0,
-            staffingCurrent: assigned ? assigned.currentCount : 0
+            staffingCurrent: assigned ? assigned.currentCount : 0,
+            supportProtected: !!(assigned && assigned.supportProtected),
+            supportRisk: assigned && assigned.supportRisk || ''
         });
     });
 
@@ -861,6 +863,8 @@ function calculate() {
             statBestFit: assigned ? assigned.statBestFit : pure ? pure.fit : 0,
             staffingTarget: assigned ? assigned.targetCount : 0,
             staffingCurrent: assigned ? assigned.currentCount : 0,
+            supportProtected: !!(assigned && assigned.supportProtected),
+            supportRisk: assigned && assigned.supportRisk || '',
             suggested: employee.wage == null ? 0 : employee.wage,
             change: 0,
             changePct: 0,
@@ -892,7 +896,10 @@ function calculate() {
         avgFit: avg(calcRows, function (x) { return x.currentFit; }),
         positionPlan: positionAssignment.plan,
         positionCurrentFit: positionAssignment.currentFit,
-        positionSuggestedFit: positionAssignment.suggestedFit
+        positionSuggestedFit: positionAssignment.suggestedFit,
+        support: positionAssignment.support || supportRoleSnapshot(),
+        protectedCount: positionAssignment.protectedCount || 0,
+        supportRisks: positionAssignment.supportRisks || []
     };
 }
 
@@ -1264,8 +1271,14 @@ function detailHtml(x) {
     var req = best && best.required;
     var staffingNote = '';
 
+    if (x.supportProtected) {
+        staffingNote += '<div class="staffing-reason"><b>Support role protected</b><p>This employee stays in a support role because moving them could change company-wide effectiveness, training, marketing, environment, or reporting. Better individual stat fit alone is not sufficient.</p></div>';
+    } else if (x.supportRisk) {
+        staffingNote += '<div class="staffing-reason caution"><b>Manual review required</b><p>' + esc(x.supportRisk) + ' Compare observed company results before applying this move.</p></div>';
+    }
+
     if (best && pure && pure.name !== best.name) {
-        staffingNote = '<div class="staffing-reason"><b>Why not ' + esc(pure.name) + '?</b><p>' + esc(pure.name) + ' is the pure stat-fit winner for this employee (' + fmt(x.statBestFit) + '), but the staffing plan assigns ' + esc(best.name) + ' so the company keeps the required number of people in each role.</p></div>';
+        staffingNote += '<div class="staffing-reason"><b>Why not ' + esc(pure.name) + '?</b><p>' + esc(pure.name) + ' is the pure stat-fit winner for this employee (' + fmt(x.statBestFit) + '), but the staffing plan assigns ' + esc(best.name) + ' so the company keeps the required number of people in each role.</p></div>';
     }
 
     return '<div class="detail-card">' +
@@ -1292,7 +1305,7 @@ function detailHtml(x) {
         '</div>' +
         (best && !x.director ? '<h4>Staffing-aware position</h4><div class="position-box"><div><b>' + esc(best.name) + '</b><small>Target: ' + fmt(x.staffingTarget) + ' employee' + (num(x.staffingTarget) === 1 ? '' : 's') + ' in this role. ' + esc(best.description || best.ability || 'Assigned using the company-wide staffing plan.') + '</small></div><strong>' + fmt(x.bestFit) + '</strong></div>' +
         '<div class="requirements"><span>Requires:</span>' + requirementBadge('MAN', req.manual) + requirementBadge('INT', req.intelligence) + requirementBadge('END', req.endurance) + '</div>' + staffingNote : '') +
-        '<p class="detail-note">Position recommendations optimize the whole company. Target counts decide how many slots each position must have; work stats decide which employees should fill those slots.</p>' +
+        '<p class="detail-note">Position recommendations maximize combined predicted work-stat fit within role counts; current support-role incumbents are preserved by default. The helper cannot forecast company income or changed Management bonuses. Support-role changes require director review.</p>' +
     '</div>';
 }
 
@@ -1507,17 +1520,22 @@ function staffingPlanEditor() {
         return bc - ac || a.name.localeCompare(b.name);
     });
     var stateClass = info.valid ? 'valid' : 'invalid';
+    var reducedSupport = positions.filter(function (p) {
+        return supportRoleKind(p) && num(info.effective[positionKey(p)]) < num(info.current[positionKey(p)]);
+    }).map(function (p) { return p.name; });
     var statusText = info.valid ?
         'Target slots match your ' + fmt(info.employeeTotal) + ' non-director employees.' :
         'Target slots total ' + fmt(info.targetTotal) + ', but you have ' + fmt(info.employeeTotal) + ' non-director employees. Current position counts are used until the totals match.';
 
     var html = '<div class="staffing-summary ' + stateClass + '"><div><b>' + (info.custom ? 'Custom staffing targets' : 'Current position counts preserved') + '</b><small>' + esc(statusText) + '</small></div><button data-a="reset-staffing">Use current counts</button></div>';
+    if (reducedSupport.length) html += '<div class="notice">Support-role reductions require review: ' + esc(reducedSupport.join(', ')) + '. Incumbents cannot all be protected when their slots are removed.</div>';
     html += '<div class="staffing-table"><div class="staffing-head"><span>Position</span><span>Current</span><span>Target</span></div>';
 
     positionRows.forEach(function (p) {
         var key = positionKey(p);
         var special = p.ability && p.ability !== 'None' ? p.ability : '';
-        html += '<label class="staffing-row"><span class="staffing-role"><b>' + esc(p.name) + '</b>' + (special ? '<small>Special: ' + esc(special) + '</small>' : '') + '</span>' +
+        var family = supportRoleKind(p);
+        html += '<label class="staffing-row"><span class="staffing-role"><b>' + esc(p.name) + '</b>' + (family ? '<small>Support role: ' + esc(family) + '</small>' : '') + (special ? '<small>Special: ' + esc(special) + '</small>' : '') + '</span>' +
             '<span class="staffing-current">' + fmt(info.current[key] || 0) + '</span>' +
             '<input type="number" min="0" max="' + fmt(info.employeeTotal) + '" inputmode="numeric" data-staffing-target="' + esc(key) + '" value="' + fmt(info.target[key] || 0) + '">' +
         '</label>';
@@ -1545,13 +1563,14 @@ function settingsPage() {
             settingField('max', 'Maximum wage', 'Cap applied to every included employee.') +
             settingField('round', 'Round to', 'Use 100, 1,000, 10,000, etc. The allocator tries to preserve the chosen total.') +
         '</div></div>' +
-        '<div class="settings-group staffing-group"><div class="settings-group-title"><b>Position staffing plan</b><small>Position recommendations must fill these role counts. The default is your current company composition; change Target only when you intentionally want a different staffing mix.</small></div>' +
+        '<div class="settings-group staffing-group"><div class="settings-group-title"><b>Position staffing plan</b><small>Position advice fills these role counts. Changing support-role totals can force risky moves even with protection enabled.</small></div>' +
             staffingPlanEditor() +
         '</div>' +
         '<div class="settings-group"><div class="settings-group-title"><b>Helper behavior</b><small>Optional conveniences and recommendations.</small></div><div class="toggles">' +
             toggle('director', 'Include director', 'Include the director in wage distribution.') +
             toggle('fill', 'Safe wage autofill', 'Fill the matching Torn wage field but never press Update or Save.') +
-            toggle('positionAdvice', 'Staffing-aware position advice', 'Optimize the whole team while respecting the target number of employees in each role.') +
+            toggle('positionAdvice', 'Staffing-aware position advice', 'Maximize combined stat fit within target role counts; this is not a profit forecast.') +
+            toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Preserve current Managers, Marketers, Trainers, Cleaners, and Secretaries when matching slots remain. Disable only to explore speculative swaps.') +
             toggle('autoRefresh', 'Refresh on open', 'Refresh automatically when cached data is old.') +
         '</div></div>' +
     '</section>';
