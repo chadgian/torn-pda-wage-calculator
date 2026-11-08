@@ -1642,9 +1642,10 @@ function supportImpactHtml(result) {
         (cfg.protectSupportRoles ? 'Protected' : 'Unprotected') + '</b></div>' +
         '<p>' + esc(kinds.length ? kinds.join(' · ') : 'No recognized current support-role occupants.') + '</p>' +
         '<p>' + esc(bonusText) + ' These are observed values, NOT a forecast of the effects of swapping roles.</p>' +
-        '<p>' + (cfg.protectSupportRoles ?
+        '<p>' + (!cfg.positionAdvice ? 'Position advice is disabled; no position moves are recommended.' :
+            (cfg.protectSupportRoles ?
             fmt(result.protectedCount) + ' support-role incumbent(s) reserved in their current slots.' :
-            'Protection is disabled. Stat-fit advice may rearrange support roles.') + '</p>';
+            'Protection is disabled. Stat-fit advice may rearrange support roles.')) + '</p>';
     if (risks.length) {
         html += '<div class="support-risk"><b>' + fmt(risks.length) +
             ' support-role change(s) require director review.</b>' +
@@ -1710,10 +1711,10 @@ function employeesPage(result, visibleRows) {
         '</tr></thead><tbody>';
 
     visibleRows.forEach(function (x) {
-        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">Suggested → ' + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
+        var review = x.recommendPosition && x.bestPosition ? '<small class="attention">' + (x.supportRisk ? 'Review support role → ' : 'Suggested → ') + esc(x.bestPosition.name) + '</small>' : '<small>Fit ' + fmt(x.currentFit) + '</small>';
         html += '<tr class="' + (x.omit ? 'excluded-row' : '') + '">' +
             '<td class="use-col"><input type="checkbox" data-inc="' + esc(x.id) + '"' + (!x.omit ? ' checked' : '') + ' aria-label="Include ' + esc(x.name) + '"></td>' +
-            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? ' · Suggested → ' + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
+            '<td class="employee-col"><button class="employee-link" data-detail="' + esc(x.id) + '">' + esc(x.name) + '</button><small class="employee-position">' + esc(x.position) + (x.recommendPosition && x.bestPosition ? (x.supportRisk ? ' · Review support role → ' : ' · Suggested → ') + esc(x.bestPosition.name) : '') + '</small><small class="employee-id">[' + esc(x.id) + ']</small></td>' +
             '<td class="position-col"><b>' + esc(x.position) + '</b>' + review + '</td>' +
             '<td class="effect-col"><b>' + fmt(x.effectiveness.total) + '</b><small>Fit ' + fmt(x.currentFit) + '</small></td>' +
             '<td class="current-col">' + (x.wage == null ? '<span class="subtle">—</span>' : money(x.wage)) + '</td>' +
