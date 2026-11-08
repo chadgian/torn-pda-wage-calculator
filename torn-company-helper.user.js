@@ -2090,7 +2090,7 @@ function statisticsPage(result) {
 
 function employeesPage(result, visibleRows) {
     var html = '<section class="workspace employee-page">' +
-        '<div class="page-heading employees-heading"><div><small>Employee recommendations</small><h3>Employee wages</h3><p>Search, review, and copy suggested daily wages. Tap a name for an effectiveness breakdown.</p></div><button class="small" data-a="reset-inclusions">Include all</button></div>' +
+        '<div class="page-heading employees-heading"><div><small>Employee recommendations</small><h3>Employee pay details</h3><p>Search employees, review pay changes, and copy individual wage recommendations.</p></div><button class="small" data-a="reset-inclusions">Include all</button></div>' +
         '<div class="toolbar">' +
             '<div class="search"><span>⌕</span><input data-ui="query" value="' + esc(ui.query) + '" placeholder="Search name, ID, or position" aria-label="Search employees"></div>' +
             '<select data-ui="sort" aria-label="Sort employees">' + sortOptions() + '</select>' +
