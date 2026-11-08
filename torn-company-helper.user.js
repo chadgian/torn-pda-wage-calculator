@@ -43,6 +43,7 @@ var defaults = {
     fill: false,
     positionAdvice: true,
     protectSupportRoles: true,
+    exploreNewRoles: true,
     autoRefresh: true
 };
 
@@ -344,7 +345,7 @@ function normalizePositions(payload, typeId) {
             id: String(p.id == null ? '' : p.id),
             name: String(p.name || 'Unknown position'),
             description: String(p.description || ''),
-            ability: String(p.ability || ''),
+            ability: String(p.ability || p.special_ability || p.specialAbility || ''),
             required: {
                 manual: num(req.manual_labor != null ? req.manual_labor : req.manual),
                 intelligence: num(req.intelligence != null ? req.intelligence : req.intel),
@@ -408,6 +409,11 @@ var POSITION_STABILITY_BONUS = 2;
 // "Marketing Manager" can be a Marketer rather than a Manager.
 function supportRoleKind(position) {
     if (!position) return '';
+    var ability = String(position.ability || position.special_ability || position.specialAbility || '').trim().toLowerCase();
+    if (/^(manager|marketer|trainer|cleaner|secretary)$/.test(ability)) return ability;
+    // Catalog ability is authoritative; a declared non-support ability wins over a
+    // misleading job title (e.g. a generic production supervisor).
+    if (ability && ability !== 'none') return '';
     var description = String(position.description || '').trim();
     var prefix = description.match(/^(manager|marketer|trainer|cleaner|secretary)\s*[:.\-]/i);
     if (prefix) return prefix[1].toLowerCase();
@@ -595,9 +601,20 @@ function maxWeightAssignment(matrix) {
     return assignment;
 }
 
-function companyPositionAssignment() {
+function companyPositionAssignment(overrideTargets) {
     var employees = staff.filter(function (x) { return !x.director; });
     var plan = staffingPlanInfo();
+    if (overrideTargets) {
+        var alternative = normalizedStaffingPlan(overrideTargets);
+        var alternativeTotal = positions.reduce(function (total, p) {
+            return total + num(alternative[positionKey(p)]);
+        }, 0);
+        if (alternativeTotal !== employees.length) return {
+            byEmployee:{}, plan:plan, currentFit:0, suggestedFit:0,
+            support:supportRoleSnapshot(), protectedCount:0, supportRisks:[], invalid:true
+        };
+        plan = Object.assign({}, plan, { effective:alternative, target:alternative, valid:true, custom:true });
+    }
     var slots = [];
     var support = supportRoleSnapshot();
 
