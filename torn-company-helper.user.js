@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.4.0
-// @description  Generic Torn company helper for wage planning, position-fit analysis, payroll balancing, export, and safe wage autofill.
+// @version      2.5.0
+// @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
 // @match        https://torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.4.0';
+var VERSION = '2.5.0';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -63,6 +63,8 @@ var lastLoadedAt = 0;
 var ui = { page: 'overview', query: '', filter: 'all', sort: 'score', direction: 'desc' };
 var pendingId = '';
 var pendingUntil = 0;
+var changeRange = String(get('changeRange', '7'));
+var changesError = '';
 
 function isOwnCompanyView() {
     try { return new URLSearchParams(location.search).get('step') === 'your'; }
@@ -307,7 +309,16 @@ function normalizeCompany(payload) {
         employeeCount: num(p.employees && p.employees.hired),
         capacity: num(p.employees && p.employees.capacity),
         dailyIncome: num(p.income && p.income.daily),
-        weeklyIncome: num(p.income && p.income.weekly)
+        weeklyIncome: num(p.income && p.income.weekly),
+        dailyCustomers: p.customers && p.customers.daily != null ? num(p.customers.daily) : null,
+        weeklyCustomers: p.customers && p.customers.weekly != null ? num(p.customers.weekly) : null,
+        efficiency: p.efficiency == null ? null : num(p.efficiency),
+        popularity: p.popularity == null ? null : num(p.popularity),
+        environment: p.environment == null ? null : num(p.environment),
+        funds: p.funds == null ? null : num(p.funds),
+        trains: p.trains == null ? null : num(p.trains),
+        advertisementBudget: p.advertisement_budget == null ? null : num(p.advertisement_budget),
+        value: p.value == null ? null : num(p.value)
     };
 }
 
@@ -825,6 +836,263 @@ async function fetchAll() {
     positions = nextPositions;
     lastLoadedAt = Date.now();
     cacheData();
+    await updateCompanyChanges(nextCompany, nextStaff);
+}
+
+
+/* Company Changes: store snapshots and the official employee news separately per company.
+   All data stays in this browser's localStorage, never in an external service. */
+function changeStorageKey(id) { return 'changeHistory:' + String(id); }
+
+function readChangeHistory(id) {
+    var raw = get(changeStorageKey(id), null);
+    if (!raw || String(raw.companyId) !== String(id)) {
+        return { companyId: String(id), snapshots: [], news: [], lastNewsFetch: 0 };
+    }
+    return {
+        companyId: String(id),
+        snapshots: Array.isArray(raw.snapshots) ? raw.snapshots : [],
+        news: Array.isArray(raw.news) ? raw.news : [],
+        lastNewsFetch: num(raw.lastNewsFetch)
+    };
+}
+
+function reportSnapshot(c, employees, timestamp) {
+    return {
+        ts: timestamp || Date.now(),
+        company: {
+            dailyIncome: c.dailyIncome, weeklyIncome: c.weeklyIncome,
+            dailyCustomers: c.dailyCustomers, weeklyCustomers: c.weeklyCustomers,
+            efficiency: c.efficiency, popularity: c.popularity, environment: c.environment,
+            funds: c.funds, trains: c.trains, advertisementBudget: c.advertisementBudget,
+            value: c.value, rating: c.rating, employeeCount: c.employeeCount,
+            payroll: sum(employees, function (e) { return e.wage; }),
+            avgEffectiveness: avg(employees.filter(function (e) { return !e.director; }),
+                function (e) { return e.effectiveness && e.effectiveness.total; })
+        },
+        staff: employees.map(function (e) {
+            return { id: String(e.id), name: e.name, position: e.position,
+                wage: e.wage, effectiveness: e.effectiveness && e.effectiveness.total };
+        })
+    };
+}
+
+function plainNewsText(html) {
+    var template = document.createElement('template');
+    template.innerHTML = String(html == null ? '' : html);
+    return String(template.content.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+}
+
+function newsEventType(text) {
+    if (/\b(fired|firing|dismissed|terminated|sacked)\b/i.test(text)) return 'fired';
+    if (/\b(left|quit|resigned|departed)\b/i.test(text)) return 'left';
+    if (/\b(hired|joined|recruited|employed|started working)\b/i.test(text)) return 'joined';
+    if (/\b(promoted|demoted|position changed|moved to)\b/i.test(text)) return 'position';
+    return 'other';
+}
+
+function reportedFiringReason(text) {
+    var match = String(text).match(/\b(?:reason\s*:\s*|because\s+(?:of\s+)?|due to\s+)([^.;]{3,120})/i);
+    return match ? match[1].trim() : '';
+}
+
+function normalizeCompanyNews(payload) {
+    var raw = payload && payload.news || [];
+    var entries = Array.isArray(raw) ? raw : Object.keys(raw || {}).map(function (id) {
+        return Object.assign({ id: id }, raw[id] || {});
+    });
+    return entries.map(function (entry) {
+        var text = plainNewsText(entry.text != null ? entry.text : entry.news);
+        var ts = num(entry.timestamp) * 1000;
+        return {
+            id: String(entry.id || (String(entry.timestamp) + ':' + text)),
+            text: text, ts: ts, type: newsEventType(text),
+            reason: reportedFiringReason(text)
+        };
+    }).filter(function (e) { return e.text && e.ts > 0; });
+}
+
+async function updateCompanyChanges(c, employees) {
+    if (!c || !c.id) { changesError = 'Company ID is unavailable; history cannot be saved.'; return; }
+    var store = readChangeHistory(c.id);
+    var now = Date.now();
+    var cutoff = now - 180 * 86400000;
+    store.snapshots = store.snapshots.filter(function (s) { return s && s.ts >= cutoff && Array.isArray(s.staff); });
+    // At most one saved baseline every 30 minutes. The latest live refresh is always
+    // shown separately, so a new baseline is not needed on every repeated refresh.
+    if (!store.snapshots.length || now - store.snapshots[store.snapshots.length - 1].ts >= 1800000) {
+        store.snapshots.push(reportSnapshot(c, employees, now));
+    }
+    store.snapshots = store.snapshots.slice(-320);
+    changesError = '';
+    if (!store.lastNewsFetch || now - store.lastNewsFetch >= 15 * 60000) {
+        try {
+            var payload = await api('/company/news?cat=employees&limit=100');
+            var merged = {};
+            store.news.concat(normalizeCompanyNews(payload)).forEach(function (entry) {
+                if (entry && entry.id && entry.ts >= cutoff) merged[String(entry.id)] = entry;
+            });
+            store.news = Object.keys(merged).map(function (k) { return merged[k]; })
+                .sort(function (a, b) { return b.ts - a.ts; }).slice(0, 800);
+            store.lastNewsFetch = now;
+        } catch (err) {
+            changesError = 'Employee news could not be refreshed (' + String(err.message || err) + '). ' +
+                'Previous company news and tracked snapshots are still available.';
+        }
+    }
+    put(changeStorageKey(c.id), store);
+}
+
+function metricDefinitions() {
+    return [
+        { key: 'dailyIncome', label: 'Daily income', kind: 'money' },
+        { key: 'weeklyIncome', label: 'Weekly income', kind: 'money' },
+        { key: 'dailyCustomers', label: 'Daily customers', kind: 'number' },
+        { key: 'weeklyCustomers', label: 'Weekly customers', kind: 'number' },
+        { key: 'avgEffectiveness', label: 'Avg. employee effectiveness', kind: 'points' },
+        { key: 'efficiency', label: 'Company efficiency', kind: 'points' },
+        { key: 'popularity', label: 'Popularity', kind: 'points' },
+        { key: 'environment', label: 'Environment', kind: 'points' },
+        { key: 'payroll', label: 'Daily wage payroll', kind: 'money' },
+        { key: 'employeeCount', label: 'Employee count', kind: 'number' },
+        { key: 'funds', label: 'Company funds', kind: 'money' },
+        { key: 'rating', label: 'Star rating', kind: 'number' },
+        { key: 'advertisementBudget', label: 'Advertising budget', kind: 'money' },
+        { key: 'trains', label: 'Available trains', kind: 'number' },
+        { key: 'value', label: 'Company value', kind: 'money' }
+    ];
+}
+
+function changePeriodDays() {
+    var days = Number(changeRange);
+    return [1, 7, 30, 90].indexOf(days) >= 0 ? days : 7;
+}
+
+function changeReport() {
+    if (!company || !company.id || !staff.length) return null;
+    var history = readChangeHistory(company.id);
+    var current = reportSnapshot(company, staff, lastLoadedAt || Date.now());
+    var start = current.ts - changePeriodDays() * 86400000;
+    var sorted = history.snapshots.filter(function (s) { return s && s.ts <= current.ts; })
+        .sort(function (a, b) { return a.ts - b.ts; });
+    // Prefer a snapshot on/before the requested start. Otherwise, use the first
+    // observation inside the period and explicitly mark the period as partial.
+    var before = sorted.filter(function (s) { return s.ts <= start; });
+    var baseline = before.length ? before[before.length - 1] : sorted.find(function (s) { return s.ts >= start; });
+    // If an older baseline has a long missing gap, do not silently imply continuous coverage.
+    var partial = !baseline || baseline.ts > start ||
+        (baseline.ts < start - 86400000 && changePeriodDays() > 1);
+    var metrics = metricDefinitions().filter(function (m) {
+        return baseline && baseline.company && current.company[m.key] != null &&
+            baseline.company[m.key] != null;
+    }).map(function (m) {
+        var previous = Number(baseline.company[m.key]), latest = Number(current.company[m.key]);
+        return { key: m.key, label: m.label, kind: m.kind,
+            previous: previous, latest: latest, delta: latest - previous };
+    });
+    var events = history.news.filter(function (e) { return e && e.ts >= start && e.ts <= current.ts &&
+        (e.type === 'fired' || e.type === 'left' || e.type === 'joined' || e.type === 'position'); })
+        .map(function (e) { return Object.assign({ source: 'Torn news' }, e); });
+    // Roster differences between observations are useful fallback evidence, but
+    // must never be misrepresented as an official firing or resignation.
+    var observations = sorted.filter(function (s) { return s.ts >= start; }).concat([current]);
+    if (baseline && observations[0] !== baseline) observations.unshift(baseline);
+    for (var i = 1; i < observations.length; i++) {
+        var previousRoster = observations[i - 1].staff || [];
+        var nextRoster = observations[i].staff || [];
+        var at = observations[i].ts;
+        var prevIds = {};
+        var nextIds = {};
+        previousRoster.forEach(function (e) { prevIds[String(e.id)] = e; });
+        nextRoster.forEach(function (e) { nextIds[String(e.id)] = e; });
+        previousRoster.concat(nextRoster).forEach(function (e) {
+            var id = String(e.id);
+            var oldEmployee = prevIds[id], newEmployee = nextIds[id];
+            if (!!oldEmployee === !!newEmployee) return;
+            var eventType = newEmployee ? 'joined' : 'unconfirmed';
+            var duplicate = events.some(function (n) {
+                return Math.abs(n.ts - at) <= 48 * 3600000 &&
+                    (n.type === eventType || (eventType === 'unconfirmed' && (n.type === 'fired' || n.type === 'left'))) &&
+                    n.text.toLowerCase().indexOf(String(e.name).toLowerCase()) >= 0;
+            });
+            if (duplicate || events.some(function (n) { return n.source === 'Roster comparison' && n.memberId === id && n.type === eventType; })) return;
+            events.push({
+                id: 'roster:' + id + ':' + at, memberId: id, ts: at, type: eventType,
+                text: newEmployee ? e.name + ' appeared in the company roster.' :
+                    e.name + ' disappeared from the company roster. Departure type not confirmed.',
+                source: 'Roster comparison', reason: ''
+            });
+        });
+    }
+    events.sort(function (a, b) { return b.ts - a.ts; });
+    var employeeChanges = [];
+    if (baseline) {
+        var oldById = {};
+        (baseline.staff || []).forEach(function (e) { oldById[String(e.id)] = e; });
+        current.staff.forEach(function (e) {
+            var old = oldById[String(e.id)];
+            if (!old) return;
+            if (old.position !== e.position) employeeChanges.push({
+                type: 'Position', name: e.name, text: old.position + ' → ' + e.position
+            });
+            if (old.wage != null && e.wage != null && old.wage !== e.wage) employeeChanges.push({
+                type: 'Wage', name: e.name, text: money(old.wage) + ' → ' + money(e.wage)
+            });
+            var delta = num(e.effectiveness) - num(old.effectiveness);
+            if (old.effectiveness != null && e.effectiveness != null && Math.abs(delta) >= 1) {
+                employeeChanges.push({
+                    type: 'Effectiveness', name: e.name,
+                    text: fmt(old.effectiveness) + ' → ' + fmt(e.effectiveness) +
+                        ' (' + (delta > 0 ? '+' : '') + fmt(delta) + ' points)'
+                });
+            }
+        });
+    }
+    return { companyName: company.name, days: changePeriodDays(), current: current,
+        baseline: baseline, partial: partial, events: events, metrics: metrics,
+        employeeChanges: employeeChanges, newsCount: history.news.length };
+}
+
+function changeDate(ts) {
+    return new Date(ts).toLocaleString('en-GB', {
+        timeZone: 'UTC', day: '2-digit', month: 'short', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false
+    }) + ' TCT';
+}
+
+function metricText(value, kind) {
+    if (kind === 'money') return money(value);
+    if (kind === 'points') return fmt(value) + '%';
+    return fmt(value);
+}
+
+function changeReportText(report) {
+    if (!report) return 'No company change report available.';
+    var lines = ['COMPANY CHANGES — ' + report.companyName,
+        'Last ' + report.days + ' day(s) ending ' + changeDate(report.current.ts),
+        'Comparison baseline: ' + (report.baseline ? changeDate(report.baseline.ts) : 'Not yet available'),
+        report.partial ? 'Coverage: PARTIAL — tracking started late or a snapshot is missing.' : 'Coverage: Tracked period',
+        '', 'PERFORMANCE CHANGES'];
+    report.metrics.forEach(function (m) {
+        lines.push(m.label + ': ' + metricText(m.previous, m.kind) + ' → ' +
+            metricText(m.latest, m.kind) + ' (' + (m.delta > 0 ? '+' : '') +
+            (m.kind === 'money' ? money(m.delta) : fmt(m.delta) +
+            (m.kind === 'points' ? ' percentage points' : '')) + ')');
+    });
+    lines.push('', 'EMPLOYEE MOVEMENTS');
+    report.events.forEach(function (e) {
+        lines.push(changeDate(e.ts) + ' — ' + e.text + ' [' + e.source + ']' +
+            (e.type === 'fired' ? ' | Reason: ' + (e.reason || 'Not stated in Torn news') : ''));
+    });
+    if (!report.events.length) lines.push('No tracked arrivals or departures in this period.');
+    lines.push('', 'EMPLOYEE PERFORMANCE / ROLE CHANGES');
+    report.employeeChanges.forEach(function (e) {
+        lines.push(e.name + ' — ' + e.type + ': ' + e.text);
+    });
+    if (!report.employeeChanges.length) lines.push('No comparison changes recorded.');
+    lines.push('', 'Daily/weekly income are point-in-time Torn values, NOT summed earnings over the selected period.',
+        'Report assembled from Torn company news and browser-local snapshots.');
+    return lines.join('\n');
 }
 
 function displayRows(result) {
