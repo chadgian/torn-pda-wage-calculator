@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.5.1
+// @version      2.6.0
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.5.1';
+var VERSION = '2.6.0';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -62,7 +62,7 @@ var errorState = null;
 var settingsOpen = false;
 var detailId = '';
 var lastLoadedAt = 0;
-var ui = { page: 'overview', query: '', filter: 'all', sort: 'score', direction: 'desc' };
+var ui = { page: 'dashboard', query: '', filter: 'all', sort: 'score', direction: 'desc' };
 var pendingId = '';
 var pendingUntil = 0;
 var changeRange = String(get('changeRange', '7'));
@@ -1510,19 +1510,26 @@ function render() {
         '<div class="header-actions"><span class="refresh-state ' + (stale ? 'stale' : '') + '">' + (lastLoadedAt ? 'Updated ' + nowText(lastLoadedAt) : 'Not loaded') + '</span><button class="icon-btn" data-a="close" aria-label="Close">×</button></div>' +
     '</header>';
 
-    html += '<nav class="page-tabs" aria-label="Helper sections">' +
-        pageTab('overview', 'Overview', 'Start here') +
-        pageTab('employees', 'Employees', 'Review wages', result ? result.rows.length : 0) +
-        pageTab('changes', 'Changes', 'History & news') +
-        pageTab('settings', 'Settings', 'Adjust model') +
-        pageTab('guide', 'How it works', 'Calculations') +
+    html += '<nav class="page-tabs" aria-label="Main company sections">' +
+        pageTab('dashboard', 'Dashboard', 'At a glance') +
+        pageTab('wages', 'Wages', 'Pay and employees', result ? result.rows.length : 0) +
+        pageTab('positions', 'Positions', 'Roles and staffing') +
+        pageTab('statistics', 'Statistics', 'Company performance') +
+        pageTab('changes', 'Changes', 'History and news') +
     '</nav>';
 
-    html += '<div class="actionbar">' +
-        '<button class="primary" data-a="load"' + (busy ? ' disabled' : '') + '>' + (busy ? '<span class="spinner"></span> Refreshing' : '↻ Refresh') + '</button>' +
+    html += '<div class="workspace-tools"><span>More tools</span>' +
+        '<button data-page="settings"' + (page === 'settings' ? ' aria-current="page" class="selected"' : '') + '>Settings</button>' +
+        '<button data-page="guide"' + (page === 'guide' ? ' aria-current="page" class="selected"' : '') + '>How it works</button>' +
+    '</div>';
+
+    html += '<div class="actionbar section-actionbar">' +
+        '<button class="primary" data-a="load"' + (busy ? ' disabled' : '') + '>' +
+            (busy ? '<span class="spinner"></span> Refreshing' : '↻ Refresh data') + '</button>' +
         '<button data-a="key">API Key</button>' +
-        '<button data-a="copy"' + (!result ? ' disabled' : '') + '>Copy wages</button>' +
-        '<button data-a="csv"' + (!result ? ' disabled' : '') + '>Export CSV</button>' +
+        (page === 'wages' ? '<button data-a="copy"' + (!result ? ' disabled' : '') +
+            '>Copy wages</button><button data-a="csv"' + (!result ? ' disabled' : '') +
+            '>Export CSV</button>' : '') +
     '</div>';
 
     if (errorState) {
@@ -1536,15 +1543,23 @@ function render() {
         html += settingsPage();
     } else if (page === 'guide') {
         html += calculationGuidePage();
-    } else if (!result && !busy) {
+    } else if (!result) {
         html += '<section class="empty">' +
-            '<div class="empty-icon">' + logoMark('empty-logo') + '</div><h3>Connect your company data</h3><p>Load employee wages, effectiveness, and company positions from the Torn API. The helper is advisory and never submits wage changes by itself.</p>' +
-            '<div><button class="primary" data-a="load">Refresh API</button><button data-a="key">Set API Key</button></div>' +
-        '</section>';
-    } else if (result && page === 'employees') {
-        html += employeesPage(result, visibleRows);
-    } else if (result) {
-        html += overviewPage(result);
+            '<div class="empty-icon">' + logoMark('empty-logo') + '</div><h3>' +
+            (busy ? 'Loading company information' : 'Welcome to your company dashboard') +
+            '</h3><p>' + (busy ?
+                'Fetching the latest company data. Your sections will appear here when the refresh is complete.' :
+                'Refresh to view wages, positions, company statistics, and important changes in separate, easy-to-read sections.') +
+            '</p><div><button class="primary" data-a="load"' + (busy ? ' disabled' : '') +
+            '>Refresh company data</button><button data-a="key">Set API Key</button></div></section>';
+    } else if (page === 'wages') {
+        html += wagesPage(result, visibleRows);
+    } else if (page === 'positions') {
+        html += positionsPage(result);
+    } else if (page === 'statistics') {
+        html += statisticsPage(result);
+    } else {
+        html += dashboardPage(result);
     }
 
     html += '<footer><span>API: ' + esc(keySource()) + '</span><span>Advisory only — wage changes are never submitted automatically.</span></footer>';
@@ -1654,7 +1669,9 @@ function changesPage() {
 }
 
 function pageTab(key, label, note, count) {
-    return '<button class="page-tab ' + ((ui.page || 'overview') === key ? 'active' : '') + '" data-page="' + key + '">' +
+    var selected = (ui.page || 'dashboard') === key;
+    return '<button class="page-tab ' + (selected ? 'active' : '') + '" type="button" data-page="' + key + '"' +
+        (selected ? ' aria-current="page"' : '') + '>' +
         '<span class="page-tab-main">' + esc(label) + (count != null ? '<b>' + fmt(count) + '</b>' : '') + '</span>' +
         '<small>' + esc(note) + '</small>' +
     '</button>';
@@ -1988,7 +2005,7 @@ function bind(result) {
                 toast('The staffing scenario is no longer available. Refresh company data.', false);
                 return;
             }
-            ui.page = 'settings';
+            ui.page = 'positions';
             detailId = '';
             render();
             toast('Exploratory staffing targets saved. No Torn position was changed.', true);
@@ -1997,7 +2014,8 @@ function bind(result) {
 
     panel.querySelectorAll('[data-page]').forEach(function (b) {
         b.onclick = function () {
-            ui.page = b.dataset.page || 'overview';
+            ui.page = b.dataset.page || 'dashboard';
+            ui.filter = ui.page === 'wages' ? ui.filter : 'all';
             detailId = '';
             render();
         };
@@ -2006,7 +2024,7 @@ function bind(result) {
     panel.querySelectorAll('[data-filter-jump]').forEach(function (b) {
         b.onclick = function () {
             ui.filter = b.dataset.filterJump || 'all';
-            ui.page = 'employees';
+            ui.page = 'wages';
             render();
         };
     });
@@ -2162,7 +2180,7 @@ async function load() {
 function openPanel() {
     S.querySelector('#overlay').classList.add('show');
     if (typeof refreshLauncherVisibility === 'function') refreshLauncherVisibility();
-    if (!ui.page) ui.page = 'overview';
+    if (!ui.page) ui.page = 'dashboard';
     render();
     if (cfg.autoRefresh && apiKey() && (!lastLoadedAt || Date.now() - lastLoadedAt > FRESH_AGE) && !busy) load();
 }
