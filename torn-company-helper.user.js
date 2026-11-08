@@ -1596,6 +1596,12 @@ function render() {
             '>Export CSV</button>' : '') +
     '</div>';
 
+    html += '<div class="auto-recording-indicator" role="status" aria-live="polite">' +
+        '<span class="auto-dot ' + (cfg.autoRefresh && apiKey() ? 'enabled' : 'paused') + '" aria-hidden="true"></span>' +
+        '<span>' + esc(autoSyncStatusText()) + '</span>' +
+        '<button type="button" data-page="settings" aria-label="Configure automatic company recording">Manage</button>' +
+    '</div>';
+
     if (errorState) {
         var info = errorInfo(errorState);
         html += '<div class="error-card"><div class="error-icon">!</div><div><b>' + esc(info.title) + '</b><p>' + esc(info.message) + '</p><small><strong>Suggested fix:</strong> ' + esc(info.solution) + '</small><div class="error-actions"><button data-a="copy-error">Copy error details</button><a href="' + esc(SUPPORT_URL) + '" target="_blank" rel="noopener noreferrer">Contact developer</a></div></div><button data-a="dismiss-error">×</button></div>';
@@ -2418,6 +2424,7 @@ function autoSyncLog() {
 function autoSyncStatusText() {
     if (cfg.autoRefresh === false) return 'Auto-recording is off. Enable it in Settings.';
     if (!apiKey()) return 'Auto-recording needs a Torn API key.';
+    if (!isOwnCompanyView()) return 'Auto-recording is available when you visit your own company page.';
     var log = autoSyncLog();
     if (log.lastError && log.lastAttempt &&
         Date.now() - log.lastAttempt < AUTO_SYNC_FAILURE_BACKOFF) {
