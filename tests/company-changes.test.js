@@ -134,3 +134,50 @@ test('different company IDs do not share history or movements', async () => {
     assert.equal(h.readChangeHistory(100).snapshots.length, 1);
     assert.equal(h.readChangeHistory(200).snapshots.length, 1);
 });
+
+
+test('material changes are recorded promptly even when less than 30 minutes apart', async () => {
+    const h=makeHarness();
+    const first=[employee(1,'Ada',75)];
+    h.setState(company(100,10000),first,t0);
+    await h.updateCompanyChanges(company(100,10000),first);
+    assert.equal(h.readChangeHistory(100).snapshots.length,1);
+
+    // Repeated identical responses must not waste localStorage space.
+    h.setState(company(100,10000),first,t0+2*60000);
+    await h.updateCompanyChanges(company(100,10000),first);
+    assert.equal(h.readChangeHistory(100).snapshots.length,1);
+
+    const changed=[employee(1,'Ada',91)];
+    h.setState(company(100,12500),changed,t0+3*60000);
+    await h.updateCompanyChanges(company(100,12500),changed);
+    const recent=h.readChangeHistory(100).snapshots;
+    assert.equal(recent.length,2,'Changed income/effectiveness must be recorded without a 30-minute wait');
+    assert.equal(recent[0].company.dailyIncome,10000);
+    assert.equal(recent[1].company.dailyIncome,12500);
+    assert.equal(recent[1].staff[0].effectiveness,91);
+
+    h.setState(company(100,12500),changed,t0+6*60000);
+    await h.updateCompanyChanges(company(100,12500),changed);
+    assert.equal(h.readChangeHistory(100).snapshots.length,2);
+
+    // A quiet company still gets a heartbeat snapshot for reporting coverage.
+    h.setState(company(100,12500),changed,t0+40*60000);
+    await h.updateCompanyChanges(company(100,12500),changed);
+    assert.equal(h.readChangeHistory(100).snapshots.length,3);
+});
+
+test('automatic snapshots include additional capacity, work-stat and Management metrics', async () => {
+    const h=makeHarness();
+    const c=Object.assign(company(100,15000),{capacity:10,environment:72});
+    const e=employee(1,'Ada',95);
+    e.effectiveness.working_stats=85;
+    e.effectiveness.management=6;
+    h.setState(c,[e],t0);
+    await h.updateCompanyChanges(c,[e]);
+    const snapshot=h.readChangeHistory(100).snapshots[0].company;
+    assert.equal(snapshot.employeeCapacity,10);
+    assert.equal(snapshot.avgWorkingStatEffectiveness,85);
+    assert.equal(snapshot.managementBonusPoints,6);
+    assert.equal(snapshot.environment,72);
+});
