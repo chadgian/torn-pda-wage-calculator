@@ -847,12 +847,13 @@ function changeStorageKey(id) { return 'changeHistory:' + String(id); }
 function readChangeHistory(id) {
     var raw = get(changeStorageKey(id), null);
     if (!raw || String(raw.companyId) !== String(id)) {
-        return { companyId: String(id), snapshots: [], news: [], lastNewsFetch: 0 };
+        return { companyId: String(id), snapshots: [], news: [], reasons: {}, lastNewsFetch: 0 };
     }
     return {
         companyId: String(id),
         snapshots: Array.isArray(raw.snapshots) ? raw.snapshots : [],
         news: Array.isArray(raw.news) ? raw.news : [],
+        reasons: raw.reasons && typeof raw.reasons === 'object' && !Array.isArray(raw.reasons) ? raw.reasons : {},
         lastNewsFetch: num(raw.lastNewsFetch)
     };
 }
@@ -996,7 +997,12 @@ function changeReport() {
     });
     var events = history.news.filter(function (e) { return e && e.ts >= start && e.ts <= current.ts &&
         (e.type === 'fired' || e.type === 'left' || e.type === 'joined' || e.type === 'position'); })
-        .map(function (e) { return Object.assign({ source: 'Torn news' }, e); });
+        .map(function (e) {
+            var note = String(history.reasons[e.id] || '').trim();
+            return Object.assign({ source: 'Torn news', reason: note || e.reason,
+                reasonSource: note ? 'Director note' : (e.reason ? 'Official news' : '') }, e,
+                { reason: note || e.reason });
+        });
     // Roster differences between observations are useful fallback evidence, but
     // must never be misrepresented as an official firing or resignation.
     var observations = sorted.filter(function (s) { return s.ts >= start; }).concat([current]);
@@ -1086,7 +1092,8 @@ function changeReportText(report) {
     lines.push('', 'EMPLOYEE MOVEMENTS');
     report.events.forEach(function (e) {
         lines.push(changeDate(e.ts) + ' — ' + e.text + ' [' + e.source + ']' +
-            (e.type === 'fired' ? ' | Reason: ' + (e.reason || 'Not stated in Torn news') : ''));
+            (e.type === 'fired' ? ' | Reason: ' + (e.reason || 'Not stated in Torn news') +
+                (e.reasonSource ? ' [' + e.reasonSource + ']' : '') : ''));
     });
     if (!report.events.length) lines.push('No tracked arrivals or departures in this period.');
     lines.push('', 'EMPLOYEE PERFORMANCE / ROLE CHANGES');
@@ -1346,7 +1353,13 @@ function changesPage() {
                 esc(e.type) + '">' + esc(label) + '</span><div class="changes-event-content">' +
                 '<b>' + esc(e.text) + '</b>' +
                 (e.type === 'fired' ? '<p>Reason: ' +
-                    esc(e.reason || 'Not stated in Torn company news') + '</p>' : '') +
+                    esc(e.reason || 'Not stated in Torn company news') +
+                    (e.reasonSource ? ' (' + esc(e.reasonSource) + ')' : '') + '</p>' +
+                    (e.source === 'Torn news' ? '<div class="changes-reason-editor">' +
+                    '<input aria-label="Edit dismissal reason" data-reason-id="' + esc(e.id) +
+                    '" maxlength="300" value="' + esc(e.reasonSource === 'Director note' ? e.reason : '') +
+                    '" placeholder="Optional private reason / note">' +
+                    '<button data-save-reason="' + esc(e.id) + '">Save reason</button></div>' : '') : '') +
                 '<small>' + esc(changeDate(e.ts)) + ' · ' + esc(e.source) + '</small></div></article>';
         }).join('') + '</div>';
         if (report.events.length > 60) html += '<div class="changes-overflow">Showing 60 of ' +
@@ -1367,7 +1380,7 @@ function changesPage() {
     }
     html += '<p class="changes-footnote">Daily and weekly Torn income figures are rolling figures from each refresh; their difference is not the total profit over this period. ' +
         'History is stored only in this browser, per company, for up to 180 days (up to 320 snapshots). ' +
-        'Dismissal reasons appear only if explicitly recorded in company news. Other devices do not share this history.</p></section>';
+        'Dismissal reasons come from Torn news or private notes you enter. Copied reports include those notes, so review before sharing. Other devices do not share this history.</p></section>';
     return html;
 }
 
@@ -1583,6 +1596,23 @@ function bind(result) {
             changeRange = String(b.dataset.changeRange || '7');
             put('changeRange', changeRange);
             render();
+        };
+    });
+    panel.querySelectorAll('[data-save-reason]').forEach(function (button) {
+        button.onclick = function () {
+            if (!company || !company.id) return;
+            var id = button.dataset.saveReason;
+            var input = Array.from(panel.querySelectorAll('[data-reason-id]')).find(function (node) {
+                return node.dataset.reasonId === id;
+            });
+            if (!input) return;
+            var history = readChangeHistory(company.id);
+            var reason = String(input.value || '').trim().slice(0, 300);
+            if (reason) history.reasons[id] = reason;
+            else delete history.reasons[id];
+            put(changeStorageKey(company.id), history);
+            render();
+            toast(reason ? 'Dismissal note saved on this device.' : 'Dismissal note cleared.', true);
         };
     });
     panel.querySelectorAll('[data-a="copy-changes"]').forEach(function (b) {
@@ -2064,7 +2094,7 @@ S.innerHTML = '<style>' +
 '</style>' +
 
 '<style>' +
-'.changes-page{padding:0 0 16px}.changes-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin:0 14px 12px}.changes-ranges{display:flex;flex-wrap:wrap;gap:5px}.changes-ranges button,.changes-copy{border:1px solid var(--border2);border-radius:8px;padding:8px 11px;background:var(--panel2);color:var(--text)!important;font-size:11px;font-weight:800}.changes-ranges button.selected{border-color:#2eaa76;background:#153e2b;color:#baf2d2!important}.changes-copy{background:var(--green2);border-color:#2eaa76}.changes-coverage{display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:0 14px 10px;padding:10px 12px;background:#13281f;border:1px solid #2e654b;border-radius:10px;font-size:11px}.changes-coverage b{color:#c2f4da}.changes-coverage span{font-size:10px;color:#afc6b9}.changes-notice{margin-top:8px}.changes-section-head{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:6px;margin:16px 14px 9px}.changes-section-head h4{margin:0;font-size:13px}.changes-section-head small{color:var(--muted);font-size:9px}.changes-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 14px}.changes-metric{min-width:0;padding:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px}.changes-metric small,.changes-metric strong,.changes-metric span{display:block}.changes-metric small{font-size:10px;color:var(--muted)}.changes-metric strong{margin-top:4px;font-size:17px;overflow-wrap:anywhere}.changes-metric span{margin-top:4px;font-size:10px;color:#b2bbc2}.changes-metric span.up{color:#8ff0bd}.changes-metric span.down{color:#ffb0b0}.changes-counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0 14px 10px}.changes-counts>div{padding:11px;background:#1c252b;border:1px solid var(--border);border-radius:9px;text-align:center}.changes-counts b,.changes-counts small{display:block}.changes-counts b{font-size:20px}.changes-counts small{color:var(--muted);font-size:10px}.changes-timeline,.changes-employee-list{margin:0 14px;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden}.changes-event{display:flex;gap:12px;padding:12px;border-bottom:1px solid var(--border);align-items:start}.changes-event:last-child,.changes-employee-row:last-child{border-bottom:none}.changes-event-tag{flex:0 0 86px;text-align:center;border:1px solid #5e6873;border-radius:5px;padding:5px 3px;color:#e0e5e9;font-size:9px;font-weight:850}.changes-event-tag.joined{color:#aaf1ce;border-color:#387b58;background:#133c2b}.changes-event-tag.fired{color:#ffc0bd;border-color:#8d4849;background:#432023}.changes-event-tag.left,.changes-event-tag.unconfirmed{color:#ffe2a0;border-color:#8d7138;background:#3e321d}.changes-event-content{min-width:0}.changes-event-content b{display:block;font-size:11px;line-height:1.5;font-weight:650;overflow-wrap:anywhere}.changes-event-content p{margin:5px 0;color:#ffccbd;font-size:10px}.changes-event-content small{display:block;margin-top:6px;color:var(--muted);font-size:9px}.changes-empty{margin:0 14px;padding:18px 12px;background:var(--panel);border:1px dashed var(--border2);border-radius:10px;color:var(--muted);font-size:11px;line-height:1.5}.changes-empty h4{margin:0 0 5px;color:var(--text);font-size:13px}.changes-empty p{margin:0}.changes-employee-row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);font-size:11px}.changes-employee-row>span{font-weight:800;min-width:0}.changes-employee-row small{display:block;margin-top:3px;color:var(--muted);font-size:9px}.changes-employee-row>b{font-size:10px;font-weight:650;text-align:right;overflow-wrap:anywhere}.changes-overflow{margin:6px 14px;font-size:10px;color:var(--amber)}.changes-footnote{margin:16px 14px 0;font-size:10px;color:var(--muted);line-height:1.6}@media(max-width:700px){.changes-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 9px}.changes-toolbar,.changes-timeline,.changes-employee-list,.changes-counts{margin-left:9px;margin-right:9px}.changes-counts{grid-template-columns:repeat(2,minmax(0,1fr))}.changes-coverage{margin-left:9px;margin-right:9px}.changes-section-head{margin-left:9px;margin-right:9px}.changes-event-tag{flex-basis:72px}.changes-event{gap:8px;padding:10px}.changes-metric strong{font-size:15px}.changes-footnote{margin:14px 9px}.page-tab{padding-left:4px;padding-right:4px}.page-tab-main{font-size:10px}.changes-employee-row{align-items:start;flex-direction:column;gap:5px}.changes-employee-row>b{text-align:left}}@media(max-width:380px){.changes-metrics{grid-template-columns:1fr}.page-tab-main{font-size:9px}}' +
+'.changes-reason-editor{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 0}.changes-reason-editor input{flex:1 1 180px;min-width:0;padding:7px 9px;border:1px solid var(--border2);border-radius:7px;background:#10171b;color:var(--text);font-size:10px}.changes-reason-editor button{padding:7px 9px;border:1px solid #317c57;border-radius:7px;background:#1b4933;color:#c2f4da;font-size:10px;font-weight:850}.changes-page{padding:0 0 16px}.changes-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin:0 14px 12px}.changes-ranges{display:flex;flex-wrap:wrap;gap:5px}.changes-ranges button,.changes-copy{border:1px solid var(--border2);border-radius:8px;padding:8px 11px;background:var(--panel2);color:var(--text)!important;font-size:11px;font-weight:800}.changes-ranges button.selected{border-color:#2eaa76;background:#153e2b;color:#baf2d2!important}.changes-copy{background:var(--green2);border-color:#2eaa76}.changes-coverage{display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;margin:0 14px 10px;padding:10px 12px;background:#13281f;border:1px solid #2e654b;border-radius:10px;font-size:11px}.changes-coverage b{color:#c2f4da}.changes-coverage span{font-size:10px;color:#afc6b9}.changes-notice{margin-top:8px}.changes-section-head{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:6px;margin:16px 14px 9px}.changes-section-head h4{margin:0;font-size:13px}.changes-section-head small{color:var(--muted);font-size:9px}.changes-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 14px}.changes-metric{min-width:0;padding:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px}.changes-metric small,.changes-metric strong,.changes-metric span{display:block}.changes-metric small{font-size:10px;color:var(--muted)}.changes-metric strong{margin-top:4px;font-size:17px;overflow-wrap:anywhere}.changes-metric span{margin-top:4px;font-size:10px;color:#b2bbc2}.changes-metric span.up{color:#8ff0bd}.changes-metric span.down{color:#ffb0b0}.changes-counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:0 14px 10px}.changes-counts>div{padding:11px;background:#1c252b;border:1px solid var(--border);border-radius:9px;text-align:center}.changes-counts b,.changes-counts small{display:block}.changes-counts b{font-size:20px}.changes-counts small{color:var(--muted);font-size:10px}.changes-timeline,.changes-employee-list{margin:0 14px;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden}.changes-event{display:flex;gap:12px;padding:12px;border-bottom:1px solid var(--border);align-items:start}.changes-event:last-child,.changes-employee-row:last-child{border-bottom:none}.changes-event-tag{flex:0 0 86px;text-align:center;border:1px solid #5e6873;border-radius:5px;padding:5px 3px;color:#e0e5e9;font-size:9px;font-weight:850}.changes-event-tag.joined{color:#aaf1ce;border-color:#387b58;background:#133c2b}.changes-event-tag.fired{color:#ffc0bd;border-color:#8d4849;background:#432023}.changes-event-tag.left,.changes-event-tag.unconfirmed{color:#ffe2a0;border-color:#8d7138;background:#3e321d}.changes-event-content{min-width:0}.changes-event-content b{display:block;font-size:11px;line-height:1.5;font-weight:650;overflow-wrap:anywhere}.changes-event-content p{margin:5px 0;color:#ffccbd;font-size:10px}.changes-event-content small{display:block;margin-top:6px;color:var(--muted);font-size:9px}.changes-empty{margin:0 14px;padding:18px 12px;background:var(--panel);border:1px dashed var(--border2);border-radius:10px;color:var(--muted);font-size:11px;line-height:1.5}.changes-empty h4{margin:0 0 5px;color:var(--text);font-size:13px}.changes-empty p{margin:0}.changes-employee-row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);font-size:11px}.changes-employee-row>span{font-weight:800;min-width:0}.changes-employee-row small{display:block;margin-top:3px;color:var(--muted);font-size:9px}.changes-employee-row>b{font-size:10px;font-weight:650;text-align:right;overflow-wrap:anywhere}.changes-overflow{margin:6px 14px;font-size:10px;color:var(--amber)}.changes-footnote{margin:16px 14px 0;font-size:10px;color:var(--muted);line-height:1.6}@media(max-width:700px){.changes-metrics{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 9px}.changes-toolbar,.changes-timeline,.changes-employee-list,.changes-counts{margin-left:9px;margin-right:9px}.changes-counts{grid-template-columns:repeat(2,minmax(0,1fr))}.changes-coverage{margin-left:9px;margin-right:9px}.changes-section-head{margin-left:9px;margin-right:9px}.changes-event-tag{flex-basis:72px}.changes-event{gap:8px;padding:10px}.changes-metric strong{font-size:15px}.changes-footnote{margin:14px 9px}.page-tab{padding-left:4px;padding-right:4px}.page-tab-main{font-size:10px}.changes-employee-row{align-items:start;flex-direction:column;gap:5px}.changes-employee-row>b{text-align:left}}@media(max-width:380px){.changes-metrics{grid-template-columns:1fr}.page-tab-main{font-size:9px}}' +
 '</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
 '<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored in local storage on this device)</label><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="save" class="save">Save key</button></div></div></div>' +
