@@ -1,0 +1,31 @@
+name: Test company change tracker
+
+on:
+  pull_request:
+    paths:
+      - 'torn-company-helper.user.js'
+      - 'tests/company-changes.test.js'
+      - '.github/workflows/test-company-changes.yml'
+  push:
+    branches:
+      - 'feature/company-change-history'
+    paths:
+      - 'torn-company-helper.user.js'
+      - 'tests/company-changes.test.js'
+      - '.github/workflows/test-company-changes.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  node-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check userscript syntax
+        run: node --check torn-company-helper.user.js
+      - name: Run company changes unit tests
+        run: node --test tests/company-changes.test.js
