@@ -2534,6 +2534,9 @@ function additionalRolesHtml() {
             '<p class="' + (x.learnedEvidence.positiveRole ? 'role-learned-positive' : x.learnedEvidence.negativeRole ? 'role-learned-negative' : 'role-learned') + '">' +
             '<b>Historical learning:</b> score ' + esc((x.learnedEvidence.score>0?'+':'')+x.learnedEvidence.score.toFixed(1)) +
             ' from ' + fmt(x.learnedEvidence.observations) + ' daily observation(s), ' + esc(x.learnedEvidence.confidence) + ' confidence.</p>' : '';
+        var immediate = x.recentSignal && x.recentSignal.strong ?
+            '<p class="role-recovery"><b>Previous-day signal:</b> role count '+fmt(x.recentSignal.before)+' -> '+fmt(x.recentSignal.after)+
+            ' while daily income changed '+(x.recentSignal.incomePct>0?'+':'')+esc(pct(x.recentSignal.incomePct,1))+'.</p>' : '';
         var details = x.plan ?
             '<p><b>' + (x.plan.historicalReverse ? 'Likely restoration path' : 'Reallocation scenario') +
                 ':</b> move one duplicated/safe planned slot from ' + esc(x.plan.replaces) +
@@ -2553,7 +2556,7 @@ function additionalRolesHtml() {
                 esc(x.kind ? 'Unstaffed ' + x.kind + ' ability' : 'Unstaffed production role') +
                 '</small><h5>' + esc(x.position) + '</h5></div>' +
                 '<span class="role-type">' + esc(x.kind ? 'Support opportunity' : 'Stat-fit opportunity') + '</span></div>' +
-            '<p>' + esc(x.reason) + '</p>' + recovery + learned + details + vacancy +
+            '<p>' + esc(x.reason) + '</p>' + recovery + immediate + learned + details + vacancy +
             (x.plan ?
                 '<button data-use-new-role="' + esc(x.key) +
                 '">Use as staffing target (helper only)</button>' :
@@ -2707,6 +2710,7 @@ function positionsPage(result) {
     html += '</div>';
     html += supportImpactHtml(result);
     html += learnedRoleHistoryHtml();
+    html += historicalRestorationHtml();
     html += additionalRolesHtml();
     html += '<div class="positions-section-head"><div><h4>Staffing targets</h4>' +
         '<p>Set how many employees should fill each job. Targets must add up to your current number of employees. Suggestions are helper-only.</p></div></div>' +
@@ -2767,24 +2771,47 @@ function statisticsAnalysisHtml() {
     '</section>';
 }
 
+function historicalRestorationHtml() {
+    var offers=suggestHistoricalRoleCountRestorations();
+    if (!offers.length) return '';
+    return '<section class="role-restoration"><div class="role-restoration-head"><div><small>Historical recovery</small><h4>Role counts worth restoring</h4><p>These are based on a recent drop in role count followed by a material company decline. The helper prefers reversing the role that increased at the same time when a safe donor exists.</p></div><span>'+fmt(offers.length)+' recovery idea'+(offers.length===1?'':'s')+'</span></div>' +
+        '<div class="role-restoration-list">'+offers.map(function(x){
+            return '<article><div><b>'+esc(x.position)+'</b><small>'+fmt(x.signal.currentCount)+' now · '+fmt(x.signal.baselineCount)+' in the better recent snapshot</small></div>' +
+                '<strong>'+esc(pct(x.signal.declinePct,0))+' income decline</strong>' +
+                '<p>'+ (x.plan.historicalReverse ?
+                    'Likely reversal: move one '+esc(x.plan.replaces)+' slot back to '+esc(x.position)+'.' :
+                    'Safest available donor: '+esc(x.plan.replaces)+'.') +
+                    ' Modeled team stat-fit change: '+(x.plan.fitDelta>0?'+':'')+fmt(x.plan.fitDelta)+'.</p>' +
+                '<button data-use-new-role="'+esc(x.key)+'">Use restoration target (helper only)</button>' +
+            '</article>';
+        }).join('')+'</div>' +
+        '<p class="role-restoration-note">The income change may have other causes. This feature treats the observed role-count reversal as a testable recovery hypothesis, not a guaranteed fix.</p></section>';
+}
+
 function learnedRoleHistoryHtml() {
-    var learned=learnedRoleSummary();
-    if (!learned.length) return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4></div><span>Collecting data</span></div><p>There is not enough repeated day-to-day role evidence yet. Keep auto-recording enabled; suggestions will become more evidence-aware as position changes and outcomes are observed.</p></section>';
+    var learned=learnedRoleSummary(), recent=recentRoleOutcomeSignals(), allEvidence=roleHistoricalEvidence();
+    if (!learned.length && !Object.keys(recent).length) return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4></div><span>Collecting data</span></div><p>There is not enough day-to-day role evidence yet. Keep auto-recording enabled; a large previous-day change can create an immediate signal, while repeated patterns build stronger long-term evidence.</p></section>';
     return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4><p>Repeated before/after observations can strengthen, weaken, or protect role recommendations.</p></div><span>'+fmt(learned.length)+' learned signal'+(learned.length===1?'':'s')+'</span></div>' +
         '<div class="role-learning-grid">'+learned.map(function(x){
             var favorable=x.score>=0, label=x.positiveRole?'Favor / protect':x.negativeRole?'Use caution':'Weak signal';
-            var currentPositionObj=positions.find(function(p){return positionKey(p)===positionKey({id:x.position,name:x.position}) || positionNameKey(p)===positionNameKey(x.position);});
-            var floor=currentPositionObj?learnedRoleFloor(currentPositionObj,roleHistoricalEvidence()):0;
+            var currentPositionObj=positions.find(function(p){return positionNameKey(p)===positionNameKey(x.position);});
+            var floor=currentPositionObj?learnedRoleFloor(currentPositionObj,allEvidence,recent):0;
             var latest=x.examples && x.examples.length?x.examples[x.examples.length-1]:null;
+            var immediate=currentPositionObj?recent[positionKey(currentPositionObj)]:null;
             return '<article class="role-learning-card '+(favorable?'positive':'negative')+'">' +
                 '<div><small>'+esc(label)+'</small><h5>'+esc(x.position)+'</h5></div>' +
                 '<b>'+esc((x.score>0?'+':'')+x.score.toFixed(1))+'</b>' +
                 '<p>'+fmt(x.observations)+' day-to-day observation'+(x.observations===1?'':'s')+' · '+esc(x.confidence)+' confidence' +
                     (floor>1?' · protected count '+fmt(floor):'')+'</p>' +
-                (latest?'<small>Latest related move: '+fmt(latest.before)+' -> '+fmt(latest.after)+'; daily income '+(latest.incomePct>0?'+':'')+pct(latest.incomePct,1)+'.</small>':'') +
+                (immediate&&immediate.strong?'<small class="role-learning-immediate">Previous-day signal: '+fmt(immediate.before)+' -> '+fmt(immediate.after)+'; income '+(immediate.incomePct>0?'+':'')+pct(immediate.incomePct,1)+'.</small>':'') +
+                (latest?'<small>Latest repeated-evidence move: '+fmt(latest.before)+' -> '+fmt(latest.after)+'; daily income '+(latest.incomePct>0?'+':'')+pct(latest.incomePct,1)+'.</small>':'') +
             '</article>';
+        }).join('') +
+        Object.keys(recent).filter(function(key){return recent[key].strong && !learned.some(function(x){return positionNameKey(x.position)===positionNameKey(recent[key].position);});}).map(function(key){
+            var x=recent[key], favorable=x.score>=0;
+            return '<article class="role-learning-card '+(favorable?'positive':'negative')+'"><div><small>Strong previous-day signal</small><h5>'+esc(x.position)+'</h5></div><b>'+esc((x.score>0?'+':'')+x.score.toFixed(1))+'</b><p>1 immediate observation · provisional</p><small>Role count '+fmt(x.before)+' -> '+fmt(x.after)+'; daily income '+(x.incomePct>0?'+':'')+pct(x.incomePct,1)+'.</small></article>';
         }).join('')+'</div>' +
-        '<p class="role-learning-note">Learning scores summarize association across saved days after down-weighting headcount, advertising, and multi-role confounders. They are not guaranteed profit estimates.</p></section>';
+        '<p class="role-learning-note">Large previous-day changes can affect suggestions immediately when headcount and advertising are stable. Repeated patterns receive more weight and can protect higher role counts. These are associations, not guaranteed profit estimates.</p></section>';
 }
 
 function statisticsPage(result) {
