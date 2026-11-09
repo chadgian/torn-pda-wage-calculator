@@ -35,6 +35,10 @@ function harness(positions, staff, options = {}) {
         'var currentPosition=function(e){return positions.find(function(p){return p.id===e.positionId;})||null;};',
         'var positionFit=function(e,p){return p ? (e.fits[p.id]||0):0;};',
         'var individualBestPosition=function(e){return positions.map(function(p){return {position:p,fit:positionFit(e,p)};}).sort(function(a,b){return b.fit-a.fit;})[0]||null;};',
+        // History integration is tested separately; these tests isolate the assignment optimizer.
+        'var previousDailySnapshot=function(){return null;};',
+        'var roleHistoricalEvidence=function(){return {};},recentRoleOutcomeSignals=function(){return {};};',
+        'var learnedRoleFloor=function(p){return num(currentStaffingCounts()[positionKey(p)])>0?1:0;};',
         moduleCode,
         'return { companyPositionAssignment, supportRoleKind, supportRoleSnapshot, staffingPlanInfo,',
         ' potentialRoleBenefit, suggestAdditionalRoles, useAdditionalRolePlan };'
