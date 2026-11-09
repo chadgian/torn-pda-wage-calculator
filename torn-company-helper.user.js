@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.6.1
+// @version      2.6.2
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.6.1';
+var VERSION = '2.6.2';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -503,7 +503,8 @@ function currentNamedPositionCounts() {
 function autoRoleCoverageFloor(position) {
     if (cfg.protectRoleCoverage === false) return 0;
     var current = currentStaffingCounts();
-    return num(current[positionKey(position)]) > 0 ? 1 : 0;
+    if (num(current[positionKey(position)]) <= 0) return 0;
+    return learnedRoleFloor(position, roleHistoricalEvidence());
 }
 
 // Look for a recently removed role whose absence coincides with a material
@@ -901,6 +902,7 @@ function suggestAdditionalRoles() {
     var targets = normalizedStaffingPlan(plan.effective);
     var currentSolution = companyPositionAssignment();
     var historySignals = roleHistoryRecoverySignals();
+    var learnedEvidence = roleHistoricalEvidence();
     if (!currentSolution || !Object.keys(currentSolution.byEmployee || {}).length) return [];
     var openCapacity = num(company.capacity) > 0 ?
         Math.max(0, Math.floor(num(company.capacity) - Math.max(staff.length, num(company.employeeCount)))) : 0;
@@ -927,6 +929,7 @@ function suggestAdditionalRoles() {
         if (!targetKey || num(targets[targetKey]) !== 0) return;
         var kind = supportRoleKind(candidate);
         var historySignal = historySignals[targetKey] || null;
+        var learned = learnedEvidence[targetKey] || null;
         // Avoid proposing another version of a special ability already staffed.
         if (kind && activeKinds[kind]) return;
         var benefit = potentialRoleBenefit(candidate);
@@ -936,6 +939,19 @@ function suggestAdditionalRoles() {
                     pct(historySignal.declinePct, 0) + ' lower than the last recent snapshot that included it. ' +
                     'This is observed correlation, not proof of causation.',
                 signal: 120 + Math.min(60, Math.max(0, historySignal.declinePct))
+            };
+        } else if (learned && learned.positiveRole) {
+            benefit = {
+                reason: 'Historical evidence favors this role: across ' + fmt(learned.observations) +
+                    ' day-to-day role-change observation(s), adding/keeping it was associated with better combined income, customer, efficiency, and effectiveness outcomes. Confidence: ' +
+                    learned.confidence + '.',
+                signal: 65 + Math.min(50, Math.abs(learned.score))
+            };
+        } else if (learned && learned.negativeRole) {
+            benefit = {
+                reason: 'Historical caution: previous increases in this role were associated with weaker combined outcomes. Confidence: ' +
+                    learned.confidence + '. Treat this as a low-priority experiment unless other evidence is stronger.',
+                signal: -25
             };
         }
         var strongest = null;
@@ -958,7 +974,12 @@ function suggestAdditionalRoles() {
             var delta = evaluated.suggestedFit - currentSolution.suggestedFit;
             var historicalReverse = !!(historySignal &&
                 historySignal.increasedKeys.indexOf(donorKey) >= 0);
-            var selectionScore = delta + (historicalReverse ? 10000 : 0);
+            var donorLearning = learnedEvidence[donorKey] || null;
+            var donorPenalty = donorLearning && donorLearning.positiveRole ?
+                250 + Math.min(250,Math.abs(donorLearning.score)*8) : 0;
+            var candidateBoost = learned && learned.positiveRole ?
+                Math.min(200,Math.abs(learned.score)*5) : 0;
+            var selectionScore = delta + candidateBoost - donorPenalty + (historicalReverse ? 10000 : 0);
             if (!strongest || selectionScore > strongest.selectionScore ||
                 (selectionScore === strongest.selectionScore && donor.name.localeCompare(strongest.replaces) < 0)) {
                 strongest = {
@@ -966,6 +987,8 @@ function suggestAdditionalRoles() {
                     targets: hypothetical, caution: !!kind || !!historySignal ||
                         (evaluated.supportRisks || []).length > 0,
                     historicalReverse: historicalReverse,
+                    learnedCandidate: learned,
+                    learnedDonor: donorLearning,
                     selectionScore: selectionScore
                 };
             }
@@ -982,7 +1005,10 @@ function suggestAdditionalRoles() {
             reason: benefit.reason, priority: benefit.signal,
             plan: strongest, openCapacity: openCapacity,
             historySignal: historySignal,
+            learnedEvidence: learned,
             rank: benefit.signal +
+                (learned && learned.positiveRole ? Math.min(60,Math.abs(learned.score)) : 0) -
+                (learned && learned.negativeRole ? Math.min(60,Math.abs(learned.score)) : 0) +
                 (historySignal && historySignal.strong ? 100 : 0) +
                 (!kind && strongest ? Math.max(0, strongest.fitDelta) : 0)
         });
@@ -1415,25 +1441,304 @@ async function updateCompanyChanges(c, employees) {
 
 function metricDefinitions() {
     return [
-        { key: 'dailyIncome', label: 'Daily income', kind: 'money' },
-        { key: 'weeklyIncome', label: 'Weekly income', kind: 'money' },
-        { key: 'dailyCustomers', label: 'Daily customers', kind: 'number' },
-        { key: 'weeklyCustomers', label: 'Weekly customers', kind: 'number' },
-        { key: 'avgEffectiveness', label: 'Avg. employee effectiveness', kind: 'points' },
-        { key: 'efficiency', label: 'Company efficiency', kind: 'points' },
-        { key: 'popularity', label: 'Popularity', kind: 'points' },
-        { key: 'environment', label: 'Environment', kind: 'points' },
-        { key: 'payroll', label: 'Daily wage payroll', kind: 'money' },
-        { key: 'employeeCount', label: 'Employee count', kind: 'number' },
-        { key: 'employeeCapacity', label: 'Employee capacity', kind: 'number' },
-        { key: 'avgWorkingStatEffectiveness', label: 'Avg. work-stat effectiveness', kind: 'points' },
-        { key: 'managementBonusPoints', label: 'Reported Management bonus total', kind: 'number' },
-        { key: 'funds', label: 'Company funds', kind: 'money' },
-        { key: 'rating', label: 'Star rating', kind: 'number' },
-        { key: 'advertisementBudget', label: 'Advertising budget', kind: 'money' },
-        { key: 'trains', label: 'Available trains', kind: 'number' },
-        { key: 'value', label: 'Company value', kind: 'money' }
+        { key: 'dailyIncome', label: 'Daily income', kind: 'money', goal: 'up' },
+        { key: 'weeklyIncome', label: 'Weekly income', kind: 'money', goal: 'up' },
+        { key: 'dailyCustomers', label: 'Daily customers', kind: 'number', goal: 'up' },
+        { key: 'weeklyCustomers', label: 'Weekly customers', kind: 'number', goal: 'up' },
+        { key: 'avgEffectiveness', label: 'Avg. employee effectiveness', kind: 'points', goal: 'up' },
+        { key: 'efficiency', label: 'Company efficiency', kind: 'points', goal: 'up' },
+        { key: 'popularity', label: 'Popularity', kind: 'points', goal: 'up' },
+        { key: 'environment', label: 'Environment', kind: 'points', goal: 'up' },
+        { key: 'payroll', label: 'Daily wage payroll', kind: 'money', goal: 'context' },
+        { key: 'employeeCount', label: 'Employee count', kind: 'number', goal: 'context' },
+        { key: 'employeeCapacity', label: 'Employee capacity', kind: 'number', goal: 'context' },
+        { key: 'avgWorkingStatEffectiveness', label: 'Avg. work-stat effectiveness', kind: 'points', goal: 'up' },
+        { key: 'managementBonusPoints', label: 'Reported Management bonus total', kind: 'number', goal: 'up' },
+        { key: 'funds', label: 'Company funds', kind: 'money', goal: 'context' },
+        { key: 'rating', label: 'Star rating', kind: 'number', goal: 'up' },
+        { key: 'advertisementBudget', label: 'Advertising budget', kind: 'money', goal: 'context' },
+        { key: 'trains', label: 'Available trains', kind: 'number', goal: 'context' },
+        { key: 'value', label: 'Company value', kind: 'money', goal: 'up' }
     ];
+}
+
+function historyDayKey(ts) {
+    if (!ts) return '';
+    try { return new Date(ts).toISOString().slice(0, 10); }
+    catch (e) { return ''; }
+}
+
+function historicalSnapshotsWithCurrent() {
+    if (!company || !company.id || !staff.length) return [];
+    var now = lastLoadedAt || Date.now();
+    var history = readChangeHistory(company.id);
+    var current = reportSnapshot(company, staff, now);
+    var list = (history.snapshots || []).filter(function (snapshot) {
+        return snapshot && snapshot.company && Array.isArray(snapshot.staff) &&
+            snapshot.ts <= now;
+    }).concat([current]).sort(function (a,b) { return a.ts - b.ts; });
+    var seen = {};
+    return list.filter(function (snapshot) {
+        var fp = String(snapshot.ts) + ':' + snapshotFingerprint(snapshot);
+        if (seen[fp]) return false;
+        seen[fp] = true;
+        return true;
+    });
+}
+
+// One representative observation per Torn day (UTC/TCT), taking the latest
+// saved state for that day. This avoids treating five-minute auto-refreshes as
+// independent evidence and lets the helper learn from day-to-day outcomes.
+function dailyHistoricalSnapshots(limitDays) {
+    var list = historicalSnapshotsWithCurrent();
+    var byDay = {};
+    list.forEach(function (snapshot) {
+        var key = historyDayKey(snapshot.ts);
+        if (!key) return;
+        if (!byDay[key] || snapshot.ts > byDay[key].ts) byDay[key] = snapshot;
+    });
+    var days = Object.keys(byDay).sort().map(function (key) { return byDay[key]; });
+    return days.slice(-Math.max(2, Math.round(num(limitDays) || 90)));
+}
+
+function previousDailySnapshot() {
+    var days = dailyHistoricalSnapshots(90);
+    if (days.length < 2) return null;
+    return days[days.length - 2];
+}
+
+function pctDelta(previous, latest) {
+    previous = num(previous); latest = num(latest);
+    if (previous === 0) return latest === 0 ? 0 : null;
+    return (latest - previous) / Math.abs(previous) * 100;
+}
+
+function snapshotRoleDelta(previous, latest) {
+    var before = snapshotPositionCounts(previous), after = snapshotPositionCounts(latest);
+    var keys = {};
+    Object.keys(before).concat(Object.keys(after)).forEach(function (key) { keys[key] = true; });
+    return Object.keys(keys).map(function (key) {
+        return { name:key, before:num(before[key]), after:num(after[key]), delta:num(after[key])-num(before[key]) };
+    }).filter(function (x) { return x.delta !== 0; });
+}
+
+function snapshotRosterDelta(previous, latest) {
+    var before = {}, after = {};
+    (previous && previous.staff || []).forEach(function (e) { before[String(e.id)] = e; });
+    (latest && latest.staff || []).forEach(function (e) { after[String(e.id)] = e; });
+    var joined = [], left = [], moved = [], wageChanges = [];
+    Object.keys(after).forEach(function (id) {
+        var n = after[id], o = before[id];
+        if (!o) joined.push(n.name || id);
+        else {
+            if (String(o.position||'') !== String(n.position||'')) moved.push({
+                name:n.name || o.name || id, from:o.position || '', to:n.position || ''
+            });
+            if (o.wage != null && n.wage != null && num(o.wage) !== num(n.wage)) wageChanges.push({
+                name:n.name || o.name || id, from:num(o.wage), to:num(n.wage)
+            });
+        }
+    });
+    Object.keys(before).forEach(function (id) {
+        if (!after[id]) left.push(before[id].name || id);
+    });
+    return { joined:joined, left:left, moved:moved, wageChanges:wageChanges };
+}
+
+function metricFactorCandidates(metricKey, previous, latest) {
+    if (!previous || !latest || !previous.company || !latest.company) return [];
+    var p=previous.company, n=latest.company, factors=[], roles=snapshotRoleDelta(previous,latest), roster=snapshotRosterDelta(previous,latest);
+    function add(label, detail, strength, key) {
+        if (!detail || !(strength > 0)) return;
+        factors.push({ label:label, detail:detail, strength:strength, key:key || label });
+    }
+    if (roles.length) {
+        add('Position mix changed', roles.slice(0,5).map(function (x) {
+            return x.name + ' ' + x.before + ' -> ' + x.after;
+        }).join('; '), 100, 'roles');
+    }
+    if (roster.moved.length) add('Employee role changes', roster.moved.slice(0,4).map(function(x){
+        return x.name + ': ' + x.from + ' -> ' + x.to;
+    }).join('; '), 95, 'roleMoves');
+    if (roster.joined.length || roster.left.length) add('Roster changed',
+        (roster.joined.length ? 'Joined: '+roster.joined.slice(0,4).join(', ') : '') +
+        (roster.joined.length && roster.left.length ? '; ' : '') +
+        (roster.left.length ? 'Left: '+roster.left.slice(0,4).join(', ') : ''), 90, 'roster');
+
+    var definitions = {
+        advertisementBudget:'Advertising budget',
+        dailyCustomers:'Daily customers',
+        weeklyCustomers:'Weekly customers',
+        avgEffectiveness:'Avg. employee effectiveness',
+        avgWorkingStatEffectiveness:'Avg. work-stat effectiveness',
+        managementBonusPoints:'Management bonus total',
+        efficiency:'Efficiency',
+        popularity:'Popularity',
+        environment:'Environment',
+        payroll:'Daily payroll',
+        employeeCount:'Employee count'
+    };
+    var relevance = {
+        dailyIncome:['dailyCustomers','efficiency','popularity','environment','advertisementBudget','avgEffectiveness','avgWorkingStatEffectiveness','managementBonusPoints','employeeCount','payroll'],
+        weeklyIncome:['weeklyCustomers','efficiency','popularity','environment','advertisementBudget','avgEffectiveness','managementBonusPoints','employeeCount','payroll'],
+        dailyCustomers:['advertisementBudget','popularity','efficiency','environment','avgEffectiveness','employeeCount'],
+        weeklyCustomers:['advertisementBudget','popularity','efficiency','environment','avgEffectiveness','employeeCount'],
+        efficiency:['avgWorkingStatEffectiveness','avgEffectiveness','managementBonusPoints','employeeCount'],
+        popularity:['advertisementBudget','dailyCustomers','weeklyCustomers','avgEffectiveness'],
+        environment:['avgEffectiveness','employeeCount'],
+        avgEffectiveness:['avgWorkingStatEffectiveness','managementBonusPoints','employeeCount'],
+        avgWorkingStatEffectiveness:['employeeCount','avgEffectiveness'],
+        managementBonusPoints:['avgEffectiveness','employeeCount'],
+        payroll:['employeeCount'],
+        funds:['dailyIncome','payroll'],
+        value:['dailyIncome','weeklyIncome','rating','employeeCount'],
+        rating:['dailyIncome','weeklyIncome','popularity','efficiency'],
+        trains:['employeeCount'],
+        advertisementBudget:['dailyCustomers','popularity']
+    };
+    (relevance[metricKey] || Object.keys(definitions)).forEach(function (key, index) {
+        if (p[key] == null || n[key] == null) return;
+        var delta=num(n[key])-num(p[key]);
+        if (!delta) return;
+        var pd=pctDelta(p[key],n[key]);
+        var detail=definitions[key] + ' ' +
+            (delta>0?'+':'') + (key==='advertisementBudget'||key==='payroll' ? money(delta) :
+                key==='employeeCount' ? fmt(delta) :
+                (pd != null && Math.abs(pd)>=1 ? pct(pd,1) : (delta>0?'+':'')+fmt(delta)));
+        add(definitions[key]+' changed', detail, Math.max(20,80-index*5), key);
+    });
+    return factors.sort(function(a,b){return b.strength-a.strength;}).slice(0,6);
+}
+
+function significantMetricMove(metric, previous, latest) {
+    if (!metric || !previous || !latest || !previous.company || !latest.company) return false;
+    var a=num(previous.company[metric.key]), b=num(latest.company[metric.key]), d=b-a, pd=pctDelta(a,b);
+    if (!d) return false;
+    if (metric.kind === 'money') return pd == null ? Math.abs(d)>0 : Math.abs(pd)>=10;
+    if (metric.kind === 'points') return Math.abs(d)>=3;
+    return pd == null ? Math.abs(d)>=1 : Math.abs(pd)>=10 || Math.abs(d)>=2;
+}
+
+function metricAnalysis(metric, previous, latest) {
+    if (!metric || !previous || !latest || !previous.company || !latest.company ||
+        previous.company[metric.key] == null || latest.company[metric.key] == null) return null;
+    var before=num(previous.company[metric.key]), after=num(latest.company[metric.key]), delta=after-before;
+    var pd=pctDelta(before,after), factors=metricFactorCandidates(metric.key,previous,latest);
+    var direction=delta>0?'up':delta<0?'down':'flat';
+    var significant=significantMetricMove(metric,previous,latest);
+    var assessment='Stable';
+    if (metric.goal === 'up') assessment=delta>0?'Improved':delta<0?'Declined':'Stable';
+    else assessment=delta===0?'Stable':'Changed';
+    var action;
+    if (!significant) {
+        action='No major day-over-day move detected. Maintain the current setup and keep collecting history.';
+    } else if (metric.goal === 'up' && delta > 0) {
+        action='Maintain the changes that coincided with this improvement, especially factors that repeat across multiple days.';
+    } else if (metric.goal === 'up' && delta < 0) {
+        action='Review the strongest same-period changes first. If a role or effectiveness factor changed, test restoring the last better-performing setup before making more changes.';
+    } else {
+        action='Treat this as context rather than automatically good or bad. Check whether the change improved income, customers, or effectiveness before keeping it.';
+    }
+    return {
+        key:metric.key,label:metric.label,kind:metric.kind,goal:metric.goal,
+        previous:before,latest:after,delta:delta,pct:pd,direction:direction,
+        assessment:assessment,significant:significant,factors:factors,action:action
+    };
+}
+
+function statisticsHistoricalAnalysis() {
+    var current=reportSnapshot(company,staff,lastLoadedAt||Date.now());
+    var previous=previousDailySnapshot();
+    if (!previous) return { previous:null,current:current,analyses:[] };
+    return {
+        previous:previous,current:current,
+        analyses:metricDefinitions().map(function(metric){
+            return metricAnalysis(metric,previous,current);
+        }).filter(Boolean)
+    };
+}
+
+// Learn role evidence from day-to-day outcomes. The score is deliberately
+// conservative: income is primary, customers/efficiency/effectiveness are
+// secondary, and observations are down-weighted when headcount, advertising,
+// or many roles changed at the same time.
+function roleHistoricalEvidence() {
+    var days=dailyHistoricalSnapshots(120), evidence={};
+    for (var i=1;i<days.length;i++) {
+        var previous=days[i-1], latest=days[i];
+        if (!previous.company || !latest.company) continue;
+        var roleChanges=snapshotRoleDelta(previous,latest);
+        if (!roleChanges.length) continue;
+        var incomePct=pctDelta(previous.company.dailyIncome,latest.company.dailyIncome);
+        var customersPct=pctDelta(previous.company.dailyCustomers,latest.company.dailyCustomers);
+        var efficiencyDelta=num(latest.company.efficiency)-num(previous.company.efficiency);
+        var effectivenessDelta=num(latest.company.avgEffectiveness)-num(previous.company.avgEffectiveness);
+        if (incomePct == null) incomePct=0;
+        if (customersPct == null) customersPct=0;
+        var outcome=incomePct + customersPct*0.25 + efficiencyDelta*0.8 + effectivenessDelta*0.35;
+        var sameHeadcount=num(previous.company.employeeCount)===num(latest.company.employeeCount);
+        var adPct=pctDelta(previous.company.advertisementBudget,latest.company.advertisementBudget);
+        var stableAds=adPct==null ? num(previous.company.advertisementBudget)===num(latest.company.advertisementBudget) : Math.abs(adPct)<=15;
+        var weight=1;
+        if (!sameHeadcount) weight*=0.55;
+        if (!stableAds) weight*=0.65;
+        if (roleChanges.length>2) weight*=0.6;
+        else if (roleChanges.length===2) weight*=0.85;
+        if (Math.abs(incomePct)<5 && Math.abs(customersPct)<5 && Math.abs(efficiencyDelta)<2) weight*=0.55;
+
+        roleChanges.forEach(function(change){
+            var roleName=change.name, signed=outcome*(change.delta>0?1:-1), item=evidence[roleName] || {
+                role:roleName,scoreSum:0,weightSum:0,observations:0,positive:0,negative:0,
+                supportedCount:0,lastObserved:0,examples:[]
+            };
+            item.scoreSum += signed*weight;
+            item.weightSum += weight;
+            item.observations++;
+            if (signed>3) item.positive++;
+            if (signed<-3) item.negative++;
+            if (signed>5) item.supportedCount=Math.max(item.supportedCount, change.delta>0?change.after:change.before);
+            item.lastObserved=Math.max(item.lastObserved,latest.ts);
+            item.examples.push({
+                ts:latest.ts,before:change.before,after:change.after,
+                incomePct:incomePct,customersPct:customersPct,score:signed,weight:weight
+            });
+            if (item.examples.length>6)item.examples=item.examples.slice(-6);
+            evidence[roleName]=item;
+        });
+    }
+
+    var byPosition={};
+    positions.forEach(function(position){
+        var item=evidence[positionNameKey(position)];
+        if (!item) return;
+        var score=item.weightSum?item.scoreSum/item.weightSum:0;
+        var consistency=item.observations?Math.max(item.positive,item.negative)/item.observations:0;
+        var confidence=item.observations>=4&&consistency>=0.7?'high':
+            item.observations>=2&&consistency>=0.6?'medium':'low';
+        byPosition[positionKey(position)]=Object.assign({},item,{
+            position:position.name,score:score,consistency:consistency,confidence:confidence,
+            positiveRole:score>=6 && (confidence==='medium'||confidence==='high'),
+            negativeRole:score<=-6 && (confidence==='medium'||confidence==='high')
+        });
+    });
+    return byPosition;
+}
+
+function learnedRoleFloor(position,evidence) {
+    if (cfg.protectRoleCoverage === false) return 0;
+    var current=num(currentStaffingCounts()[positionKey(position)]);
+    if (!current) return 0;
+    var item=evidence && evidence[positionKey(position)];
+    if (!item || !item.positiveRole) return 1;
+    return Math.max(1,Math.min(current,Math.round(num(item.supportedCount)||1)));
+}
+
+function learnedRoleSummary() {
+    var evidence=roleHistoricalEvidence();
+    return Object.keys(evidence).map(function(key){return evidence[key];})
+        .filter(function(x){return x.confidence!=='low' || Math.abs(x.score)>=15;})
+        .sort(function(a,b){return Math.abs(b.score)-Math.abs(a.score);})
+        .slice(0,8);
 }
 
 function changePeriodDays() {
