@@ -616,9 +616,12 @@ function staffingPlanInfo() {
     var valid = targetTotal === employeeTotal;
     var coverageWarnings = [];
     if (valid && saved && cfg.protectRoleCoverage !== false) {
+        var learned = roleHistoricalEvidence();
         positions.forEach(function (position) {
-            var key = positionKey(position);
-            if (num(current[key]) > 0 && num(target[key]) <= 0) coverageWarnings.push(position.name);
+            var key = positionKey(position), floor = learnedRoleFloor(position, learned);
+            if (num(current[key]) > 0 && num(target[key]) < floor) {
+                coverageWarnings.push(position.name + ' (minimum ' + fmt(floor) + ' from current/history safeguards)');
+            }
         });
     }
     var safe = valid && coverageWarnings.length === 0;
@@ -1876,7 +1879,18 @@ function changeReportText(report) {
         lines.push(e.name + ' — ' + e.type + ': ' + e.text);
     });
     if (!report.employeeChanges.length) lines.push('No comparison changes recorded.');
+    var daily=statisticsHistoricalAnalysis();
+    if (daily.previous && daily.analyses.length) {
+        lines.push('', 'PREVIOUS-DAY STATISTICS ANALYSIS',
+            'Compared with: '+changeDate(daily.previous.ts));
+        daily.analyses.forEach(function(a){
+            lines.push(a.label+': '+a.assessment+'; '+analysisDeltaText(a));
+            if (a.factors.length) lines.push('  Observed factors: '+a.factors.slice(0,4).map(function(f){return f.detail;}).join(' | '));
+            lines.push('  Action: '+a.action);
+        });
+    }
     lines.push('', 'Daily/weekly income are point-in-time Torn values, NOT summed earnings over the selected period.',
+        'Factors listed by the helper are same-period observations and historical associations, not proof of causation.',
         'Report assembled from Torn company news and automatically collected browser-local snapshots. Missing past observations cannot be recreated.');
     return lines.join('\n');
 }
@@ -2214,7 +2228,7 @@ function staffingPlanEditor() {
     var statusText = !info.valid ?
         'Target slots total ' + fmt(info.targetTotal) + ', but you have ' + fmt(info.employeeTotal) + ' non-director employees. Current position counts are used until the totals match.' :
         info.coverageWarnings.length ?
-            'Safety hold: this plan removes the last employee from ' + info.coverageWarnings.join(', ') + '. Current position counts remain active unless role-coverage protection is disabled.' :
+            'Safety hold: this plan reduces protected role coverage below the safe floor for ' + info.coverageWarnings.join(', ') + '. Current position counts remain active unless role-coverage protection is disabled.' :
             'Target slots match your ' + fmt(info.employeeTotal) + ' non-director employees and preserve current operating-role coverage.';
 
     var html = '<div class="staffing-summary ' + stateClass + '"><div><b>' + (info.customApplied ? 'Custom staffing targets active' : info.custom ? 'Custom targets paused by safeguards' : 'Current position counts preserved') + '</b><small>' + esc(statusText) + '</small></div><button data-a="reset-staffing">Use current counts</button></div>';
@@ -2366,6 +2380,10 @@ function additionalRolesHtml() {
                 esc(pct(x.historySignal.declinePct, 0)) +
                 ' lower than the last recent snapshot that still had this role. ' +
                 'This is correlation, not proof; use it as a reason to test restoring the role.</p>' : '';
+        var learned = x.learnedEvidence ?
+            '<p class="' + (x.learnedEvidence.positiveRole ? 'role-learned-positive' : x.learnedEvidence.negativeRole ? 'role-learned-negative' : 'role-learned') + '">' +
+            '<b>Historical learning:</b> score ' + esc((x.learnedEvidence.score>0?'+':'')+x.learnedEvidence.score.toFixed(1)) +
+            ' from ' + fmt(x.learnedEvidence.observations) + ' daily observation(s), ' + esc(x.learnedEvidence.confidence) + ' confidence.</p>' : '';
         var details = x.plan ?
             '<p><b>' + (x.plan.historicalReverse ? 'Likely restoration path' : 'Reallocation scenario') +
                 ':</b> move one duplicated/safe planned slot from ' + esc(x.plan.replaces) +
@@ -2385,7 +2403,7 @@ function additionalRolesHtml() {
                 esc(x.kind ? 'Unstaffed ' + x.kind + ' ability' : 'Unstaffed production role') +
                 '</small><h5>' + esc(x.position) + '</h5></div>' +
                 '<span class="role-type">' + esc(x.kind ? 'Support opportunity' : 'Stat-fit opportunity') + '</span></div>' +
-            '<p>' + esc(x.reason) + '</p>' + recovery + details + vacancy +
+            '<p>' + esc(x.reason) + '</p>' + recovery + learned + details + vacancy +
             (x.plan ?
                 '<button data-use-new-role="' + esc(x.key) +
                 '">Use as staffing target (helper only)</button>' :
@@ -2538,6 +2556,7 @@ function positionsPage(result) {
     });
     html += '</div>';
     html += supportImpactHtml(result);
+    html += learnedRoleHistoryHtml();
     html += additionalRolesHtml();
     html += '<div class="positions-section-head"><div><h4>Staffing targets</h4>' +
         '<p>Set how many employees should fill each job. Targets must add up to your current number of employees. Suggestions are helper-only.</p></div></div>' +
@@ -2547,7 +2566,7 @@ function positionsPage(result) {
         '<div class="toggles">' +
             toggle('positionAdvice', 'Show position recommendations', 'Compare proposed roles with current assignments.') +
             toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Keep current Managers, Trainers, Marketers, Cleaners, and Secretaries when their slots remain.') +
-            toggle('protectRoleCoverage', 'Protect existing role coverage (strongly recommended)', 'Automatic advice will not remove the last employee from a currently staffed role such as Administrator, Technician, or Cashier. Disable only if you intentionally want to eliminate a role.') +
+            toggle('protectRoleCoverage', 'Protect existing & historically important role coverage (strongly recommended)', 'Automatic advice preserves at least one employee in every staffed role and can preserve higher counts when repeated history indicates that reducing the role hurt company outcomes. Disable only for an intentional restructure.') +
             toggle('exploreNewRoles', 'Explore additional positions', 'Consider unstaffed positions, safe alternatives, historical recovery signals, and hiring capacity.') +
         '</div></div></section>';
     return html;
@@ -2561,8 +2580,66 @@ function statisticsTile(label, key, suffix, note, kind) {
         esc(shown) + '</strong><span>' + esc(note) + '</span></div>';
 }
 
+
+function analysisDeltaText(a) {
+    var base=(a.delta>0?'+':'')+(a.kind==='money'?money(a.delta):fmt(a.delta)+(a.kind==='points'?' pp':''));
+    if (a.pct != null && Math.abs(a.pct) >= 0.1 && a.kind !== 'points') base += ' (' + (a.pct>0?'+':'') + pct(a.pct,1) + ')';
+    return base;
+}
+
+function statisticsAnalysisCard(a) {
+    var factorHtml=a.factors.length ? '<ul>' + a.factors.slice(0,5).map(function(f){
+        return '<li><b>'+esc(f.label)+'</b><span>'+esc(f.detail)+'</span></li>';
+    }).join('') + '</ul>' :
+        '<p class="stats-analysis-none">No other tracked factor changed enough to stand out in the same comparison. Keep collecting data before attributing a cause.</p>';
+    var cls=a.assessment==='Improved'?'good':a.assessment==='Declined'?'bad':a.significant?'watch':'stable';
+    return '<details class="stats-analysis-card '+cls+'"'+(a.significant?' open':'')+'>' +
+        '<summary><span><small>'+esc(a.label)+'</small><b>'+esc(metricText(a.latest,a.kind))+'</b></span>' +
+        '<span class="stats-analysis-change"><b>'+esc(a.assessment)+'</b><small>'+esc(analysisDeltaText(a))+'</small></span></summary>' +
+        '<div class="stats-analysis-body">' +
+            '<div class="stats-analysis-compare"><span>Previous day</span><b>'+esc(metricText(a.previous,a.kind))+'</b><span>Current</span><b>'+esc(metricText(a.latest,a.kind))+'</b></div>' +
+            '<h5>What changed alongside it?</h5>'+factorHtml+
+            '<div class="stats-analysis-action"><b>'+(a.assessment==='Improved'?'Maintain / learn from this':'What to review next')+'</b><p>'+esc(a.action)+'</p></div>' +
+            '<small class="stats-analysis-caution">Factors are observations from the same period, not proof that one caused the other.</small>' +
+        '</div></details>';
+}
+
+function statisticsAnalysisHtml() {
+    var pack=statisticsHistoricalAnalysis();
+    if (!pack.previous) return '<div class="stats-analysis-empty">No previous-day snapshot is available yet. Keep auto-recording enabled; the helper needs at least two different Torn days before it can analyze changes and possible factors.</div>';
+    var significant=pack.analyses.filter(function(a){return a.significant;}).length;
+    return '<section class="stats-analysis-section">' +
+        '<div class="stats-analysis-head"><div><small>Historical analysis</small><h4>What changed since the previous day?</h4>' +
+        '<p>Compared with '+esc(changeDate(pack.previous.ts))+'. '+fmt(significant)+' significant metric change'+(significant===1?'':'s')+' detected.</p></div>' +
+        '<span class="stats-learning-badge">History-aware</span></div>' +
+        '<div class="stats-analysis-list">'+pack.analyses.map(statisticsAnalysisCard).join('')+'</div>' +
+        '<p class="stats-analysis-foot">The helper compares role mix, employee movements, effectiveness, management bonuses, advertising, customers, payroll, efficiency, popularity, environment, and other saved indicators. Repeated patterns influence future position suggestions, but uncertain relationships remain labeled as correlation.</p>' +
+    '</section>';
+}
+
+function learnedRoleHistoryHtml() {
+    var learned=learnedRoleSummary();
+    if (!learned.length) return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4></div><span>Collecting data</span></div><p>There is not enough repeated day-to-day role evidence yet. Keep auto-recording enabled; suggestions will become more evidence-aware as position changes and outcomes are observed.</p></section>';
+    return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4><p>Repeated before/after observations can strengthen, weaken, or protect role recommendations.</p></div><span>'+fmt(learned.length)+' learned signal'+(learned.length===1?'':'s')+'</span></div>' +
+        '<div class="role-learning-grid">'+learned.map(function(x){
+            var favorable=x.score>=0, label=x.positiveRole?'Favor / protect':x.negativeRole?'Use caution':'Weak signal';
+            var currentPositionObj=positions.find(function(p){return positionKey(p)===positionKey({id:x.position,name:x.position}) || positionNameKey(p)===positionNameKey(x.position);});
+            var floor=currentPositionObj?learnedRoleFloor(currentPositionObj,roleHistoricalEvidence()):0;
+            var latest=x.examples && x.examples.length?x.examples[x.examples.length-1]:null;
+            return '<article class="role-learning-card '+(favorable?'positive':'negative')+'">' +
+                '<div><small>'+esc(label)+'</small><h5>'+esc(x.position)+'</h5></div>' +
+                '<b>'+esc((x.score>0?'+':'')+x.score.toFixed(1))+'</b>' +
+                '<p>'+fmt(x.observations)+' day-to-day observation'+(x.observations===1?'':'s')+' · '+esc(x.confidence)+' confidence' +
+                    (floor>1?' · protected count '+fmt(floor):'')+'</p>' +
+                (latest?'<small>Latest related move: '+fmt(latest.before)+' -> '+fmt(latest.after)+'; daily income '+(latest.incomePct>0?'+':'')+pct(latest.incomePct,1)+'.</small>':'') +
+            '</article>';
+        }).join('')+'</div>' +
+        '<p class="role-learning-note">Learning scores summarize association across saved days after down-weighting headcount, advertising, and multi-role confounders. They are not guaranteed profit estimates.</p></section>';
+}
+
 function statisticsPage(result) {
     var history = changeReport();
+    var dayAnalysis = statisticsHistoricalAnalysis();
     var html = '<section class="statistics-page">' +
         '<div class="page-heading"><div><small>Business performance</small><h3>Company Statistics</h3>' +
         '<p>Understand your current figures without mixing them with wage or position recommendations.</p></div>' +
@@ -2598,6 +2675,7 @@ function statisticsPage(result) {
             positionStat('Daily wage payroll', money(result.currentAll), 'All employees with known wages') +
             positionStat('Employee capacity', company && company.capacity ? fmt(company.capacity) : 'Not reported', 'Reported hiring slots') +
         '</div>';
+    html += statisticsAnalysisHtml();
     html += '<div class="positions-section-head"><div><h4>Changes over time</h4>' +
         '<p>Compare tracked values against the earliest available baseline for the selected period.</p></div>' +
         '<button class="small" data-page="changes">Open Changes →</button></div>';
