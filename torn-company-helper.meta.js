@@ -2,7 +2,7 @@
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
 // @version      2.6.2
-// @description  Torn company helper for wages, staffing, and historical company changes.
+// @description  Torn company helper for wages, history-aware staffing, and company performance analysis.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
 // @match        https://torn.com/companies.php*
