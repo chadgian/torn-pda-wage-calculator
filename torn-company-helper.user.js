@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.6.0
+// @version      2.6.1
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.6.0';
+var VERSION = '2.6.1';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -43,6 +43,7 @@ var defaults = {
     fill: false,
     positionAdvice: true,
     protectSupportRoles: true,
+    protectRoleCoverage: true,
     exploreNewRoles: true,
     autoRefresh: true
 };
@@ -467,6 +468,107 @@ function positionKey(position) {
     return String(position.id || position.name || '');
 }
 
+function positionNameKey(value) {
+    var name = typeof value === 'string' ? value : value && value.name;
+    return String(name || '').trim().toLowerCase();
+}
+
+function snapshotPositionCounts(snapshot) {
+    var counts = {};
+    (snapshot && snapshot.staff || []).forEach(function (employee) {
+        var name = String(employee && employee.position || '').trim();
+        if (!name || /^director$/i.test(name)) return;
+        var key = name.toLowerCase();
+        counts[key] = (counts[key] || 0) + 1;
+    });
+    return counts;
+}
+
+function currentNamedPositionCounts() {
+    var counts = {};
+    staff.forEach(function (employee) {
+        if (employee.director) return;
+        var current = currentPosition(employee);
+        var key = positionNameKey(current || employee.position);
+        if (key) counts[key] = (counts[key] || 0) + 1;
+    });
+    return counts;
+}
+
+// Automatic suggestions use a role-coverage floor. Torn does not expose a
+// complete profit formula for every operating position, so eliminating the
+// last Administrator, Technician, Cashier, etc. merely because another role
+// has a better work-stat score is unsafe. Special support roles are already
+// handled separately; this floor protects ordinary operating coverage.
+function autoRoleCoverageFloor(position) {
+    if (cfg.protectRoleCoverage === false) return 0;
+    var current = currentStaffingCounts();
+    return num(current[positionKey(position)]) > 0 ? 1 : 0;
+}
+
+// Look for a recently removed role whose absence coincides with a material
+// daily-income decline. This is correlation, not proof, so it is used as a
+// recovery warning / prioritization signal rather than a profit forecast.
+function roleHistoryRecoverySignals() {
+    var out = {};
+    if (!company || !company.id || !positions.length || !staff.length) return out;
+    var history = readChangeHistory(company.id);
+    var now = lastLoadedAt || Date.now();
+    var current = reportSnapshot(company, staff, now);
+    var currentCounts = snapshotPositionCounts(current);
+    var currentIncome = num(current.company && current.company.dailyIncome);
+    var currentEmployees = num(current.company && current.company.employeeCount) || (current.staff || []).length;
+    var currentAds = num(current.company && current.company.advertisementBudget);
+    var cutoff = now - 14 * 86400000;
+    var snapshots = (history.snapshots || []).filter(function (snapshot) {
+        return snapshot && snapshot.ts >= cutoff && snapshot.ts < now - 1000 &&
+            snapshot.company && Array.isArray(snapshot.staff);
+    }).sort(function (a, b) { return a.ts - b.ts; });
+
+    positions.forEach(function (position) {
+        var nameKey = positionNameKey(position);
+        if (!nameKey || num(currentCounts[nameKey]) > 0) return;
+        var withRole = snapshots.filter(function (snapshot) {
+            return num(snapshotPositionCounts(snapshot)[nameKey]) > 0;
+        });
+        if (!withRole.length) return;
+        var baseline = withRole[withRole.length - 1];
+        var baselineIncome = num(baseline.company.dailyIncome);
+        if (!(baselineIncome > 0) || !(currentIncome >= 0)) return;
+        var declinePct = (baselineIncome - currentIncome) / baselineIncome * 100;
+        var baselineEmployees = num(baseline.company.employeeCount) || (baseline.staff || []).length;
+        var baselineAds = num(baseline.company.advertisementBudget);
+        var sameHeadcount = baselineEmployees === currentEmployees;
+        var adChangePct = baselineAds > 0 ? Math.abs(currentAds - baselineAds) / baselineAds * 100 :
+            (currentAds === baselineAds ? 0 : 100);
+        // Require a meaningful decline. Same headcount strengthens the signal;
+        // a very large decline is still surfaced even if another roster change occurred.
+        if (!(declinePct >= 20 && sameHeadcount) && declinePct < 35) return;
+
+        var beforeCounts = snapshotPositionCounts(baseline);
+        var increasedKeys = [];
+        positions.forEach(function (candidate) {
+            var candidateName = positionNameKey(candidate);
+            if (num(currentCounts[candidateName]) > num(beforeCounts[candidateName])) {
+                increasedKeys.push(positionKey(candidate));
+            }
+        });
+
+        out[positionKey(position)] = {
+            position: position.name,
+            removedAfter: baseline.ts,
+            baselineIncome: baselineIncome,
+            currentIncome: currentIncome,
+            declinePct: declinePct,
+            sameHeadcount: sameHeadcount,
+            adChangePct: adChangePct,
+            increasedKeys: increasedKeys,
+            strong: declinePct >= 35 || (declinePct >= 20 && sameHeadcount && adChangePct <= 25)
+        };
+    });
+    return out;
+}
+
 function samePosition(employee, position) {
     var current = currentPosition(employee);
     return !!(current && position && positionKey(current) === positionKey(position));
@@ -511,7 +613,15 @@ function staffingPlanInfo() {
     var targetTotal = positions.reduce(function (t, p) { return t + num(target[positionKey(p)]); }, 0);
     var currentTotal = positions.reduce(function (t, p) { return t + num(current[positionKey(p)]); }, 0);
     var valid = targetTotal === employeeTotal;
-    var effective = valid ? target : normalizedStaffingPlan(current);
+    var coverageWarnings = [];
+    if (valid && saved && cfg.protectRoleCoverage !== false) {
+        positions.forEach(function (position) {
+            var key = positionKey(position);
+            if (num(current[key]) > 0 && num(target[key]) <= 0) coverageWarnings.push(position.name);
+        });
+    }
+    var safe = valid && coverageWarnings.length === 0;
+    var effective = safe ? target : normalizedStaffingPlan(current);
 
     return {
         current: current,
@@ -521,7 +631,10 @@ function staffingPlanInfo() {
         targetTotal: targetTotal,
         currentTotal: currentTotal,
         valid: valid,
-        custom: !!saved
+        safe: safe,
+        coverageWarnings: coverageWarnings,
+        custom: !!saved,
+        customApplied: !!saved && safe
     };
 }
 
@@ -729,7 +842,10 @@ function companyPositionAssignment(overrideTargets) {
         suggestedFit: suggestedFit,
         support: support,
         protectedCount: protectedCount,
-        supportRisks: supportRisks
+        supportRisks: supportRisks,
+        coverageProtectedCount: cfg.protectRoleCoverage === false ? 0 :
+            positions.filter(function (position) { return num(plan.current[positionKey(position)]) > 0; }).length,
+        coverageWarnings: plan.coverageWarnings || []
     };
 }
 
@@ -781,9 +897,10 @@ function suggestAdditionalRoles() {
     if (!cfg.positionAdvice || cfg.exploreNewRoles === false ||
         !company || !positions.length || !staff.length) return [];
     var plan = staffingPlanInfo();
-    if (!plan.valid || plan.employeeTotal < 1) return [];
+    if (!plan.valid || !plan.safe || plan.employeeTotal < 1) return [];
     var targets = normalizedStaffingPlan(plan.effective);
     var currentSolution = companyPositionAssignment();
+    var historySignals = roleHistoryRecoverySignals();
     if (!currentSolution || !Object.keys(currentSolution.byEmployee || {}).length) return [];
     var openCapacity = num(company.capacity) > 0 ?
         Math.max(0, Math.floor(num(company.capacity) - Math.max(staff.length, num(company.employeeCount)))) : 0;
@@ -795,8 +912,13 @@ function suggestAdditionalRoles() {
     });
 
     // Never make an existing support role the source of an exploratory slot.
+    // Also preserve at least one slot in every currently staffed operating role.
+    // A new role may therefore replace a duplicated Cashier/Technician/etc.,
+    // but never the company's only Administrator simply because of stat fit.
     var donorPositions = positions.filter(function (p) {
-        return num(targets[positionKey(p)]) > 0 && !supportRoleKind(p);
+        var key = positionKey(p);
+        return !supportRoleKind(p) &&
+            num(targets[key]) > autoRoleCoverageFloor(p);
     });
     var offers = [];
 
@@ -804,9 +926,18 @@ function suggestAdditionalRoles() {
         var targetKey = positionKey(candidate);
         if (!targetKey || num(targets[targetKey]) !== 0) return;
         var kind = supportRoleKind(candidate);
+        var historySignal = historySignals[targetKey] || null;
         // Avoid proposing another version of a special ability already staffed.
         if (kind && activeKinds[kind]) return;
         var benefit = potentialRoleBenefit(candidate);
+        if (historySignal && historySignal.strong) {
+            benefit = {
+                reason: 'Recovery signal: this role was recently staffed, and tracked daily income is now ' +
+                    pct(historySignal.declinePct, 0) + ' lower than the last recent snapshot that included it. ' +
+                    'This is observed correlation, not proof of causation.',
+                signal: 120 + Math.min(60, Math.max(0, historySignal.declinePct))
+            };
+        }
         var strongest = null;
 
         donorPositions.forEach(function (donor) {
@@ -825,24 +956,35 @@ function suggestAdditionalRoles() {
             })) return;
 
             var delta = evaluated.suggestedFit - currentSolution.suggestedFit;
-            if (!strongest || delta > strongest.fitDelta ||
-                (delta === strongest.fitDelta && donor.name.localeCompare(strongest.replaces) < 0)) {
+            var historicalReverse = !!(historySignal &&
+                historySignal.increasedKeys.indexOf(donorKey) >= 0);
+            var selectionScore = delta + (historicalReverse ? 10000 : 0);
+            if (!strongest || selectionScore > strongest.selectionScore ||
+                (selectionScore === strongest.selectionScore && donor.name.localeCompare(strongest.replaces) < 0)) {
                 strongest = {
                     replaces: donor.name, replacesKey: donorKey, fitDelta: delta,
-                    targets: hypothetical, caution: !!kind || (evaluated.supportRisks || []).length > 0
+                    targets: hypothetical, caution: !!kind || !!historySignal ||
+                        (evaluated.supportRisks || []).length > 0,
+                    historicalReverse: historicalReverse,
+                    selectionScore: selectionScore
                 };
             }
         });
 
-        // Without a special ability, only advertise an actual modeled fit
-        // improvement, except where there's spare capacity for a future hire.
-        if (!kind && (!strongest || strongest.fitDelta <= 0) && !openCapacity) return;
-        if (!strongest && !openCapacity) return;
+        // Ordinary unstaffed roles need either a modeled fit improvement or a
+        // strong recent recovery signal. If no safe donor exists, keep the role
+        // visible as a manual/hiring recovery idea rather than deleting another
+        // unique operating role.
+        if (!kind && !historySignal && (!strongest || strongest.fitDelta <= 0) && !openCapacity) return;
+        if (!strongest && !openCapacity && !(historySignal && historySignal.strong)) return;
         offers.push({
             position: candidate.name, key: targetKey, kind: kind,
             reason: benefit.reason, priority: benefit.signal,
             plan: strongest, openCapacity: openCapacity,
-            rank: benefit.signal + (!kind && strongest ? Math.max(0, strongest.fitDelta) : 0)
+            historySignal: historySignal,
+            rank: benefit.signal +
+                (historySignal && historySignal.strong ? 100 : 0) +
+                (!kind && strongest ? Math.max(0, strongest.fitDelta) : 0)
         });
     });
 
@@ -1060,7 +1202,9 @@ function calculate() {
         positionSuggestedFit: positionAssignment.suggestedFit,
         support: positionAssignment.support || supportRoleSnapshot(),
         protectedCount: positionAssignment.protectedCount || 0,
-        supportRisks: positionAssignment.supportRisks || []
+        supportRisks: positionAssignment.supportRisks || [],
+        coverageProtectedCount: positionAssignment.coverageProtectedCount || 0,
+        coverageWarnings: positionAssignment.coverageWarnings || []
     };
 }
 
@@ -1758,15 +1902,17 @@ function staffingPlanEditor() {
         var bc = num(info.target[positionKey(b)]) + num(info.current[positionKey(b)]);
         return bc - ac || a.name.localeCompare(b.name);
     });
-    var stateClass = info.valid ? 'valid' : 'invalid';
+    var stateClass = info.safe ? 'valid' : 'invalid';
     var reducedSupport = positions.filter(function (p) {
-        return supportRoleKind(p) && num(info.effective[positionKey(p)]) < num(info.current[positionKey(p)]);
+        return supportRoleKind(p) && num(info.target[positionKey(p)]) < num(info.current[positionKey(p)]);
     }).map(function (p) { return p.name; });
-    var statusText = info.valid ?
-        'Target slots match your ' + fmt(info.employeeTotal) + ' non-director employees.' :
-        'Target slots total ' + fmt(info.targetTotal) + ', but you have ' + fmt(info.employeeTotal) + ' non-director employees. Current position counts are used until the totals match.';
+    var statusText = !info.valid ?
+        'Target slots total ' + fmt(info.targetTotal) + ', but you have ' + fmt(info.employeeTotal) + ' non-director employees. Current position counts are used until the totals match.' :
+        info.coverageWarnings.length ?
+            'Safety hold: this plan removes the last employee from ' + info.coverageWarnings.join(', ') + '. Current position counts remain active unless role-coverage protection is disabled.' :
+            'Target slots match your ' + fmt(info.employeeTotal) + ' non-director employees and preserve current operating-role coverage.';
 
-    var html = '<div class="staffing-summary ' + stateClass + '"><div><b>' + (info.custom ? 'Custom staffing targets' : 'Current position counts preserved') + '</b><small>' + esc(statusText) + '</small></div><button data-a="reset-staffing">Use current counts</button></div>';
+    var html = '<div class="staffing-summary ' + stateClass + '"><div><b>' + (info.customApplied ? 'Custom staffing targets active' : info.custom ? 'Custom targets paused by safeguards' : 'Current position counts preserved') + '</b><small>' + esc(statusText) + '</small></div><button data-a="reset-staffing">Use current counts</button></div>';
     if (reducedSupport.length) html += '<div class="notice">Support-role reductions require review: ' + esc(reducedSupport.join(', ')) + '. Incumbents cannot all be protected when their slots are removed.</div>';
     html += '<div class="staffing-table"><div class="staffing-head"><span>Position</span><span>Current</span><span>Target</span></div>';
 
@@ -1846,16 +1992,16 @@ function calculationGuidePage() {
             guideCard('7', 'Minimum and maximum wages', 'For Current and Fixed modes, the target itself is constrained to a feasible range. The allocator starts each included employee at the minimum wage, distributes the remainder by score, caps employees that reach the maximum, and redistributes what remains.', 'Feasible target = clamp(Target, Minimum × Employees, Maximum × Employees)', 'For 5 included employees with a $100,000 minimum, the target cannot be lower than $500,000. A maximum wage can similarly cap the highest possible total.') +
             guideCard('8', 'Rounding and payroll balancing', 'Each raw wage is rounded to the Round to increment. In Current and Fixed modes, the helper then moves eligible wages up or down by one increment at a time to keep the final payroll as close as possible to the target.', 'Rounded wage = round(Raw wage ÷ Step) × Step', 'With Round to $10,000, $1,067,500 becomes $1,070,000. If this pushes the total payroll too high, another eligible recommendation can be reduced by $10,000.') +
             guideCard('9', 'Raise, cut, and change percentage', 'The employee list compares the suggested wage with the current wage. A positive difference is a raise; a negative difference is a cut.', 'Change = Suggested − Current; Change % = Change ÷ Current × 100', 'Current $1,000,000 and suggested $1,250,000 gives +$250,000, or +25%.') +
-            guideCard('10', 'Staffing-aware position assignment', 'The helper fills target slots using combined predicted work-stat fit and a 2-point staying bonus. With support-role protection enabled (the default), existing Managers, Marketers, Trainers, Cleaners, and Secretaries are kept in their current slots first. Stat fit alone does not measure their benefits to the rest of the company.', 'Reserve existing support-role incumbents when slots exist; then maximize remaining PositionFit + 2 when staying', 'If the plan requires 2 Cashiers, 1 Technician, 1 Admin, and 1 Cleaner, exactly those slots must be filled. Even if a Manager is individually better suited as Cashier, they remain Manager while their Manager slot is available. Removing that slot requires manual review.') +
-            guideCard('11', 'Custom staffing targets', 'Settings lets the director choose how many employees the company should have in each position. Target counts must add up to the number of non-director employees. If they do not match, the helper falls back to current counts. Reducing support-role slots can force speculative assignments and is flagged for review.', 'Sum of target position slots = non-director employees', 'For 10 non-director employees, a valid plan could be 3 Cashiers + 2 Technicians + 1 Admin + 1 Cleaner + 3 employees in other roles = 10 slots.') +
+            guideCard('10', 'Staffing-aware position assignment', 'The helper fills target slots using combined predicted work-stat fit and a 2-point staying bonus, but it no longer treats stat fit as the whole-company objective. Existing Managers, Marketers, Trainers, Cleaners, and Secretaries are reserved first. With role-coverage protection enabled, automatic advice also preserves at least one slot in every currently staffed operating role such as Administrator, Technician, or Cashier.', 'Preserve support incumbents + current role coverage; then maximize remaining PositionFit + 2 when staying', 'If the company has exactly one Administrator, an automatic Marketer suggestion may use a duplicated Cashier slot but cannot remove the only Administrator just because the Administrator would score better as Cashier.') +
+            guideCard('11', 'Custom staffing targets', 'The director can choose how many employees should fill each position. Targets must add up to the non-director employee count. By default, a custom plan that reduces any currently staffed role to zero is paused and current counts remain active. You can disable role-coverage protection for an intentional restructure, but doing so removes this safety barrier.', 'Valid plan = correct employee total + no protected current role reduced to zero', 'For 9 employees with 1 Administrator, changing the Administrator target to 0 will be held by the safeguard until role-coverage protection is deliberately disabled.') +
             guideCard('12', 'Summary values', 'The Dashboard and Wages pages average included employees only. Budget variance is the final included payroll minus the target payroll. In Benchmark mode there is no fixed company target, so budget variance is shown as not applicable.', 'Budget variance = Suggested included payroll − Target payroll', 'If the target is $10,000,000 and rounded recommendations total $10,010,000, budget variance is +$10,000.') +
-            guideCard('13', 'Discovering unstaffed roles', 'If Explore additional company roles is enabled, the Positions section looks at every position in the Torn company-type catalog, including roles that currently have zero employees or zero target slots. It skips another position with an already staffed special ability and examines what the new role could provide. Manager, Marketer, Cleaner, Trainer, and Secretary benefits are described using their catalog ability; other jobs are evaluated only for modeled work-stat fit.', 'Only consider unstaffed catalog positions; never assume an unreported company-wide bonus', 'If you currently have Cashiers and a Manager but no Trainer, the helper may suggest considering a Trainer for additional company trains, even though no Trainer exists in your current staffing plan.') +
-            guideCard('14', 'Comparing an alternate staffing mix', 'For a possible new role, the helper examines reallocating one existing non-support position slot. It preserves all currently employed support-role incumbents, optimizes the remaining employee-to-position assignments, and compares combined predicted work-stat fit with the current planning scenario. A decrease can be acceptable as a trade-off to investigate for support roles; an increase does not prove extra revenue. No sales or bonus estimates are invented.', 'Modeled stat-fit difference = simulated team fit − current-plan team fit; support benefits are excluded', 'Changing a target from 3 Cashiers + 1 Manager to 2 Cashiers + 1 Manager + 1 Trainer may lower the predicted stat-fit sum, but provides a possible new training benefit that must be verified in Torn.') +
-            guideCard('15', 'Hiring, applying, and limitations', 'If company capacity exceeds occupied slots, the helper identifies a separate hiring path. It does not invent a candidate employee or predict their effectiveness, wage, or income. The Use as staffing target button saves only a valid one-slot reallocation in this helper and opens Positions for review; it does not hire, dismiss, change positions, or submit anything in Torn. Recommendations are exploratory and require the director to compare actual results.', 'Valid reallocation: total role targets = current non-director staff; hiring is not scored without candidate stats', 'If there is 1 vacant employee slot, the helper may identify a Marketer as an available hiring option. You must hire and assign that employee in Torn yourself. Automatic recording then recalculates on your next successful company sync.') +
+            guideCard('13', 'Discovering unstaffed and recently removed roles', 'The Positions section reviews every company-type role with zero current slots. Special roles are described using Torn\'s catalog ability. Ordinary roles normally need a modeled team-fit benefit, but local history can create a recovery signal when a recently removed role coincides with a material daily-income decline. That signal is explicitly labeled as correlation, not proof.', 'Unstaffed role opportunity = safe fit/special-role case OR strong recent recovery signal', 'If Administrator disappears and the recorded daily income later falls sharply while headcount is unchanged, Administrator can be promoted as a role to test restoring even if its pure stat-fit score is not the highest.') +
+            guideCard('14', 'Comparing a safe alternate staffing mix', 'For a possible new role, the helper may reallocate only a duplicated non-support slot above its protected coverage floor. It preserves support-role incumbents and refuses to zero-out an existing operating role automatically. When history shows which role count increased as another role disappeared, the helper prefers reversing that specific change. It still reports the separate modeled stat-fit difference and never invents a sales forecast.', 'Safe donor count must remain at least 1 for every currently staffed operating role', 'If Administrator fell from 1 to 0 while Cashier rose from 1 to 2, a restoration scenario prefers moving one Cashier slot back to Administrator instead of sacrificing a different unique role.') +
+            guideCard('15', 'Hiring, applying, and limitations', 'If no duplicated role can be reduced safely, the helper will not manufacture a reallocation just to add a new role. It can instead show a hiring path when capacity is available, or leave the idea for manual director review. The helper does not know Torn\'s complete company-income formula, so preserving observed role coverage takes priority over squeezing out a few extra stat-fit points.', 'No safe donor = no automatic role replacement', 'With nine employees all occupying unique roles, adding a Marketer does not justify deleting the only Administrator. The helper will require a vacancy, a duplicated donor role, or a deliberate manual restructure.') +
             guideCard('16', 'Finding your way around', 'The Dashboard shows concise summaries and opens dedicated sections. Wages contains pay suggestions and exports. Positions contains role recommendations, support-role safeguards, exploratory role options, and staffing targets. Company Statistics displays current income, customers, company condition, resources, and available historical comparisons. Changes records events and performance differences. Settings controls wage calculations and general behavior.', 'Dashboard → choose a section → review details → return using the top navigation', 'To decide whether to introduce a Trainer, open Positions. To see income figures, open Statistics. To compare activity across days, open Changes. To export suggested daily pay, open Wages.') +
-            guideCard('17', 'Automatic company refresh and data recording', 'With Auto-refresh and record enabled, the helper checks your company as soon as you visit your own company page, after relevant management interactions, when you return to the tab, and periodically while the company page is open. It works even when the helper panel is closed. It uses a 45-second minimum gap for recent actions, 90 seconds for visits, a 5-minute regular interval, temporary cross-tab coordination, and a 5-minute retry delay after failures. Hidden tabs, missing API keys, or disabled settings pause automatic requests. Repeated identical company data is not saved again; changed figures and employees are recorded on the next successful API sync, with older samples compacted into longer-term history.', 'Auto-refresh observes and records available data; it does not change Torn company settings', 'If you change a Cashier to another role, the helper checks again after a short delay. If Torn confirms a different roster or new metrics through its API, that information is saved without pressing Refresh. It cannot recover snapshots from earlier days when you did not visit the company.') +
+            guideCard('17', 'Automatic company refresh and data recording', 'With Auto-refresh and record enabled, the helper checks your company after visits and management activity and periodically while visible. Recorded snapshots now also help identify risky role removals: if a previously staffed role disappears and daily income later drops materially, the Positions section can surface a recovery signal. Because other factors such as advertising, employee changes, prices, or Torn\'s daily update timing can also affect income, the helper never treats this history as proof of causation.', 'History supplies evidence and warnings, not a guaranteed profit model', 'If Administrator disappears and income later drops roughly 50%, the helper can prioritize testing Administrator again and show the before/after income evidence while still warning that other changes may have contributed.') +
         '</div>' +
-        '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. New-role suggestions are possibilities for director review, not demonstrated profit improvements. Salary, work-stat fit, and support-role contributions must be evaluated separately. Nothing hires staff or submits role or wage changes to Torn automatically.</div>' +
+        '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. The recommender now prioritizes preserving special-role effects and existing operating-role coverage over pure stat-fit gains. Historical recovery signals are observed correlations, not guaranteed profit improvements. Nothing hires staff or submits role or wage changes to Torn automatically.</div>' +
     '</section>';
 }
 
@@ -1888,6 +2034,9 @@ function supportImpactHtml(result) {
         (cfg.protectSupportRoles ? 'Protected' : 'Unprotected') + '</b></div>' +
         '<p>' + esc(kinds.length ? kinds.join(' · ') : 'No recognized current support-role occupants.') + '</p>' +
         '<p>' + esc(bonusText) + ' These are observed values, NOT a forecast of the effects of swapping roles.</p>' +
+        '<p>' + (cfg.protectRoleCoverage !== false ?
+            'Operating-role coverage is also protected: automatic advice will not eliminate the last currently staffed Administrator, Technician, Cashier, or other operating role.' :
+            'Operating-role coverage protection is disabled; recommendations may eliminate a currently staffed role.') + '</p>' +
         '<p>' + (!cfg.positionAdvice ? 'Position advice is disabled; no position moves are recommended.' :
             (cfg.protectSupportRoles ?
             fmt(result.protectedCount) + ' support-role incumbent(s) reserved in their current slots.' :
@@ -1907,15 +2056,22 @@ function additionalRolesHtml() {
     if (!cfg.positionAdvice || cfg.exploreNewRoles === false || !positions.length) return '';
     var candidates = suggestAdditionalRoles();
     var content = candidates.length ? candidates.map(function (x) {
+        var recovery = x.historySignal && x.historySignal.strong ?
+            '<p class="role-recovery"><b>Observed recovery signal:</b> tracked daily income is ' +
+                esc(pct(x.historySignal.declinePct, 0)) +
+                ' lower than the last recent snapshot that still had this role. ' +
+                'This is correlation, not proof; use it as a reason to test restoring the role.</p>' : '';
         var details = x.plan ?
-            '<p><b>Reallocation scenario:</b> move one planned slot from ' + esc(x.plan.replaces) +
+            '<p><b>' + (x.plan.historicalReverse ? 'Likely restoration path' : 'Reallocation scenario') +
+                ':</b> move one duplicated/safe planned slot from ' + esc(x.plan.replaces) +
                 ' to ' + esc(x.position) + '.</p>' +
             '<p class="' + (x.plan.fitDelta >= 0 ? 'role-positive' : 'role-caution') + '">' +
                 'Combined modeled stat-fit change: ' + (x.plan.fitDelta > 0 ? '+' : '') +
                 fmt(x.plan.fitDelta) + ' points. ' +
                 (x.kind ? 'The special-role benefit is NOT included in this score.' :
+                    x.historySignal ? 'Historical income evidence is separate from this stat-fit score.' :
                     'Higher fit does not guarantee higher income.') + '</p>' :
-            '<p>No safe existing non-support slot is available for reassignment.</p>';
+            '<p>No safe duplicated non-support slot is available for automatic reassignment. Keep current role coverage; use a vacancy or make a manual director-reviewed change instead.</p>';
         var vacancy = x.openCapacity ?
             '<p>Hiring path: ' + fmt(x.openCapacity) +
                 ' unfilled company slot(s) reported. A new hire needs their own stats and wage assessment.</p>' : '';
@@ -1924,7 +2080,7 @@ function additionalRolesHtml() {
                 esc(x.kind ? 'Unstaffed ' + x.kind + ' ability' : 'Unstaffed production role') +
                 '</small><h5>' + esc(x.position) + '</h5></div>' +
                 '<span class="role-type">' + esc(x.kind ? 'Support opportunity' : 'Stat-fit opportunity') + '</span></div>' +
-            '<p>' + esc(x.reason) + '</p>' + details + vacancy +
+            '<p>' + esc(x.reason) + '</p>' + recovery + details + vacancy +
             (x.plan ?
                 '<button data-use-new-role="' + esc(x.key) +
                 '">Use as staffing target (helper only)</button>' :
@@ -1935,10 +2091,11 @@ function additionalRolesHtml() {
     return '<section class="role-opportunities"><div class="role-opportunities-intro">' +
         '<div><small>Beyond your current staff mix</small><h4>Additional roles worth considering</h4>' +
         '<p>The helper reviews the full company position catalog, including roles with no current employees. ' +
-        'It checks possible one-slot reallocations without removing existing support-role incumbents and also notes available hiring capacity.</p></div>' +
+        'Automatic reallocations preserve special-role incumbents and at least one slot in every currently staffed operating role. Recent local history can also flag a removed role when its absence coincides with a sharp income decline.</p></div>' +
         '<button data-page="guide">How recommendations work</button></div>' +
         '<div class="role-opportunity-grid">' + content + '</div>' +
         '<p class="role-opportunity-disclaimer">These are exploratory options, NOT proven income improvements. ' +
+        'Automatic suggestions preserve existing role coverage by default. Historical recovery signals show observed before/after income correlation and may still have other causes. ' +
         'The stat-fit difference excludes changes to sales, management bonuses, advertising, environment, and training. ' +
         'Choosing a target updates this helper only. No positions or wages are changed in Torn.</p></section>';
 }
@@ -2041,6 +2198,7 @@ function positionsPage(result) {
             positionStat('Employees in positions', fmt(nonDirectors.length), 'Excludes the director') +
             positionStat('Suggested changes', cfg.positionAdvice ? fmt(reviews.length) : 'Off', 'Review before changing jobs') +
             positionStat('Protected support roles', fmt(result.protectedCount), 'Existing support employees kept in place') +
+            positionStat('Protected role coverage', fmt(result.coverageProtectedCount), 'Currently staffed roles kept from dropping to zero') +
         '</div>';
     if (!positions.length) {
         return html + '<div class="notice"><b>Position information unavailable.</b> Refresh company data to load available jobs.</div></section>';
@@ -2081,7 +2239,8 @@ function positionsPage(result) {
         '<div class="toggles">' +
             toggle('positionAdvice', 'Show position recommendations', 'Compare proposed roles with current assignments.') +
             toggle('protectSupportRoles', 'Protect support-role incumbents (recommended)', 'Keep current Managers, Trainers, Marketers, Cleaners, and Secretaries when their slots remain.') +
-            toggle('exploreNewRoles', 'Explore additional positions', 'Consider unstaffed positions, safe alternatives, and hiring capacity.') +
+            toggle('protectRoleCoverage', 'Protect existing role coverage (strongly recommended)', 'Automatic advice will not remove the last employee from a currently staffed role such as Administrator, Technician, or Cashier. Disable only if you intentionally want to eliminate a role.') +
+            toggle('exploreNewRoles', 'Explore additional positions', 'Consider unstaffed positions, safe alternatives, historical recovery signals, and hiring capacity.') +
         '</div></div></section>';
     return html;
 }
