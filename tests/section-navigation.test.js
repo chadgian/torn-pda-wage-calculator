@@ -49,9 +49,9 @@ function rendered(page) {
     return panel.innerHTML;
 }
 
-test('v2.6.0 userscript syntax',()=>{
+test('current userscript syntax and version',()=>{
     assert.doesNotThrow(()=>new Function(script));
-    assert.match(script,/\/\/ @version\s+2\.6\.0/);
+    assert.match(script,/\/\/ @version\s+2\.6\.3/);
 });
 test('Dashboard, Wages, Positions, Statistics and Changes are separate top destinations',()=>{
     const html=rendered('dashboard');
