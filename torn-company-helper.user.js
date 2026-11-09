@@ -2084,7 +2084,10 @@ function additionalRolesHtml() {
             (x.plan ?
                 '<button data-use-new-role="' + esc(x.key) +
                 '">Use as staffing target (helper only)</button>' :
-                '<small class="role-caution">Hiring suggestion only; no employee reassignment can be modeled.</small>') +
+                '<small class="role-caution">' +
+                    (x.historySignal ? 'Recovery candidate only; no safe automatic donor slot is available. Review the lineup manually or use a vacancy.' :
+                        'Hiring suggestion only; no employee reassignment can be modeled.') +
+                '</small>') +
             '</article>';
     }).join('') : '<p class="role-opportunity-empty">No additional roles passed the current eligibility checks. ' +
         'This does not establish that your existing staffing mix maximizes revenue.</p>';
