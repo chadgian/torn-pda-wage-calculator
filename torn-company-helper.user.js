@@ -489,6 +489,13 @@ function snapshotPositionCounts(snapshot) {
     return counts;
 }
 
+function matchingSnapshotRoleMix(a, b) {
+    var x=snapshotPositionCounts(a), y=snapshotPositionCounts(b);
+    return Object.keys(x).concat(Object.keys(y)).every(function (key) {
+        return num(x[key])===num(y[key]);
+    });
+}
+
 function currentNamedPositionCounts() {
     var counts = {};
     staff.forEach(function (employee) {
@@ -518,18 +525,17 @@ function autoRoleCoverageFloor(position,evidence,recentSignals) {
 function roleHistoryRecoverySignals() {
     var out = {};
     if (!company || !company.id || !positions.length || !staff.length) return out;
-    var history = readChangeHistory(company.id);
-    var now = lastLoadedAt || Date.now();
-    var current = reportSnapshot(company, staff, now);
-    var currentCounts = snapshotPositionCounts(current);
-    var currentIncome = num(current.company && current.company.dailyIncome);
-    var currentEmployees = num(current.company && current.company.employeeCount) || (current.staff || []).length;
-    var currentAds = num(current.company && current.company.advertisementBudget);
-    var cutoff = now - 14 * 86400000;
-    var snapshots = (history.snapshots || []).filter(function (snapshot) {
-        return snapshot && snapshot.ts >= cutoff && snapshot.ts < now - 1000 &&
-            snapshot.company && Array.isArray(snapshot.staff);
-    }).sort(function (a, b) { return a.ts - b.ts; });
+    var completed = previousDailySnapshot();
+    if (!completed || !matchingSnapshotRoleMix(completed, reportSnapshot(company, staff, lastLoadedAt || Date.now()))) return out;
+    var currentCounts = snapshotPositionCounts(completed);
+    var currentIncome = num(completed.company.dailyIncome);
+    var currentEmployees = num(completed.company.employeeCount);
+    var currentAds = num(completed.company.advertisementBudget);
+    var cutoff = completed.ts - 14 * 86400000;
+    // Recovery claims compare fully completed days, never a partial live day.
+    var snapshots = dailyHistoricalSnapshots(0, false).filter(function (snapshot) {
+        return snapshot.ts >= cutoff && snapshot.ts < completed.ts;
+    });
 
     positions.forEach(function (position) {
         var nameKey = positionNameKey(position);
@@ -1869,15 +1875,16 @@ function recentRoleOutcomeSignals() {
 function roleCountRecoverySignals() {
     var out={};
     if (!company || !company.id || !positions.length || !staff.length) return out;
-    var history=readChangeHistory(company.id), now=lastLoadedAt||Date.now();
-    var current=reportSnapshot(company,staff,now), currentCounts=snapshotPositionCounts(current);
-    var currentIncome=num(current.company&&current.company.dailyIncome);
-    var currentEmployees=num(current.company&&current.company.employeeCount)||(current.staff||[]).length;
-    var currentAds=num(current.company&&current.company.advertisementBudget);
-    var cutoff=now-14*86400000;
-    var snapshots=(history.snapshots||[]).filter(function(snapshot){
-        return snapshot&&snapshot.ts>=cutoff&&snapshot.ts<now-1000&&snapshot.company&&Array.isArray(snapshot.staff);
-    }).sort(function(a,b){return a.ts-b.ts;});
+    var completed=previousDailySnapshot();
+    if (!completed || !matchingSnapshotRoleMix(completed,reportSnapshot(company,staff,lastLoadedAt||Date.now()))) return out;
+    var currentCounts=snapshotPositionCounts(completed);
+    var currentIncome=num(completed.company.dailyIncome);
+    var currentEmployees=num(completed.company.employeeCount);
+    var currentAds=num(completed.company.advertisementBudget);
+    var cutoff=completed.ts-14*86400000;
+    var snapshots=dailyHistoricalSnapshots(0,false).filter(function(snapshot){
+        return snapshot.ts>=cutoff&&snapshot.ts<completed.ts;
+    });
     positions.forEach(function(position){
         var nameKey=positionNameKey(position), currentCount=num(currentCounts[nameKey]);
         var withMore=snapshots.filter(function(snapshot){
