@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.6.2
+// @version      2.6.3
 // @description  Torn company helper for wages, history-aware staffing, and company performance analysis.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -18,7 +18,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.6.2';
+var VERSION = '2.6.3';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -474,6 +474,11 @@ function positionNameKey(value) {
 }
 
 function snapshotPositionCounts(snapshot) {
+    // The lifetime archive stores aggregate role counts instead of employee
+    // identities; recent detailed snapshots still contain the roster.
+    if (snapshot && snapshot.roleCounts && typeof snapshot.roleCounts === 'object') {
+        return Object.assign({}, snapshot.roleCounts);
+    }
     var counts = {};
     (snapshot && snapshot.staff || []).forEach(function (employee) {
         var name = String(employee && employee.position || '').trim();
@@ -1428,9 +1433,10 @@ function normalizeCompanyNews(payload) {
     }).filter(function (e) { return e.text && e.ts > 0; });
 }
 
-// Preserve every observed material update in the recent window. Older history
-// is downsampled so daily, weekly and monthly reports remain useful without
-// exhausting localStorage. Values are never backfilled for unobserved periods.
+// Preserve detailed changes in the recent 180-day window. A separate compact,
+// uncapped one-observation-per-day archive keeps older observed days available for
+// recommendations without keeping full employee rosters forever.
+// Values are never backfilled for days when the helper was not recording.
 function snapshotFingerprint(snapshot) {
     if (!snapshot) return '';
     var roster = (snapshot.staff || []).map(function (e) {
@@ -1460,11 +1466,58 @@ function compactCompanySnapshots(snapshots, now) {
         .sort(function(a,b){return a.ts-b.ts;}).slice(-480);
 }
 
+function dailyArchiveStorageKey(id) { return 'dailyCompanyHistory:' + String(id); }
+
+// Lifetime daily archive: aggregate metrics and role counts only, never names,
+// employee IDs or duplicate five-minute refreshes. A day means Torn/UTC day.
+function readLifetimeDailyHistory(id) {
+    var raw = get(dailyArchiveStorageKey(id), []);
+    return (Array.isArray(raw) ? raw : []).filter(function (day) {
+        return day && Number.isFinite(Number(day.ts)) && day.company &&
+            day.roleCounts && typeof day.roleCounts === 'object';
+    });
+}
+
+function compactHistoricalDay(snapshot) {
+    if (!snapshot || !snapshot.company || !Number.isFinite(Number(snapshot.ts))) return null;
+    var metrics = {};
+    metricDefinitions().forEach(function (metric) {
+        var value = snapshot.company[metric.key];
+        if (value != null && Number.isFinite(Number(value))) metrics[metric.key] = Number(value);
+    });
+    return { ts:Number(snapshot.ts), company:metrics, roleCounts:snapshotPositionCounts(snapshot) };
+}
+
+function saveLifetimeDailyHistory(id, observations) {
+    var existing = readLifetimeDailyHistory(id), byDay = {};
+    existing.concat((observations || []).map(compactHistoricalDay).filter(Boolean))
+        .forEach(function (snapshot) {
+            var day = historyDayKey(snapshot.ts);
+            if (!day) return;
+            // Latest real observation replaces earlier refreshes of that UTC day.
+            if (!byDay[day] || snapshot.ts >= byDay[day].ts) byDay[day] = snapshot;
+        });
+    var merged = Object.keys(byDay).sort().map(function (day) { return byDay[day]; });
+    var json = JSON.stringify(merged);
+    // Avoid unnecessary localStorage writes during no-change refreshes.
+    if (JSON.stringify(existing) === json) return true;
+    try {
+        localStorage.setItem(PFX + dailyArchiveStorageKey(id), json);
+        return true;
+    } catch (error) {
+        // Never report a write as successful when storage quota blocks it.
+        return false;
+    }
+}
+
 async function updateCompanyChanges(c, employees) {
     if (!c || !c.id) { changesError = 'Company ID is unavailable; history cannot be saved.'; return; }
     var store = readChangeHistory(c.id);
     var now = lastLoadedAt || Date.now();
     var cutoff = now - 180 * 86400000;
+    // Migrate all available legacy snapshots BEFORE trimming the detailed store.
+    var migrationSaved = readLifetimeDailyHistory(c.id).length > 0 ||
+        saveLifetimeDailyHistory(c.id, store.snapshots);
     store.snapshots = compactCompanySnapshots(store.snapshots, now);
     var newest = store.snapshots[store.snapshots.length - 1];
     var current = reportSnapshot(c, employees, now);
@@ -1476,7 +1529,10 @@ async function updateCompanyChanges(c, employees) {
         store.snapshots.push(current);
         store.snapshots = compactCompanySnapshots(store.snapshots, now);
     }
-    changesError = '';
+    var archiveSaved = saveLifetimeDailyHistory(c.id, store.snapshots.concat([current]));
+    changesError = migrationSaved && archiveSaved ? '' :
+        'The complete daily history could not be saved (browser storage may be full). ' +
+        'Existing records were kept; free storage space to resume lifetime learning.';
     if (!store.lastNewsFetch || now - store.lastNewsFetch >= 15 * 60000) {
         try {
             var payload = await api('/company/news?cat=employees&limit=100');
@@ -1545,22 +1601,55 @@ function historicalSnapshotsWithCurrent() {
 // One representative observation per Torn day (UTC/TCT), taking the latest
 // saved state for that day. This avoids treating five-minute auto-refreshes as
 // independent evidence and lets the helper learn from day-to-day outcomes.
-function dailyHistoricalSnapshots(limitDays) {
-    var list = historicalSnapshotsWithCurrent();
-    var byDay = {};
+function dailyHistoricalSnapshots(limitDays, includeToday) {
+    if (!company || !company.id) return [];
+    // Prefer detailed recent snapshots over compact archived days at equal times,
+    // so employee-movement explanations remain available for recent comparisons.
+    var list = readLifetimeDailyHistory(company.id)
+        .concat(historicalSnapshotsWithCurrent());
+    var byDay = {}, todayKey = historyDayKey(lastLoadedAt || Date.now());
     list.forEach(function (snapshot) {
         var key = historyDayKey(snapshot.ts);
-        if (!key) return;
-        if (!byDay[key] || snapshot.ts > byDay[key].ts) byDay[key] = snapshot;
+        if (!key || (includeToday === false && key >= todayKey)) return;
+        if (!byDay[key] || snapshot.ts >= byDay[key].ts) byDay[key] = snapshot;
     });
     var days = Object.keys(byDay).sort().map(function (key) { return byDay[key]; });
-    return days.slice(-Math.max(2, Math.round(num(limitDays) || 90)));
+    var maxDays = Number(limitDays);
+    return Number.isFinite(maxDays) && maxDays > 0 ?
+        days.slice(-Math.floor(maxDays)) : days;
 }
 
 function previousDailySnapshot() {
-    var days = dailyHistoricalSnapshots(90);
-    if (days.length < 2) return null;
-    return days[days.length - 2];
+    // For a live statistics comparison, use yesterday's last recorded state,
+    // or the latest earlier observed day when there is a recording gap.
+    var completed = dailyHistoricalSnapshots(0, false);
+    return completed.length ? completed[completed.length - 1] : null;
+}
+
+function historicalLearningCoverage() {
+    var days = dailyHistoricalSnapshots(0, false);
+    if (!days.length) return { days:0, first:0, last:0, calendarDays:0 };
+    var first = days[0].ts, last = days[days.length - 1].ts;
+    var calendarDays = Math.round((Date.parse(historyDayKey(last)) -
+        Date.parse(historyDayKey(first))) / 86400000) + 1;
+    return { days:days.length, first:first, last:last, calendarDays:calendarDays };
+}
+
+function historicalMetricBenchmarks(key) {
+    var days = dailyHistoricalSnapshots(0, false).filter(function (day) {
+        return day.company && day.company[key] != null &&
+            Number.isFinite(Number(day.company[key]));
+    });
+    function average(items) {
+        return items.length ? items.reduce(function (total, day) {
+            return total + Number(day.company[key]);
+        }, 0) / items.length : null;
+    }
+    return {
+        days:days.length,
+        average7:average(days.slice(-7)), average30:average(days.slice(-30)),
+        lifetime:average(days)
+    };
 }
 
 function pctDelta(previous, latest) {
@@ -1743,8 +1832,12 @@ function statisticsHistoricalAnalysis() {
 }
 
 function recentRoleOutcomeSignals() {
-    var current=reportSnapshot(company,staff,lastLoadedAt||Date.now()), previous=previousDailySnapshot(), out={};
-    if (!previous || !previous.company || !current.company) return out;
+    // The latest completed two days are the short-term signal. Today's live
+    // rolling income is not treated as the final result of today's role mix.
+    var days=dailyHistoricalSnapshots(0,false), out={};
+    var current=days[days.length-1], previous=days[days.length-2];
+    if (!previous || !current || !previous.company || !current.company ||
+        Date.parse(historyDayKey(current.ts))-Date.parse(historyDayKey(previous.ts))!==86400000) return out;
     var roleChanges=snapshotRoleDelta(previous,current);
     if (!roleChanges.length) return out;
     var incomePct=pctDelta(previous.company.dailyIncome,current.company.dailyIncome);
@@ -1819,63 +1912,112 @@ function roleCountRecoverySignals() {
 // conservative: income is primary, customers/efficiency/effectiveness are
 // secondary, and observations are down-weighted when headcount, advertising,
 // or many roles changed at the same time.
+// Learn across every available *completed* Torn day from the first observed
+// record to yesterday. Repeated unchanged days help smooth the outcomes after
+// a role change; each event still counts only once, not once per refresh.
 function roleHistoricalEvidence() {
-    var days=dailyHistoricalSnapshots(120), evidence={};
+    var days=dailyHistoricalSnapshots(0,false), evidence={};
+    function sameMix(a,b) {
+        var x=snapshotPositionCounts(a), y=snapshotPositionCounts(b);
+        return Object.keys(x).concat(Object.keys(y)).every(function (key) {
+            return num(x[key]) === num(y[key]);
+        });
+    }
+    function consecutive(a,b) {
+        return Date.parse(historyDayKey(b.ts))-Date.parse(historyDayKey(a.ts))===86400000;
+    }
+    function averageMetric(samples,key) {
+        var values=samples.map(function (d) {
+            return d.company && d.company[key];
+        }).filter(function (v) {return v != null && Number.isFinite(Number(v));});
+        return values.length ? values.reduce(function (sum,v) {return sum+Number(v);},0)/values.length:null;
+    }
     for (var i=1;i<days.length;i++) {
         var previous=days[i-1], latest=days[i];
-        if (!previous.company || !latest.company) continue;
-        var roleChanges=snapshotRoleDelta(previous,latest);
-        if (!roleChanges.length) continue;
-        var incomePct=pctDelta(previous.company.dailyIncome,latest.company.dailyIncome);
-        var customersPct=pctDelta(previous.company.dailyCustomers,latest.company.dailyCustomers);
-        var efficiencyDelta=num(latest.company.efficiency)-num(previous.company.efficiency);
-        var effectivenessDelta=num(latest.company.avgEffectiveness)-num(previous.company.avgEffectiveness);
-        if (incomePct == null) incomePct=0;
-        if (customersPct == null) customersPct=0;
-        var outcome=incomePct + customersPct*0.25 + efficiencyDelta*0.8 + effectivenessDelta*0.35;
+        if (!previous.company || !latest.company || !consecutive(previous,latest)) continue;
+        var changes=snapshotRoleDelta(previous,latest);
+        if (!changes.length) continue;
+        var before=[previous], after=[latest];
+        // Smooth across up to two consecutive days on each side, but never
+        // blend different role mixes, headcounts or materially changed ads.
+        for (var b=i-2;b>=Math.max(0,i-3);b--) {
+            var prior=days[b], reference=before[0];
+            var adBefore=pctDelta(prior.company.advertisementBudget,reference.company.advertisementBudget);
+            if (!consecutive(prior,reference)||!sameMix(prior,previous)||
+                num(prior.company.employeeCount)!==num(previous.company.employeeCount)||
+                (adBefore!=null && Math.abs(adBefore)>15)) break;
+            before.unshift(prior);
+        }
+        for (var f=i+1;f<Math.min(days.length,i+3);f++) {
+            var next=days[f], priorDay=after[after.length-1];
+            var adAfter=pctDelta(latest.company.advertisementBudget,next.company.advertisementBudget);
+            if (!consecutive(priorDay,next)||!sameMix(next,latest)||
+                num(next.company.employeeCount)!==num(latest.company.employeeCount)||
+                (adAfter!=null&&Math.abs(adAfter)>15)) break;
+            after.push(next);
+        }
+        var pIncome=averageMetric(before,'dailyIncome'), nIncome=averageMetric(after,'dailyIncome');
+        if (pIncome==null || nIncome==null || pIncome<=0) continue;
+        var incomePct=pctDelta(pIncome,nIncome);
+        var customersPct=pctDelta(averageMetric(before,'dailyCustomers'),averageMetric(after,'dailyCustomers'));
+        var efficiencyDelta=num(averageMetric(after,'efficiency'))-num(averageMetric(before,'efficiency'));
+        var effectivenessDelta=num(averageMetric(after,'avgEffectiveness'))-num(averageMetric(before,'avgEffectiveness'));
+        if (incomePct==null) continue;
+        if (customersPct==null) customersPct=0;
+        // Cap isolated spikes: they should not override multiple quiet days.
+        var outcome=clamp(incomePct,-80,80)+clamp(customersPct,-80,80)*0.25+
+            clamp(efficiencyDelta,-30,30)*0.8+clamp(effectivenessDelta,-30,30)*0.35;
         var sameHeadcount=num(previous.company.employeeCount)===num(latest.company.employeeCount);
         var adPct=pctDelta(previous.company.advertisementBudget,latest.company.advertisementBudget);
-        var stableAds=adPct==null ? num(previous.company.advertisementBudget)===num(latest.company.advertisementBudget) : Math.abs(adPct)<=15;
-        var weight=1;
-        if (!sameHeadcount) weight*=0.55;
-        if (!stableAds) weight*=0.65;
-        if (roleChanges.length>2) weight*=0.6;
-        else if (roleChanges.length===2) weight*=0.85;
-        if (Math.abs(incomePct)<5 && Math.abs(customersPct)<5 && Math.abs(efficiencyDelta)<2) weight*=0.55;
-
-        roleChanges.forEach(function(change){
-            var roleName=change.name, signed=outcome*(change.delta>0?1:-1), item=evidence[roleName] || {
-                role:roleName,scoreSum:0,weightSum:0,observations:0,positive:0,negative:0,
-                supportedCount:0,lastObserved:0,examples:[]
+        var stableAds=adPct==null?num(previous.company.advertisementBudget)===num(latest.company.advertisementBudget):Math.abs(adPct)<=15;
+        // No time cutoff: older days retain a floor of 55% of recent weight.
+        var ageDays=Math.max(0,(Date.now()-latest.ts)/86400000);
+        var weight=0.55+0.45*Math.exp(-ageDays/365);
+        if (!sameHeadcount) weight*=0.4;
+        if (!stableAds) weight*=0.5;
+        if (changes.length>2) weight*=0.45;
+        else if (changes.length===2) weight*=0.8;
+        if (after.length===1) weight*=0.7;
+        if (Math.abs(incomePct)<5 && Math.abs(customersPct)<5 && Math.abs(efficiencyDelta)<2) weight*=0.6;
+        changes.forEach(function(change) {
+            var signed=outcome*(change.delta>0?1:-1);
+            var item=evidence[change.name]||{
+                role:change.name,scoreSum:0,weightSum:0,observations:0,
+                positive:0,negative:0,supportedCount:0,lastObserved:0,examples:[]
             };
-            item.scoreSum += signed*weight;
-            item.weightSum += weight;
+            item.scoreSum+=signed*weight;
+            item.weightSum+=weight;
             item.observations++;
             if (signed>3) item.positive++;
             if (signed<-3) item.negative++;
-            if (signed>5) item.supportedCount=Math.max(item.supportedCount, change.delta>0?change.after:change.before);
+            if (signed>5 && weight>=0.5 && after.length>=2) {
+                item.supportedCount=Math.max(item.supportedCount,change.delta>0?change.after:change.before);
+            }
             item.lastObserved=Math.max(item.lastObserved,latest.ts);
             item.examples.push({
                 ts:latest.ts,before:change.before,after:change.after,
-                incomePct:incomePct,customersPct:customersPct,score:signed,weight:weight
+                incomePct:incomePct,customersPct:customersPct,score:signed,weight:weight,
+                sustainedDays:after.length
             });
-            if (item.examples.length>6)item.examples=item.examples.slice(-6);
-            evidence[roleName]=item;
+            if (item.examples.length>6) item.examples=item.examples.slice(-6);
+            evidence[change.name]=item;
         });
     }
-
     var byPosition={};
-    positions.forEach(function(position){
+    positions.forEach(function(position) {
         var item=evidence[positionNameKey(position)];
         if (!item) return;
         var score=item.weightSum?item.scoreSum/item.weightSum:0;
-        var consistency=item.observations?Math.max(item.positive,item.negative)/item.observations:0;
-        var confidence=item.observations>=4&&consistency>=0.7?'high':
-            item.observations>=2&&consistency>=0.6?'medium':'low';
+        var directional=item.positive+item.negative;
+        var consistency=directional?Math.max(item.positive,item.negative)/directional:0;
+        // Contradictory or highly confounded events must not create a
+        // high-confidence staffing floor, regardless of raw observation count.
+        var confidence=item.observations>=5&&item.weightSum>=3&&consistency>=0.8?'high':
+            item.observations>=3&&item.weightSum>=1.5&&consistency>=0.7?'medium':'low';
         byPosition[positionKey(position)]=Object.assign({},item,{
             position:position.name,score:score,consistency:consistency,confidence:confidence,
-            positiveRole:score>=6 && (confidence==='medium'||confidence==='high'),
-            negativeRole:score<=-6 && (confidence==='medium'||confidence==='high')
+            positiveRole:score>=6&&(confidence==='medium'||confidence==='high'),
+            negativeRole:score<=-6&&(confidence==='medium'||confidence==='high')
         });
     });
     return byPosition;
@@ -2353,7 +2495,7 @@ function changesPage() {
         if (report.employeeChanges.length > 80) html += '<div class="changes-overflow">Showing the first 80 employee changes. Copy report includes all.</div>';
     }
     html += '<p class="changes-footnote">Daily and weekly Torn income figures are rolling figures from each refresh; their difference is not the total profit over this period. ' +
-        'History is saved automatically in this browser, per company, for up to 180 days. Recent changes are recorded individually, and older samples are condensed. ' +
+        'Detailed changes remain available for up to 180 days; a separate compact daily archive preserves every observed day for lifetime role learning. ' +
         'Dismissal reasons come from Torn news or private notes you enter. Copied reports include those notes, so review before sharing. Other devices do not share this history.</p></section>';
     return html;
 }
@@ -2476,8 +2618,8 @@ function calculationGuidePage() {
             guideCard('15', 'Hiring, applying, and limitations', 'If no duplicated role can be reduced safely, the helper will not manufacture a reallocation just to add a new role. It can instead show a hiring path when capacity is available, or leave the idea for manual director review. The helper does not know Torn\'s complete company-income formula, so preserving observed role coverage takes priority over squeezing out a few extra stat-fit points.', 'No safe donor = no automatic role replacement', 'With nine employees all occupying unique roles, adding a Marketer does not justify deleting the only Administrator. The helper will require a vacancy, a duplicated donor role, or a deliberate manual restructure.') +
             guideCard('16', 'Finding your way around', 'The Dashboard shows concise summaries and opens dedicated sections. Wages contains pay suggestions and exports. Positions contains role recommendations, support-role safeguards, exploratory role options, and staffing targets. Company Statistics displays current income, customers, company condition, resources, and available historical comparisons. Changes records events and performance differences. Settings controls wage calculations and general behavior.', 'Dashboard → choose a section → review details → return using the top navigation', 'To decide whether to introduce a Trainer, open Positions. To see income figures, open Statistics. To compare activity across days, open Changes. To export suggested daily pay, open Wages.') +
             guideCard('17', 'Automatic company refresh and data recording', 'With Auto-refresh and record enabled, the helper checks your company after visits and management activity and periodically while visible. Recorded snapshots now also help identify risky role removals: if a previously staffed role disappears and daily income later drops materially, the Positions section can surface a recovery signal. Because other factors such as advertising, employee changes, prices, or Torn\'s daily update timing can also affect income, the helper never treats this history as proof of causation.', 'History supplies evidence and warnings, not a guaranteed profit model', 'If Administrator disappears and income later drops roughly 50%, the helper can prioritize testing Administrator again and show the before/after income evidence while still warning that other changes may have contributed.') +
-            guideCard('18', 'Historical role learning', 'The helper compares one representative snapshot per Torn day so frequent auto-refreshes are not counted as independent evidence. It observes role-count changes together with daily income, customers, efficiency, average effectiveness, headcount, and advertising. Days with headcount changes, large advertising changes, or many simultaneous role changes receive less weight. A large previous-day move can create a provisional signal immediately; repeated consistent patterns build medium or high confidence and can protect historically useful role counts from being reduced.', 'Evidence score = signed outcome change × confidence weight; repeated consistent observations increase confidence', 'If Cashier rises from 1 to 2 and income improves strongly while headcount and ads stay stable, that second Cashier may be temporarily protected. If repeated observations later contradict it, the historical score weakens.') +
-            guideCard('19', 'Per-statistics analysis', 'The Statistics page compares every available company metric with the previous Torn-day snapshot. Each metric shows the size and direction of the change, the strongest tracked factors that changed in the same period, and a maintain/review recommendation. The factor list is metric-specific: for example income looks at customers, efficiency, popularity, environment, advertising, effectiveness, management bonuses, payroll, headcount, and role mix; efficiency focuses more on work-stat fit and effectiveness.', 'Analysis = current value vs previous-day value + same-period factor changes + metric-specific guidance', 'If daily income falls 45% after Administrator drops from 1 to 0, Cashier rises from 1 to 2, and advertising is unchanged, the report highlights the role-mix change as a strong factor and recommends testing the last better-performing setup before making more staffing changes.') +
+            guideCard('18', 'Historical role learning', 'The helper uses all available completed Torn days, from the earliest recorded day through yesterday, rather than an arbitrary 120-day window. The compact archive keeps one observation per day for long-term evidence, and unchanged-role days help smooth the results surrounding role changes. Headcount, advertising, multiple simultaneous moves, and incomplete evidence reduce confidence; old observations remain relevant but carry slightly less weight. The helper never assumes that a single-day change proves the role caused a profit change.', 'Evidence score = signed outcome change × confidence weight; repeated consistent observations increase confidence', 'If Cashier rises from 1 to 2 and income improves strongly while headcount and ads stay stable, that second Cashier may be temporarily protected. If repeated observations later contradict it, the historical score weakens.') +
+            guideCard('19', 'Per-statistics analysis', 'The Statistics page compares every available company metric with the latest previous completed Torn day AND the averages of the last 7, 30, and all available completed observations. Each metric shows the size and direction of the change, the strongest tracked factors that changed in the same period, and a maintain/review recommendation. The factor list is metric-specific: for example income looks at customers, efficiency, popularity, environment, advertising, effectiveness, management bonuses, payroll, headcount, and role mix; efficiency focuses more on work-stat fit and effectiveness.', 'Analysis = current value vs previous-day value + same-period factor changes + metric-specific guidance', 'If daily income falls 45% after Administrator drops from 1 to 0, Cashier rises from 1 to 2, and advertising is unchanged, the report highlights the role-mix change as a strong factor and recommends testing the last better-performing setup before making more staffing changes.') +
         '</div>' +
         '<div class="guide-note"><b>Important:</b> Torn Company Helper is advisory. The recommender prioritizes special-role effects, current operating-role coverage, and accumulated historical evidence over pure stat-fit gains. Previous-day and repeated historical signals are observed associations, not guaranteed causes or profit improvements. Nothing hires staff or submits role or wage changes to Torn automatically.</div>' +
     '</section>';
@@ -2756,11 +2898,18 @@ function statisticsAnalysisCard(a) {
     }).join('') + '</ul>' :
         '<p class="stats-analysis-none">No other tracked factor changed enough to stand out in the same comparison. Keep collecting data before attributing a cause.</p>';
     var cls=a.assessment==='Improved'?'good':a.assessment==='Declined'?'bad':a.significant?'watch':'stable';
+    var history=historicalMetricBenchmarks(a.key);
+    var historicalCompare=history.days?
+        '<p class="stats-analysis-historical"><b>Completed-day averages ('+fmt(history.days)+' observed days):</b> '+
+        'Last 7: '+esc(metricText(history.average7,a.kind))+' · Last 30: '+
+        esc(metricText(history.average30,a.kind))+' · Full history: '+
+        esc(metricText(history.lifetime,a.kind))+'</p>' : '';
     return '<details class="stats-analysis-card '+cls+'"'+(a.significant?' open':'')+'>' +
         '<summary><span><small>'+esc(a.label)+'</small><b>'+esc(metricText(a.latest,a.kind))+'</b></span>' +
         '<span class="stats-analysis-change"><b>'+esc(a.assessment)+'</b><small>'+esc(analysisDeltaText(a))+'</small></span></summary>' +
         '<div class="stats-analysis-body">' +
             '<div class="stats-analysis-compare"><span>Previous day</span><b>'+esc(metricText(a.previous,a.kind))+'</b><span>Current</span><b>'+esc(metricText(a.latest,a.kind))+'</b></div>' +
+            historicalCompare+
             '<div class="stats-analysis-confidence"><span>Evidence quality</span><b>'+esc(a.evidenceLabel)+'</b></div>' +
             '<h5>What changed alongside it?</h5>'+factorHtml+
             '<div class="stats-analysis-action"><b>'+(a.assessment==='Improved'?'Maintain / learn from this':'What to review next')+'</b><p>'+esc(a.action)+'</p></div>' +
@@ -2770,7 +2919,7 @@ function statisticsAnalysisCard(a) {
 
 function statisticsAnalysisHtml() {
     var pack=statisticsHistoricalAnalysis();
-    if (!pack.previous) return '<div class="stats-analysis-empty">No previous-day snapshot is available yet. Keep auto-recording enabled; the helper needs at least two different Torn days before it can analyze changes and possible factors.</div>';
+    if (!pack.previous) return '<div class="stats-analysis-empty">No earlier completed-day snapshot is available yet. Keep auto-recording enabled; only actual observed days are used, and history is never invented.</div>';
     var significant=pack.analyses.filter(function(a){return a.significant;}).length;
     return '<section class="stats-analysis-section">' +
         '<div class="stats-analysis-head"><div><small>Historical analysis</small><h4>What changed since the previous day?</h4>' +
@@ -2800,8 +2949,13 @@ function historicalRestorationHtml() {
 
 function learnedRoleHistoryHtml() {
     var learned=learnedRoleSummary(), recent=recentRoleOutcomeSignals(), allEvidence=roleHistoricalEvidence();
-    if (!learned.length && !Object.keys(recent).length) return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4></div><span>Collecting data</span></div><p>There is not enough day-to-day role evidence yet. Keep auto-recording enabled; a large previous-day change can create an immediate signal, while repeated patterns build stronger long-term evidence.</p></section>';
-    return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4><p>Repeated before/after observations can strengthen, weaken, or protect role recommendations.</p></div><span>'+fmt(learned.length)+' learned signal'+(learned.length===1?'':'s')+'</span></div>' +
+    var coverage=historicalLearningCoverage();
+    var coverageText=coverage.days ?
+        fmt(coverage.days)+' recorded completed day(s) from '+changeDate(coverage.first)+
+        ' through '+changeDate(coverage.last)+' ('+fmt(coverage.calendarDays)+' calendar days; recording gaps are not filled).' :
+        'No completed recorded days yet.';
+    if (!learned.length && !Object.keys(recent).length) return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4></div><span>Collecting data</span></div><p>'+esc(coverageText)+' There is not enough consistent role-change evidence yet. The helper uses every completed observed day, including quiet days that help establish sustained outcomes, but does not invent missing history.</p></section>';
+    return '<section class="role-learning"><div class="role-learning-head"><div><small>Historical learning</small><h4>What company history has taught the helper</h4><p>'+esc(coverageText)+' Repeated before/after observations can strengthen, weaken, or protect role recommendations.</p></div><span>'+fmt(learned.length)+' learned signal'+(learned.length===1?'':'s')+'</span></div>' +
         '<div class="role-learning-grid">'+learned.map(function(x){
             var favorable=x.score>=0, label=x.positiveRole?'Favor / protect':x.negativeRole?'Use caution':'Weak signal';
             var currentPositionObj=positions.find(function(p){return positionNameKey(p)===positionNameKey(x.position);});
@@ -2821,7 +2975,7 @@ function learnedRoleHistoryHtml() {
             var x=recent[key], favorable=x.score>=0;
             return '<article class="role-learning-card '+(favorable?'positive':'negative')+'"><div><small>Strong previous-day signal</small><h5>'+esc(x.position)+'</h5></div><b>'+esc((x.score>0?'+':'')+x.score.toFixed(1))+'</b><p>1 immediate observation · provisional</p><small>Role count '+fmt(x.before)+' -> '+fmt(x.after)+'; daily income '+(x.incomePct>0?'+':'')+pct(x.incomePct,1)+'.</small></article>';
         }).join('')+'</div>' +
-        '<p class="role-learning-note">Large previous-day changes can affect suggestions immediately when headcount and advertising are stable. Repeated patterns receive more weight and can protect higher role counts. These are associations, not guaranteed profit estimates.</p></section>';
+        '<p class="role-learning-note">Every completed day from the earliest stored snapshot through yesterday contributes to the historical picture; same-mix days help smooth observations. Recent days have somewhat higher weight, but older recorded days are never excluded. A change observed only once stays provisional; associations do not prove causation.</p></section>';
 }
 
 function statisticsPage(result) {
