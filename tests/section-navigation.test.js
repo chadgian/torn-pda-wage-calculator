@@ -49,9 +49,9 @@ function rendered(page) {
     return panel.innerHTML;
 }
 
-test('v2.6.0 userscript syntax',()=>{
+test('current userscript syntax and version',()=>{
     assert.doesNotThrow(()=>new Function(script));
-    assert.match(script,/\/\/ @version\s+2\.6\.0/);
+    assert.match(script,/\/\/ @version\s+2\.6\.3/);
 });
 test('Dashboard, Wages, Positions, Statistics and Changes are separate top destinations',()=>{
     const html=rendered('dashboard');
@@ -94,6 +94,10 @@ function sectionPages() {
         'var supportImpactHtml=function(){return \'<section id="support"></section>\';};',
         'var additionalRolesHtml=function(){return \'<section id="additional-roles"></section>\';};',
         'var staffingPlanEditor=function(){return \'<section id="staffing-plan"></section>\';};',
+        'var learnedRoleSummary=function(){return [];};',
+        'var learnedRoleHistoryHtml=function(){return "";},historicalRestorationHtml=function(){return "";};',
+        'var statisticsHistoricalAnalysis=function(){return {previous:null,current:null,analyses:[]};};',
+        'var statisticsAnalysisHtml=function(){return "";};',
         'var toggle=function(k){return "<label>"+k+"</label>";};'
     ].join('\n');
     return new Function('ctx',boot+'\n'+code+

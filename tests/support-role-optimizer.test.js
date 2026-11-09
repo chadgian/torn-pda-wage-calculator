@@ -35,6 +35,11 @@ function harness(positions, staff, options = {}) {
         'var currentPosition=function(e){return positions.find(function(p){return p.id===e.positionId;})||null;};',
         'var positionFit=function(e,p){return p ? (e.fits[p.id]||0):0;};',
         'var individualBestPosition=function(e){return positions.map(function(p){return {position:p,fit:positionFit(e,p)};}).sort(function(a,b){return b.fit-a.fit;})[0]||null;};',
+        // History integration is tested separately; these tests isolate the assignment optimizer.
+        'var previousDailySnapshot=function(){return null;};',
+        'var roleHistoricalEvidence=function(){return {};},recentRoleOutcomeSignals=function(){return {};};',
+        'var learnedRoleFloor=function(p){return num(currentStaffingCounts()[positionKey(p)])>0?1:0;};',
+        'var roleCountRecoverySignals=function(){return {};};',
         moduleCode,
         'return { companyPositionAssignment, supportRoleKind, supportRoleSnapshot, staffingPlanInfo,',
         ' potentialRoleBenefit, suggestAdditionalRoles, useAdditionalRolePlan };'
@@ -119,10 +124,12 @@ test('custom staffing that removes a Manager slot is flagged even with protectio
     const staffingPlans={ 'company-1': {'m':0,'c':2} };
     const result=harness([manager,cashier],staff,{staffingPlans}).companyPositionAssignment();
     assert.equal(result.plan.valid,true);
-    assert.equal(result.byEmployee['1'].position.id,'c');
-    assert.equal(result.byEmployee['1'].supportProtected,false);
-    assert.equal(result.supportRisks.length,1);
-    assert.match(result.byEmployee['1'].supportRisk,/unknown/);
+    assert.equal(result.plan.safe,false,'Removing the only Manager is held');
+    assert.equal(result.plan.customApplied,false);
+    assert.equal(result.byEmployee['1'].position.id,'m');
+    assert.equal(result.byEmployee['1'].supportProtected,true);
+    assert.equal(result.supportRisks.length,0);
+    assert.match(result.plan.coverageWarnings.join(' '),/Store Manager/);
 });
 
 test('ordinary employee assignments still optimize work-stat fit', () => {
@@ -257,7 +264,10 @@ test('modeled fit benefits alone gate nonsupport recommendations', () => {
     const employees=[employee('1','Cashier',cashier,{c:90,other:30})];
     assert.equal(harness([cashier,clerk],employees).suggestAdditionalRoles().length,0);
     const upgraded=[employee('1','Cashier',cashier,{c:30,other:100})];
-    const proposal=harness([cashier,clerk],upgraded).suggestAdditionalRoles();
+    assert.equal(harness([cashier,clerk],upgraded).suggestAdditionalRoles().length,0,
+        'Do not eliminate the only Cashier, even for better work-stat fit');
+    const duplicated=upgraded.concat([employee('2','Second cashier',cashier,{c:90,other:20})]);
+    const proposal=harness([cashier,clerk],duplicated).suggestAdditionalRoles();
     assert.equal(proposal[0].key,'other');
     assert.equal(proposal[0].plan.fitDelta,70);
 });

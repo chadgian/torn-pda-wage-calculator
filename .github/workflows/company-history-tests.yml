@@ -1,0 +1,23 @@
+name: Company history checks
+on:
+  pull_request:
+    paths:
+      - 'torn-company-helper.user.js'
+      - 'tests/company-history.test.cjs'
+      - '.github/workflows/company-history-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'torn-company-helper.user.js'
+      - 'tests/company-history.test.cjs'
+      - '.github/workflows/company-history-tests.yml'
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check torn-company-helper.user.js
+      - run: node tests/company-history.test.cjs
