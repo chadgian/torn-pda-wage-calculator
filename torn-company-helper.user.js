@@ -564,7 +564,7 @@ function roleHistoryRecoverySignals() {
             sameHeadcount: sameHeadcount,
             adChangePct: adChangePct,
             increasedKeys: increasedKeys,
-            strong: declinePct >= 35 || (declinePct >= 20 && sameHeadcount && adChangePct <= 25)
+            strong: declinePct >= 20 && sameHeadcount && adChangePct <= 25
         };
     });
     return out;
@@ -1716,10 +1716,17 @@ function metricAnalysis(metric, previous, latest) {
         value:'Treat company-value movement as a longer-term signal; do not use it alone for next-day staffing changes.'
     };
     if (specific[metric.key]) action=specific[metric.key];
+    var roleFactor=factors.some(function(f){return f.key==='roles'||f.key==='roleMoves';});
+    var adFactor=factors.some(function(f){return f.key==='advertisementBudget';});
+    var rosterFactor=factors.some(function(f){return f.key==='roster'||f.key==='employeeCount';});
+    var evidenceLabel=!significant?'Low':
+        roleFactor&&!adFactor&&!rosterFactor?'Moderate':
+        factors.length<=2?'Moderate':'Mixed';
     return {
         key:metric.key,label:metric.label,kind:metric.kind,goal:metric.goal,
         previous:before,latest:after,delta:delta,pct:pd,direction:direction,
-        assessment:assessment,significant:significant,factors:factors,action:action
+        assessment:assessment,significant:significant,factors:factors,action:action,
+        evidenceLabel:evidenceLabel
     };
 }
 
@@ -1802,7 +1809,7 @@ function roleCountRecoverySignals() {
             position:position.name,baselineCount:baselineCount,currentCount:currentCount,
             missingCount:Math.max(1,baselineCount-currentCount),baselineIncome:baselineIncome,currentIncome:currentIncome,
             declinePct:declinePct,sameHeadcount:sameHeadcount,adChangePct:adChangePct,increasedKeys:increasedKeys,
-            strong:declinePct>=30||(declinePct>=15&&sameHeadcount&&adChangePct<=25),baselineTs:baseline.ts
+            strong:declinePct>=15&&sameHeadcount&&adChangePct<=25,baselineTs:baseline.ts
         };
     });
     return out;
@@ -2754,6 +2761,7 @@ function statisticsAnalysisCard(a) {
         '<span class="stats-analysis-change"><b>'+esc(a.assessment)+'</b><small>'+esc(analysisDeltaText(a))+'</small></span></summary>' +
         '<div class="stats-analysis-body">' +
             '<div class="stats-analysis-compare"><span>Previous day</span><b>'+esc(metricText(a.previous,a.kind))+'</b><span>Current</span><b>'+esc(metricText(a.latest,a.kind))+'</b></div>' +
+            '<div class="stats-analysis-confidence"><span>Evidence quality</span><b>'+esc(a.evidenceLabel)+'</b></div>' +
             '<h5>What changed alongside it?</h5>'+factorHtml+
             '<div class="stats-analysis-action"><b>'+(a.assessment==='Improved'?'Maintain / learn from this':'What to review next')+'</b><p>'+esc(a.action)+'</p></div>' +
             '<small class="stats-analysis-caution">Factors are observations from the same period, not proof that one caused the other.</small>' +
@@ -2769,7 +2777,7 @@ function statisticsAnalysisHtml() {
         '<p>Compared with '+esc(changeDate(pack.previous.ts))+'. '+fmt(significant)+' significant metric change'+(significant===1?'':'s')+' detected.</p></div>' +
         '<span class="stats-learning-badge">History-aware</span></div>' +
         '<div class="stats-analysis-list">'+pack.analyses.map(statisticsAnalysisCard).join('')+'</div>' +
-        '<p class="stats-analysis-foot">The helper compares role mix, employee movements, effectiveness, management bonuses, advertising, customers, payroll, efficiency, popularity, environment, and other saved indicators. Repeated patterns influence future position suggestions, but uncertain relationships remain labeled as correlation.</p>' +
+        '<p class="stats-analysis-foot">The helper compares role mix, employee movements, effectiveness, management bonuses, advertising, customers, payroll, efficiency, popularity, environment, and other saved indicators. These are candidate explanations from the same period, not proven causes. Repeated patterns influence future position suggestions only when the evidence becomes consistent enough.</p>' +
     '</section>';
 }
 
