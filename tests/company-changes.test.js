@@ -9,7 +9,8 @@ const script = fs.readFileSync(path.resolve(__dirname, '../torn-company-helper.u
 const start = script.indexOf('/* Company Changes:');
 const end = script.indexOf('function displayRows(result)', start);
 assert.ok(start > -1 && end > start, 'Company Changes module is present');
-const moduleCode = script.slice(start, end);
+const roleCountsCode = script.slice(script.indexOf('function snapshotPositionCounts(snapshot) {'), script.indexOf('function currentNamedPositionCounts()'));
+const moduleCode = roleCountsCode + '\n' + script.slice(start, end);
 
 function makeHarness(newsProvider = async () => ({ news: [] })) {
     const store = new Map();
@@ -39,6 +40,7 @@ function makeHarness(newsProvider = async () => ({ news: [] })) {
         'var get=ctx.get, put=ctx.put, document=ctx.document, api=ctx.api;',
         'var num=ctx.num, sum=ctx.sum, avg=ctx.avg, money=ctx.money, fmt=ctx.fmt;',
         'var company=null, staff=[], lastLoadedAt=0, changeRange="7", changesError="";',
+        'var PFX="gb-wage:",localStorage={setItem:function(key,value){ctx.put(key.slice(PFX.length),JSON.parse(value));}};',
         moduleCode,
         'return { newsEventType, reportedFiringReason, updateCompanyChanges, changeReport,',
         ' changeReportText, readChangeHistory, setReason(companyId, eventId, reason) {',
