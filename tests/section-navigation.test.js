@@ -28,7 +28,8 @@ function rendered(page) {
         'var S={querySelector:function(){return ctx.panel;}};',
         'var ui={page:ctx.page},company=ctx.company,staff=[{}],positions=[];',
         'var errorState=null,busy=false,lastLoadedAt=Date.now(),FRESH_AGE=900000;',
-        'var VERSION="2.6.0",detailId="",cfg={},keySource=function(){return "Demo";};',
+        'var wageVisibility={missing:0,total:0};',
+        'var VERSION="2.6.1",detailId="",cfg={},keySource=function(){return "Demo";};',
         'var nowText=function(){return "recently";},esc=function(x){return String(x);};',
         'var fmt=function(x){return String(x);},logoMark=function(){return "";};',
         'var calculate=function(){return ctx.result;},displayRows=function(x){return x.rows;};',
@@ -49,9 +50,9 @@ function rendered(page) {
     return panel.innerHTML;
 }
 
-test('v2.6.0 userscript syntax',()=>{
+test('v2.6.1 userscript syntax',()=>{
     assert.doesNotThrow(()=>new Function(script));
-    assert.match(script,/\/\/ @version\s+2\.6\.0/);
+    assert.match(script,/\/\/ @version\s+2\.6\.1/);
 });
 test('Dashboard, Wages, Positions, Statistics and Changes are separate top destinations',()=>{
     const html=rendered('dashboard');

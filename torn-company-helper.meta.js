@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.6.0
+// @version      2.6.1
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*

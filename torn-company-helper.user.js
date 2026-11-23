@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Company Helper
 // @namespace    wyn.torn.company.tools
-// @version      2.6.0
+// @version      2.6.1
 // @description  Torn company helper for wages, staffing, and historical company changes.
 // @author       Wyn / OpenAI
 // @match        https://www.torn.com/companies.php*
@@ -9,7 +9,8 @@
 // @updateURL    https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/torn-company-helper.meta.js
 // @downloadURL  https://raw.githubusercontent.com/chadgian/torn-pda-wage-calculator/main/torn-company-helper.user.js
 // @run-at       document-end
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      api.torn.com
 // ==/UserScript==
 
 (function () {
@@ -18,7 +19,7 @@
 var params = new URLSearchParams(location.search);
 if (!/\/companies\.php$/i.test(location.pathname)) return;
 
-var VERSION = '2.6.0';
+var VERSION = '2.6.1';
 try { console.log('[Torn Company Helper] v' + VERSION + ' starting'); } catch (e) {}
 var ID = 'gb-wage-v240';
 var PFX = 'gb-wage:';
@@ -26,6 +27,8 @@ var PDA_KEY = '###PDA-APIKEY###';
 var CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
 var FRESH_AGE = 15 * 60 * 1000;
 var API_BASE = 'https://api.torn.com/v2';
+var API_KEY_CREATE_URL = 'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=Torn%20Company%20Helper&company=employees,profile,news&torn=companies';
+var lastApiTransport = 'Not tested';
 var API_COMMENT = 'Torn Company Helper ' + VERSION;
 var SUPPORT_URL = 'https://www.torn.com/profiles.php?XID=4325416';
 
@@ -54,6 +57,7 @@ Object.keys(defaults).forEach(function (k) {
 
 var excluded = get('excluded', []);
 var staff = [];
+var wageVisibility = { missing:0, total:0 };
 var positions = [];
 var company = null;
 var rows = [];
@@ -190,12 +194,12 @@ function errorInfo(err) {
     if (!apiKey() || /no api key/.test(text)) {
         title = 'API key required';
         solution = 'Open API Key and use the Torn PDA key or add a Torn API key. The key is sent only to api.torn.com.';
-    } else if (status === 401 || code === 2 || /incorrect key|invalid key|key is invalid/.test(text)) {
+    } else if (status === 401 || code === 2 || code === 10 || code === 18 || /incorrect key|invalid key|key is invalid|paused key|key is paused/.test(text)) {
         title = 'API key rejected';
-        solution = 'Replace the saved key. If Torn PDA normally supplies your key, clear the manual key so the script can use the PDA-provided key instead.';
-    } else if (status === 403 || /permission|access level|not permitted|not allowed/.test(text)) {
+        solution = code === 18 ? 'This key is paused in Torn. Resume it or create a Custom key.' : 'Check the key and account, or clear a stale manual key to use Torn PDA instead.';
+    } else if (status === 403 || code === 7 || code === 16 || /permission|access level|not permitted|not allowed|entity relation/.test(text)) {
         title = 'The key does not expose enough company data';
-        solution = 'Use a key that can read your company employees. Directors need wage access for wage calculations; a Limited, Custom, or Full key is the safest choice when wage data is required.';
+        solution = 'Create a Custom key for company employees, profile, news and torn companies. Wage details require the key owner to be the company director.';
     } else if (status === 429 || code === 5 || /too many|rate limit/.test(text)) {
         title = 'Torn API rate limit reached';
         solution = 'Avoid repeatedly tapping Refresh. The last successful cached data remains available in the calculator.';
@@ -220,6 +224,7 @@ function diagnosticText(err) {
         'Time: ' + new Date().toISOString(),
         'Company: ' + (company ? company.name + (company.typeName ? ' / ' + company.typeName : '') : 'Not loaded'),
         'Key source: ' + keySource(),
+        'Request transport: ' + lastApiTransport,
         'HTTP status: ' + (err && err.status != null ? err.status : 'n/a'),
         'Torn error code: ' + (err && err.code != null ? err.code : 'n/a'),
         'Error: ' + String(err && err.message || err || 'Unknown error')
@@ -227,36 +232,58 @@ function diagnosticText(err) {
     return details.join('\n');
 }
 
-async function api(path) {
-    var k = apiKey();
+// Prefer the Torn PDA bridge, then manager XHR; browser fetch is a fallback.
+// API-level errors must not be retried over another transport.
+async function apiGetResponse(url, headers) {
+    if (typeof PDA_httpGet === 'function') {
+        lastApiTransport = 'Torn PDA';
+        var native = await PDA_httpGet(url, headers);
+        return { status:num(native.status), ok:num(native.status) >= 200 && num(native.status) < 300,
+            json:async function () { return JSON.parse(native.responseText); } };
+    }
+    if (typeof GM_xmlhttpRequest === 'function') {
+        lastApiTransport = 'Userscript manager';
+        return new Promise(function (resolve, reject) {
+            GM_xmlhttpRequest({ method:'GET', url:url, headers:headers, timeout:20000,
+                onload:function(r) { resolve({status:num(r.status),ok:num(r.status)>=200&&num(r.status)<300,
+                    json:async function(){return JSON.parse(r.responseText);} }); },
+                onerror:function(){reject(new Error('Userscript request failed. Check API domain permissions.'));},
+                ontimeout:function(){reject(new Error('Torn API request timed out.'));}
+            });
+        });
+    }
+    lastApiTransport = 'Browser fetch';
+    return fetch(url, {method:'GET',credentials:'omit',cache:'no-store',headers:headers});
+}
+async function api(path, overrideKey) {
+    var k = overrideKey == null ? apiKey() : String(overrideKey).trim();
     if (!k) throw apiError('No API key configured.');
-
     var sep = path.indexOf('?') >= 0 ? '&' : '?';
     var url = API_BASE + path + sep + 'comment=' + encodeURIComponent(API_COMMENT);
     var response;
     try {
-        response = await fetch(url, {
-            method: 'GET',
-            credentials: 'omit',
-            cache: 'no-store',
-            headers: { 'Authorization': 'ApiKey ' + k, 'Accept': 'application/json' }
-        });
-    } catch (e) {
-        throw apiError(e.message || 'Network request failed.', { cause: e });
-    }
-
+        response = await apiGetResponse(url, {'Authorization':'ApiKey '+k,'Accept':'application/json'});
+    } catch(e) { throw apiError(e && e.message || 'Network request failed.', {transport:lastApiTransport}); }
     var data;
     try { data = await response.json(); }
-    catch (e) { throw apiError('Torn API returned an unreadable response.', { status: response.status }); }
-
-    if (!response.ok || data.error) {
+    catch(e) { throw apiError('Torn API returned an unreadable response.', {status:response.status,transport:lastApiTransport}); }
+    if (!response.ok || (data && data.error)) {
         var er = data && data.error || {};
-        throw apiError(er.error || er.message || ('Torn API request failed (' + response.status + ').'), {
-            status: response.status,
-            code: er.code
-        });
+        throw apiError(typeof er === 'string' ? er : er.error || er.message || ('Torn API request failed ('+response.status+').'),
+            {status:response.status,code:er.code,transport:lastApiTransport});
     }
     return data;
+}
+// Probe the actual selections needed before accepting a saved key.
+async function validateKeyCandidate(candidate) {
+    var info = await api('/key/info', candidate);
+    var profile = await api('/company/profile', candidate);
+    var employees = normalizeEmployees(await api('/company/employees', candidate));
+    if (!employees.length) throw apiError('No company employees were returned. Verify the key belongs to your account and company.');
+    var missing = employees.filter(function(e){return e.wage == null;}).length;
+    return {info:info,company:normalizeCompany(profile),count:employees.length,missing:missing,
+        message:missing ? 'Key accepted, but '+missing+' of '+employees.length+' wages are unavailable. Wage advice for those employees is disabled; you must be the director to view wages.' :
+            'Key verified: company profile and wages available for '+employees.length+' employees.'};
 }
 
 function normalizeEmployees(payload) {
@@ -952,7 +979,7 @@ function roundBalanced(raw, target, minimum, maximum, step) {
 function calculate() {
     var positionAssignment = cfg.positionAdvice ? companyPositionAssignment() : { byEmployee:{}, plan:staffingPlanInfo(), currentFit:0, suggestedFit:0 };
     var included = staff.filter(function (x) {
-        return excluded.indexOf(x.id) < 0 && (cfg.director || !x.director);
+        return x.wage != null && excluded.indexOf(x.id) < 0 && (cfg.director || !x.director);
     });
 
     var totalWeight = Math.max(1, num(cfg.stats) + num(cfg.eff));
@@ -1077,6 +1104,7 @@ function restoreCache() {
     var c = get('cache', null);
     if (!c || !c.ts || Date.now() - c.ts > CACHE_MAX_AGE || !Array.isArray(c.staff)) return false;
     staff = c.staff;
+    wageVisibility = {missing:staff.filter(function(x){return x.wage == null;}).length,total:staff.length};
     positions = Array.isArray(c.positions) ? c.positions : [];
     company = c.company || null;
     lastLoadedAt = c.ts;
@@ -1090,7 +1118,7 @@ async function fetchAll() {
 
     if (!nextStaff.length) throw apiError('No employees were returned for your company.');
     var missingWages = nextStaff.filter(function (x) { return x.wage == null; }).length;
-    if (missingWages) throw apiError('Wage data is incomplete for ' + missingWages + ' of ' + nextStaff.length + ' employees. Wage data is required for accurate payroll recommendations.');
+    // Missing wage fields do not prevent the dashboard or snapshots from loading.
 
     var nextPositions = [];
     if (nextCompany.typeId) {
@@ -1104,6 +1132,7 @@ async function fetchAll() {
     }
 
     staff = nextStaff;
+    wageVisibility = {missing:missingWages,total:nextStaff.length};
     company = nextCompany;
     positions = nextPositions;
     lastLoadedAt = Date.now();
@@ -1602,6 +1631,7 @@ function render() {
         '<button type="button" data-page="settings" aria-label="Configure automatic company recording">Manage</button>' +
     '</div>';
 
+    if (wageVisibility.missing && staff.length) html += '<div class="error-card"><div class="error-icon">!</div><div><b>Some wages are unavailable</b><p>' + fmt(wageVisibility.missing) + ' of ' + fmt(wageVisibility.total) + ' wages are missing. Those employees are excluded from salary calculations; other company information remains available.</p><small>Director access is required for wage visibility.</small></div></div>';
     if (errorState) {
         var info = errorInfo(errorState);
         html += '<div class="error-card"><div class="error-icon">!</div><div><b>' + esc(info.title) + '</b><p>' + esc(info.message) + '</p><small><strong>Suggested fix:</strong> ' + esc(info.solution) + '</small><div class="error-actions"><button data-a="copy-error">Copy error details</button><a href="' + esc(SUPPORT_URL) + '" target="_blank" rel="noopener noreferrer">Contact developer</a></div></div><button data-a="dismiss-error">×</button></div>';
@@ -2607,46 +2637,58 @@ function closePanel() {
 function showKey() {
     var box = S.querySelector('#keybox');
     var input = box.querySelector('input[type="password"]');
-    var remember = box.querySelector('[data-k="remember"]');
-    var persistent = String(get('key', '') || '');
+    var persistent = String(get('key','')||'');
     var session = sessionGet('sessionKey');
     input.value = session || persistent || '';
-    remember.checked = !!persistent && !session;
-    box.querySelector('[data-k="status"]').textContent = keySource() + '. Keys are sent only to api.torn.com; API requests use the Authorization header.';
+    box.querySelector('[data-k="remember"]').checked = !!persistent && !session;
+    box.querySelector('[data-k="status"]').textContent = keySource()+'. Requests are sent only to api.torn.com. Last transport: '+lastApiTransport+'.';
+    box.querySelector('[data-k="feedback"]').textContent = '';
     box.classList.add('show');
     if (typeof refreshLauncherVisibility === 'function') refreshLauncherVisibility();
     input.focus();
 }
-
-function saveKey() {
-    var box = S.querySelector('#keybox');
-    var input = box.querySelector('input[type="password"]');
-    var remember = box.querySelector('[data-k="remember"]');
-    var value = input.value.trim();    if (!value) return;
-    if (remember.checked) {
-        put('key', value);
-        sessionPut('sessionKey', '');
-    } else {
-        remove('key');
-        sessionPut('sessionKey', value);
+var keyCheckBusy = false;
+async function checkKey(shouldSave) {
+    if (keyCheckBusy) return;
+    var box=S.querySelector('#keybox'), input=box.querySelector('input[type="password"]'),
+        remember=box.querySelector('[data-k="remember"]'), feedback=box.querySelector('[data-k="feedback"]');
+    var candidate=input.value.trim();
+    if (!candidate) { feedback.textContent='Paste a key or choose Create API Key.'; return; }
+    keyCheckBusy=true;
+    box.querySelector('[data-k="save"]').disabled=true;
+    box.querySelector('[data-k="test"]').disabled=true;
+    feedback.textContent='Testing key against Torn API…';
+    try {
+        var result=await validateKeyCandidate(candidate);
+        feedback.textContent=result.message;
+        if (shouldSave) {
+            if (remember.checked) { put('key',candidate); sessionPut('sessionKey',''); }
+            else { remove('key'); sessionPut('sessionKey',candidate); }
+            remove('autoSyncState'); errorState=null;
+            box.classList.remove('show');
+            if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility();
+            toast(result.missing ? 'Key saved; some wages are unavailable.' : 'Verified API key saved.', !result.missing);
+            render();
+            if (isOwnCompanyView() && cfg.autoRefresh) scheduleAutoCompanySync('company-visit',300);
+        }
+    } catch(err) {
+        var info=errorInfo(err);
+        feedback.textContent=info.title+': '+info.message+' '+info.solution;
+    } finally {
+        keyCheckBusy=false;
+        box.querySelector('[data-k="save"]').disabled=false;
+        box.querySelector('[data-k="test"]').disabled=false;
     }
-    // A new key should not inherit the failed-key auto-sync backoff.
-    remove('autoSyncState');
-    box.classList.remove('show');
-    if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility();
-    errorState = null;
-    toast('API key saved for ' + (remember.checked ? 'this device.' : 'this session.'), true);
-    render();
-    if (isOwnCompanyView() && cfg.autoRefresh) scheduleAutoCompanySync('company-visit', 300);
 }
-
-function clearKey() {
-    remove('key');
-    sessionPut('sessionKey', '');
-    var box = S.querySelector('#keybox');
-    box.querySelector('input[type="password"]').value = '';
-    box.querySelector('[data-k="status"]').textContent = PDA_KEY.indexOf('###PDA-APIKEY###') < 0 ? 'Manual key cleared. Torn PDA key will be used.' : 'No key configured.';
-    toast('Manual API key cleared.', true);
+function saveKey(){return checkKey(true);}
+function testKey(){return checkKey(false);}
+function clearKey(){
+    remove('key'); sessionPut('sessionKey',''); remove('autoSyncState');
+    var box=S.querySelector('#keybox');
+    box.querySelector('input[type="password"]').value='';
+    box.querySelector('[data-k="feedback"]').textContent='';
+    box.querySelector('[data-k="status"]').textContent=PDA_KEY.indexOf('###PDA-APIKEY###')<0 ? 'Manual key cleared. Torn PDA key will be used.' : 'No key configured.';
+    toast('Manual API key cleared.',true);
     render();
 }
 
@@ -2998,15 +3040,16 @@ S.innerHTML = '<style>' +
 '@media(prefers-reduced-motion:reduce){.dashboard-link{transition:none}.dashboard-link:hover{transform:none}}' +
 '</style>' +
 '<style>' +
-".auto-recording-indicator{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid #293d35;background:#10221a;color:#bdd5c5;font-size:10px;line-height:1.4}.auto-recording-indicator .auto-dot{flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#8b8973}.auto-recording-indicator .auto-dot.enabled{background:#48d695;box-shadow:0 0 0 3px #48d69522}.auto-recording-indicator .auto-dot.paused{background:#c89e65}.auto-recording-indicator>span:nth-child(2){min-width:0;flex:1}.auto-recording-indicator button{border:1px solid #335b45;background:#143c29;color:#c9f4d8!important;border-radius:6px;font-weight:800;font-size:10px;padding:5px 9px;min-height:29px;cursor:pointer}@media(max-width:700px){.auto-recording-indicator{padding:8px 10px}.auto-recording-indicator button{min-height:30px}}" +
+".key-card .key-guide{font-size:11px;line-height:1.5;color:#c7d4ce;margin:8px 0 12px}.key-card .create-key{display:inline-block;padding:10px 14px;border:1px solid #55c78c;border-radius:8px;background:#145b37;color:#ebfff0!important;font-size:12px;font-weight:800;text-decoration:none;margin:0 0 14px}.key-card .key-feedback{font-size:11px;line-height:1.5;color:#f3d39e;margin:8px 0;overflow-wrap:anywhere}.auto-recording-indicator{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid #293d35;background:#10221a;color:#bdd5c5;font-size:10px;line-height:1.4}.auto-recording-indicator .auto-dot{flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#8b8973}.auto-recording-indicator .auto-dot.enabled{background:#48d695;box-shadow:0 0 0 3px #48d69522}.auto-recording-indicator .auto-dot.paused{background:#c89e65}.auto-recording-indicator>span:nth-child(2){min-width:0;flex:1}.auto-recording-indicator button{border:1px solid #335b45;background:#143c29;color:#c9f4d8!important;border-radius:6px;font-weight:800;font-size:10px;padding:5px 9px;min-height:29px;cursor:pointer}@media(max-width:700px){.auto-recording-indicator{padding:8px 10px}.auto-recording-indicator button{min-height:30px}}" +
 '</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
-'<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored in local storage on this device)</label><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="save" class="save">Save key</button></div></div></div>' +
+'<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><p class="key-guide">Create a Custom key with company employees, profile, news, and public company positions. Full Access is not needed. The company director can see wages.</p><a class="create-key" href="' + esc(API_KEY_CREATE_URL) + '" target="_blank" rel="noopener noreferrer">Create API Key</a><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored unencrypted in this browser)</label><p class="key-feedback" data-k="feedback" role="status" aria-live="polite"></p><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="test">Test Connection</button><button data-k="save" class="save">Verify &amp; Save</button></div></div></div>' +
 '<div id="toast" role="status" aria-live="polite"></div>';
 
 S.querySelector('#overlay').addEventListener('click', function (e) { if (e.target.id === 'overlay') closePanel(); });
 S.querySelector('#keybox [data-k="cancel"]').onclick = function () { S.querySelector('#keybox').classList.remove('show'); if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility(); };
 S.querySelector('#keybox [data-k="save"]').onclick = saveKey;
+S.querySelector('#keybox [data-k="test"]').onclick = testKey;
 S.querySelector('#keybox [data-k="clear"]').onclick = clearKey;
 S.querySelector('#keybox input[type="password"]').addEventListener('keydown', function (e) { if (e.key === 'Enter') saveKey(); });
 document.addEventListener('keydown', function (e) {
