@@ -2637,46 +2637,58 @@ function closePanel() {
 function showKey() {
     var box = S.querySelector('#keybox');
     var input = box.querySelector('input[type="password"]');
-    var remember = box.querySelector('[data-k="remember"]');
-    var persistent = String(get('key', '') || '');
+    var persistent = String(get('key','')||'');
     var session = sessionGet('sessionKey');
     input.value = session || persistent || '';
-    remember.checked = !!persistent && !session;
-    box.querySelector('[data-k="status"]').textContent = keySource() + '. Keys are sent only to api.torn.com; API requests use the Authorization header.';
+    box.querySelector('[data-k="remember"]').checked = !!persistent && !session;
+    box.querySelector('[data-k="status"]').textContent = keySource()+'. Requests are sent only to api.torn.com. Last transport: '+lastApiTransport+'.';
+    box.querySelector('[data-k="feedback"]').textContent = '';
     box.classList.add('show');
     if (typeof refreshLauncherVisibility === 'function') refreshLauncherVisibility();
     input.focus();
 }
-
-function saveKey() {
-    var box = S.querySelector('#keybox');
-    var input = box.querySelector('input[type="password"]');
-    var remember = box.querySelector('[data-k="remember"]');
-    var value = input.value.trim();    if (!value) return;
-    if (remember.checked) {
-        put('key', value);
-        sessionPut('sessionKey', '');
-    } else {
-        remove('key');
-        sessionPut('sessionKey', value);
+var keyCheckBusy = false;
+async function checkKey(shouldSave) {
+    if (keyCheckBusy) return;
+    var box=S.querySelector('#keybox'), input=box.querySelector('input[type="password"]'),
+        remember=box.querySelector('[data-k="remember"]'), feedback=box.querySelector('[data-k="feedback"]');
+    var candidate=input.value.trim();
+    if (!candidate) { feedback.textContent='Paste a key or choose Create API Key.'; return; }
+    keyCheckBusy=true;
+    box.querySelector('[data-k="save"]').disabled=true;
+    box.querySelector('[data-k="test"]').disabled=true;
+    feedback.textContent='Testing key against Torn API…';
+    try {
+        var result=await validateKeyCandidate(candidate);
+        feedback.textContent=result.message;
+        if (shouldSave) {
+            if (remember.checked) { put('key',candidate); sessionPut('sessionKey',''); }
+            else { remove('key'); sessionPut('sessionKey',candidate); }
+            remove('autoSyncState'); errorState=null;
+            box.classList.remove('show');
+            if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility();
+            toast(result.missing ? 'Key saved; some wages are unavailable.' : 'Verified API key saved.', !result.missing);
+            render();
+            if (isOwnCompanyView() && cfg.autoRefresh) scheduleAutoCompanySync('company-visit',300);
+        }
+    } catch(err) {
+        var info=errorInfo(err);
+        feedback.textContent=info.title+': '+info.message+' '+info.solution;
+    } finally {
+        keyCheckBusy=false;
+        box.querySelector('[data-k="save"]').disabled=false;
+        box.querySelector('[data-k="test"]').disabled=false;
     }
-    // A new key should not inherit the failed-key auto-sync backoff.
-    remove('autoSyncState');
-    box.classList.remove('show');
-    if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility();
-    errorState = null;
-    toast('API key saved for ' + (remember.checked ? 'this device.' : 'this session.'), true);
-    render();
-    if (isOwnCompanyView() && cfg.autoRefresh) scheduleAutoCompanySync('company-visit', 300);
 }
-
-function clearKey() {
-    remove('key');
-    sessionPut('sessionKey', '');
-    var box = S.querySelector('#keybox');
-    box.querySelector('input[type="password"]').value = '';
-    box.querySelector('[data-k="status"]').textContent = PDA_KEY.indexOf('###PDA-APIKEY###') < 0 ? 'Manual key cleared. Torn PDA key will be used.' : 'No key configured.';
-    toast('Manual API key cleared.', true);
+function saveKey(){return checkKey(true);}
+function testKey(){return checkKey(false);}
+function clearKey(){
+    remove('key'); sessionPut('sessionKey',''); remove('autoSyncState');
+    var box=S.querySelector('#keybox');
+    box.querySelector('input[type="password"]').value='';
+    box.querySelector('[data-k="feedback"]').textContent='';
+    box.querySelector('[data-k="status"]').textContent=PDA_KEY.indexOf('###PDA-APIKEY###')<0 ? 'Manual key cleared. Torn PDA key will be used.' : 'No key configured.';
+    toast('Manual API key cleared.',true);
     render();
 }
 
@@ -3028,15 +3040,16 @@ S.innerHTML = '<style>' +
 '@media(prefers-reduced-motion:reduce){.dashboard-link{transition:none}.dashboard-link:hover{transform:none}}' +
 '</style>' +
 '<style>' +
-".auto-recording-indicator{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid #293d35;background:#10221a;color:#bdd5c5;font-size:10px;line-height:1.4}.auto-recording-indicator .auto-dot{flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#8b8973}.auto-recording-indicator .auto-dot.enabled{background:#48d695;box-shadow:0 0 0 3px #48d69522}.auto-recording-indicator .auto-dot.paused{background:#c89e65}.auto-recording-indicator>span:nth-child(2){min-width:0;flex:1}.auto-recording-indicator button{border:1px solid #335b45;background:#143c29;color:#c9f4d8!important;border-radius:6px;font-weight:800;font-size:10px;padding:5px 9px;min-height:29px;cursor:pointer}@media(max-width:700px){.auto-recording-indicator{padding:8px 10px}.auto-recording-indicator button{min-height:30px}}" +
+".key-card .key-guide{font-size:11px;line-height:1.5;color:#c7d4ce;margin:8px 0 12px}.key-card .create-key{display:inline-block;padding:10px 14px;border:1px solid #55c78c;border-radius:8px;background:#145b37;color:#ebfff0!important;font-size:12px;font-weight:800;text-decoration:none;margin:0 0 14px}.key-card .key-feedback{font-size:11px;line-height:1.5;color:#f3d39e;margin:8px 0;overflow-wrap:anywhere}.auto-recording-indicator{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid #293d35;background:#10221a;color:#bdd5c5;font-size:10px;line-height:1.4}.auto-recording-indicator .auto-dot{flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:#8b8973}.auto-recording-indicator .auto-dot.enabled{background:#48d695;box-shadow:0 0 0 3px #48d69522}.auto-recording-indicator .auto-dot.paused{background:#c89e65}.auto-recording-indicator>span:nth-child(2){min-width:0;flex:1}.auto-recording-indicator button{border:1px solid #335b45;background:#143c29;color:#c9f4d8!important;border-radius:6px;font-weight:800;font-size:10px;padding:5px 9px;min-height:29px;cursor:pointer}@media(max-width:700px){.auto-recording-indicator{padding:8px 10px}.auto-recording-indicator button{min-height:30px}}" +
 '</style>' +
 '<div id="overlay"><div id="panel"></div></div>' +
-'<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored in local storage on this device)</label><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="save" class="save">Save key</button></div></div></div>' +
+'<div id="keybox"><div class="key-card"><h3>Torn API Key</h3><p data-k="status"></p><p class="key-guide">Create a Custom key with company employees, profile, news, and public company positions. Full Access is not needed. The company director can see wages.</p><a class="create-key" href="' + esc(API_KEY_CREATE_URL) + '" target="_blank" rel="noopener noreferrer">Create API Key</a><input type="password" autocomplete="off" placeholder="Paste Torn API key"><label class="remember"><input type="checkbox" data-k="remember"> Remember on this device (stored unencrypted in this browser)</label><p class="key-feedback" data-k="feedback" role="status" aria-live="polite"></p><div class="key-actions"><button data-k="clear">Clear manual key</button><button data-k="cancel">Cancel</button><button data-k="test">Test Connection</button><button data-k="save" class="save">Verify &amp; Save</button></div></div></div>' +
 '<div id="toast" role="status" aria-live="polite"></div>';
 
 S.querySelector('#overlay').addEventListener('click', function (e) { if (e.target.id === 'overlay') closePanel(); });
 S.querySelector('#keybox [data-k="cancel"]').onclick = function () { S.querySelector('#keybox').classList.remove('show'); if (typeof scheduleLauncherVisibility === 'function') scheduleLauncherVisibility(); };
 S.querySelector('#keybox [data-k="save"]').onclick = saveKey;
+S.querySelector('#keybox [data-k="test"]').onclick = testKey;
 S.querySelector('#keybox [data-k="clear"]').onclick = clearKey;
 S.querySelector('#keybox input[type="password"]').addEventListener('keydown', function (e) { if (e.key === 'Enter') saveKey(); });
 document.addEventListener('keydown', function (e) {
